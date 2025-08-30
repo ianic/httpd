@@ -1,7 +1,9 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
 const net = std.net;
+const mem = std.mem;
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.loop);
@@ -14,7 +16,7 @@ pub const Options = struct {
     /// Number of kernel registered file descriptors
     fd_nr: u16,
 
-    read_buffers: struct {
+    recv_buffers: struct {
         size: u32 = 0,
         count: u16 = 0,
     } = .{},
@@ -22,35 +24,29 @@ pub const Options = struct {
 
 const Loop = @This();
 
-ring: linux.IoUring,
-read_buffer_group: ?linux.IoUring.BufferGroup,
+ring: linux.IoUring = undefined,
+recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: [128]linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 
-pub fn init(allocator: Allocator, opt: Options) !Loop {
-    var ring = try linux.IoUring.init(opt.entries, opt.flags);
-    errdefer ring.deinit();
-    try ring.register_files_sparse(opt.fd_nr);
+pub fn init(loop: *Loop, allocator: Allocator, opt: Options) !void {
+    assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
 
-    const read_buffer_group: ?linux.IoUring.BufferGroup = if (opt.read_buffers.size > 0 and opt.read_buffers.count > 0)
-        try linux.IoUring.BufferGroup.init(
-            &ring,
-            allocator,
-            0,
-            opt.read_buffers.size,
-            opt.read_buffers.count,
-        )
-    else
-        null;
+    loop.ring = try linux.IoUring.init(opt.entries, opt.flags);
+    errdefer loop.ring.deinit();
+    try loop.ring.register_files_sparse(opt.fd_nr);
 
-    return .{
-        .ring = ring,
-        .read_buffer_group = read_buffer_group,
-    };
+    loop.recv_buffer_group = try linux.IoUring.BufferGroup.init(
+        &loop.ring,
+        allocator,
+        0,
+        opt.recv_buffers.size,
+        opt.recv_buffers.count,
+    );
 }
 
 pub fn deinit(self: *Loop, allocator: Allocator) void {
-    if (self.read_buffer_group) |*bg| bg.deinit(allocator);
+    self.recv_buffer_group.deinit(allocator);
     self.ring.deinit();
 }
 
@@ -58,6 +54,9 @@ pub const Completion = struct {
     id: u32,
     operation: Operation,
     result: anyerror!i32,
+    cqe: linux.io_uring_cqe,
+
+    pub const none: Completion = .{ .id = 0, .operation = .none, .result = 0, .cqe = mem.zeroes(linux.io_uring_cqe) };
 };
 
 pub fn peek(self: *Loop) !Completion {
@@ -76,6 +75,7 @@ pub fn peek(self: *Loop) !Completion {
             .operation = op,
             .id = id,
             .result = if (cqe.res < 0) error.OperationFailed else cqe.res,
+            .cqe = cqe,
         };
     }
 }
@@ -109,6 +109,32 @@ pub fn accept(self: *Loop, id: u32, fd: posix.fd_t) !void {
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
+pub fn recv(self: *Loop, id: u32, fd: posix.fd_t) !void {
+    var sqe = try self.recv_buffer_group.recv(userData(.recv, id), fd, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+pub fn getRecvBuffer(self: *Loop, completion: Completion) ![]const u8 {
+    return try self.recv_buffer_group.get(completion.cqe);
+}
+
+pub fn putRecvBuffer(self: *Loop, completion: Completion) !void {
+    try self.recv_buffer_group.put(completion.cqe);
+}
+
+/// Close file descriptor
+pub fn close(self: *Loop, id: u32, fd: linux.fd_t) !void {
+    _ = try self.ring.close_direct(userData(.close, id), @intCast(fd));
+}
+
+/// Cancel any fd operations
+pub fn cancel(self: *Loop, id: u32, fd: linux.fd_t) !void {
+    var sqe = try self.ring.get_sqe();
+    sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    sqe.user_data = userData(.cancel, id);
+}
+
 // Reserved values for user_data
 const rsv_user_data = struct {
     const none: u32 = 0xff_ff_ff_ff;
@@ -122,6 +148,9 @@ pub const Operation = enum(u8) {
     bind,
     listen,
     accept,
+    recv,
+    close,
+    cancel,
 };
 
 fn userData(op: Operation, idx: u32) u64 {
