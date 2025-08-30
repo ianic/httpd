@@ -55,12 +55,12 @@ pub fn deinit(self: *Loop, allocator: Allocator) void {
 }
 
 pub const Completion = struct {
-    op: Operation,
     id: u32,
-    res: anyerror!i32,
+    operation: Operation,
+    result: anyerror!i32,
 };
 
-pub fn peekCompletion(self: *Loop) !Completion {
+pub fn peek(self: *Loop) !Completion {
     while (true) {
         if (self.cqes.len == 0) {
             _ = try self.ring.submit();
@@ -73,9 +73,9 @@ pub fn peekCompletion(self: *Loop) !Completion {
         }
         const op, const id = decodeUserData(cqe.user_data);
         return .{
-            .op = op,
+            .operation = op,
             .id = id,
-            .res = if (cqe.res < 0) error.OperationFailed else cqe.res,
+            .result = if (cqe.res < 0) error.OperationFailed else cqe.res,
         };
     }
 }

@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 
 const Loop = @import("Loop.zig");
 const Operation = Loop.Operation;
+const Completion = Loop.Completion;
 
 const log = std.log.scoped(.main);
 
@@ -22,9 +23,9 @@ pub fn main() !void {
     try listener.complete(&loop, .none, 0);
 
     while (true) {
-        const cmp = try loop.peekCompletion();
-        if (cmp.id == listener.id) {
-            try listener.complete(&loop, cmp.op, cmp.res);
+        const completion = try loop.peek();
+        if (completion.id == listener.id) {
+            try listener.complete(&loop, completion);
         } else {
             unreachable;
         }
@@ -37,21 +38,21 @@ const Listener = struct {
     fd: posix.fd_t = -1,
     addr: net.Address,
 
-    fn complete(self: *Listener, loop: *Loop, op: Operation, res: anyerror!i32) !void {
-        switch (op) {
+    fn complete(self: *Listener, loop: *Loop, completion: Completion) !void {
+        switch (completion.operation) {
             .none => {
                 try loop.socket(self.id, &self.addr);
             },
             .socket => {
-                self.fd = try res;
+                self.fd = try completion.result;
                 try loop.listen(self.id, &self.addr, self.fd);
             },
             .listen => {
-                assert(0 == try res);
+                assert(0 == try completion.result);
                 try loop.accept(self.id, self.fd);
             },
             .accept => {
-                const fd = try res;
+                const fd = try completion.result;
                 log.debug("accept fd: {}", .{fd});
                 try loop.accept(self.id, self.fd);
             },
