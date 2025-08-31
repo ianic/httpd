@@ -7,11 +7,7 @@ const assert = std.debug.assert;
 const fd_t = posix.fd_t;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-
-const Io = @import("Loop.zig");
-const Operation = Io.Operation;
-const Completion = Io.Completion;
-
+const Io = @import("Io.zig");
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
@@ -32,6 +28,7 @@ pub fn main() !void {
 
     while (true) {
         const cqe = try io.peek();
+        // TODO: handle sqe exhaustion
         try complete(gpa, &io, cqe, &addr);
         io.advance();
     }
@@ -116,7 +113,6 @@ test UserData {
     try testing.expectEqual(64, @bitSizeOf(UserData));
 
     const user_data: UserData = .{ .operation = .send, .kind = .connection, .fd = 0x0abbccdd };
-
     try testing.expectEqual(0x0a_bb_cc_dd_03_00_00_09, @as(u64, @bitCast(user_data)));
 }
 
