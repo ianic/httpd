@@ -89,6 +89,18 @@ pub fn listen(io: *Io, ud: u64, addr: *const net.Address, fd: posix.fd_t) !void 
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
+pub fn ktlsUgrade(io: *Io, ud: u64, fd: posix.fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
+    const TX = @as(c_int, 1);
+    const RX = @as(c_int, 2);
+
+    var sqe = try io.ring.setsockopt(UserData.skip, fd, linux.IPPROTO.TCP, linux.TCP.ULP, "tls");
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe = try io.ring.setsockopt(UserData.skip, fd, linux.SOL.TLS, TX, tx_opt);
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe = try io.ring.setsockopt(userData(.ktls_upgrade, ud), fd, linux.SOL.TLS, RX, rx_opt);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
 pub fn accept(io: *Io, ud: u64, fd: posix.fd_t) !void {
     var sqe = try io.ring.accept_direct(userData(.accept, ud), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -121,7 +133,7 @@ pub fn cancel(io: *Io, ud: u64, fd: linux.fd_t) !void {
 }
 
 pub fn send(io: *Io, ud: u64, fd: linux.fd_t, buffer: []const u8) !void {
-    var sqe = try io.ring.send(userData(.send, ud), fd, buffer, linux.MSG.WAITALL | linux.MSG.NOSIGNAL);
+    var sqe = try io.ring.send(userData(.send, ud), fd, buffer, linux.MSG.NOSIGNAL);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
@@ -151,6 +163,7 @@ pub const Operation = enum(u8) {
     close,
     cancel,
     send,
+    ktls_upgrade,
 };
 
 fn decodeUserData(user_data: u64) struct { Operation, u32 } {
