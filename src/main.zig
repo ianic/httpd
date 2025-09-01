@@ -99,6 +99,10 @@ const Server = struct {
         try hs.init();
     }
 
+    fn remove(self: *Server, id: u32) !void {
+        try self.pool.remove(self.gpa, id);
+    }
+
     fn complete(self: *Server, cqe: linux.io_uring_cqe) !void {
         const ud: UserData = @bitCast(cqe.user_data);
         const ptr = self.pool.get(ud.id);
@@ -227,6 +231,13 @@ const Handshake = struct {
         try io.recv(self.userData(), self.fd);
     }
 
+    fn deinit(self: *Handshake) void {
+        const gpa = self.srv.gpa;
+        self.input_buf.deinit(gpa);
+        self.srv.remove(self.id) catch {};
+        gpa.destroy(self);
+    }
+
     fn complete(self: *Handshake, cqe: linux.io_uring_cqe) !void {
         const io = self.srv.io;
         const gpa = self.srv.gpa;
@@ -235,12 +246,23 @@ const Handshake = struct {
 
         switch (ud.operation) {
             .recv => {
-                _ = try Io.result(cqe);
-
+                const n = Io.result(cqe) catch |err| {
+                    log.info("handshake recv failed {}", .{err});
+                    try io.close(self.userData(), self.fd);
+                    return;
+                };
+                if (n == 0) {
+                    try io.close(self.userData(), self.fd);
+                    return;
+                }
                 const input_buf = try self.input_buf.append(gpa, try io.getRecvBuffer(cqe));
                 defer io.putRecvBuffer(cqe) catch {};
 
-                const res = try self.hs.run(input_buf, &self.output_buf);
+                const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
+                    log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
+                    try io.close(self.userData(), self.fd);
+                    return;
+                };
 
                 try self.input_buf.set(gpa, res.unused_recv);
                 if (res.send_pos > 0) {
@@ -250,10 +272,6 @@ const Handshake = struct {
                 if (self.hs.cipher()) |cipher| {
                     self.ktls = Ktls.init(cipher);
                     try io.ktlsUgrade(self.userData(), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
-
-                    //log.debug("tls connected {}", .{cipher});
-                    //log.debug("tx_buf {x}", .{self.tx_opt_buf});
-                    //try io.close(self.userData(), self.fd);
                     return;
                 }
                 try io.recv(self.userData(), self.fd);
@@ -263,13 +281,13 @@ const Handshake = struct {
             },
             .ktls_upgrade => {
                 _ = try Io.result(cqe);
-                log.debug("UPGRADED input_buffer_len: {}!!!", .{self.input_buf.buffer.len});
-                //try io.close(self.userData(), self.fd);
                 // TODO sto ako je nesto ostalo u input_buf
+                assert(self.input_buf.buffer.len == 0);
                 try self.srv.newConnection(self.fd);
+                self.deinit();
             },
             .close => {
-                log.debug("tls closed", .{});
+                self.deinit();
             },
             else => unreachable,
         }
@@ -290,6 +308,11 @@ const Connection = struct {
         try io.recv(self.userData(), self.fd);
     }
 
+    fn deinit(self: *Connection) void {
+        self.srv.remove(self.id) catch {};
+        self.srv.gpa.destroy(self);
+    }
+
     fn complete(self: *Connection, cqe: linux.io_uring_cqe) !void {
         const io = self.srv.io;
         const ud: UserData = @bitCast(cqe.user_data);
@@ -297,7 +320,7 @@ const Connection = struct {
 
         switch (ud.operation) {
             .recv => {
-                // TODO retry on interrupt, no_buffs
+                // TODO retry on interrupt, no_buffs, close on all other
                 _ = try Io.result(cqe);
                 const bytes = try io.getRecvBuffer(cqe);
                 defer io.putRecvBuffer(cqe) catch {};
@@ -315,12 +338,14 @@ const Connection = struct {
                 try io.send(self.userData(), self.fd, not_found);
             },
             .send => {
+                // TODO: close on error, handle short send
                 _ = try Io.result(cqe);
                 try io.close(self.userData(), self.fd);
             },
             .close => {
-                // TODO notify server
-                log.debug("connection closed", .{});
+                // TODO: log error
+                _ = try Io.result(cqe);
+                self.deinit();
             },
             else => unreachable,
         }

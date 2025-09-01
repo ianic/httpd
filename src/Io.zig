@@ -53,12 +53,19 @@ pub fn deinit(io: *Io, allocator: Allocator) void {
 pub fn peek(io: *Io) !linux.io_uring_cqe {
     while (true) {
         if (io.cqes.len == 0) {
-            _ = try io.ring.submit();
-            const n = try io.ring.copy_cqes(&io.cqes_buf, 1);
+            _ = io.ring.submit() catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
+            const n = io.ring.copy_cqes(&io.cqes_buf, 1) catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
             io.cqes = io.cqes_buf[0..n];
         }
         const cqe = io.cqes[0];
         if (cqe.user_data == UserData.skip) {
+            io.advance();
             continue;
         }
         return cqe;
