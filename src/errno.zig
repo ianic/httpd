@@ -9,7 +9,7 @@ pub const Error = error{
     OperationNotPermitted, // PERM = 1 Operation not permitted
     NoSuchFileOrDirectory, // NOENT = 2 No such file or directory
     NoSuchProcess, // SRCH = 3 No such process
-    InterruptedSystemCall, // INTR = 4 Interrupted system call
+    SignalInterrupt, // INTR = 4 Interrupted system call
     IOError, // IO = 5 I/O error
     NoSuchDeviceOrAddress, // NXIO = 6 No such device or address
     ArgListTooLong, // @"2BIG" = 7 Arg list too long
@@ -162,7 +162,7 @@ pub fn toError(errno: posix.E) Error {
         .PERM => error.OperationNotPermitted, // 1 Operation not permitted
         .NOENT => error.NoSuchFileOrDirectory, // 2 No such file or directory
         .SRCH => error.NoSuchProcess, // 3 No such process
-        .INTR => error.InterruptedSystemCall, // 4 Interrupted system call
+        .INTR => error.SignalInterrupt, // 4 Interrupted system call
         .IO => error.IOError, // 5 I/O error
         .NXIO => error.NoSuchDeviceOrAddress, // 6 No such device or address
         .@"2BIG" => error.ArgListTooLong, // 7 Arg list too long

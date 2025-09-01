@@ -12,6 +12,7 @@ const log = std.log.scoped(.main);
 const tls = @import("tls");
 const mem = std.mem;
 const signal = @import("signal.zig");
+const Ktls = @import("Ktls.zig");
 
 pub fn main() !void {
     signal.watch();
@@ -80,33 +81,35 @@ const Listener = struct {
     completion: Io.Completion = .{},
 
     fn init(self: *Listener) !void {
-        try self.io.socket(self.completion.with(socket), &self.addr);
+        try self.io.socket(self.completion.with(onSocket), &self.addr);
     }
 
-    fn socket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
         self.fd = try Io.result(cqe);
-        try self.io.listen(completion.with(listen), &self.addr, self.fd);
+        try self.io.listen(completion.with(onListen), &self.addr, self.fd);
     }
 
-    fn listen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
         assert(0 == try Io.result(cqe));
-        try self.io.accept(completion.with(accept), self.fd);
+        try self.accept();
     }
 
-    fn accept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn accept(self: *Listener) !void {
+        try self.io.accept(self.completion.with(onAccept), self.fd);
+    }
+
+    fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
         const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
             error.OperationCanceled => return,
             else => return err,
         };
-
-        try self.io.accept(completion.with(accept), self.fd);
-
+        try self.accept();
         switch (self.protocol) {
             .http => {
                 const conn = try self.gpa.create(Connection);
@@ -138,19 +141,34 @@ const Handshake = struct {
 
     fn init(self: *Handshake, config: tls.config.Server) !void {
         self.hs = .init(config);
-        try self.io.recv(self.completion.with(recv), self.fd);
+        try self.recv();
     }
 
-    fn recv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn recv(self: *Handshake) !void {
+        try self.io.recv(self.completion.with(onRecv), self.fd);
+    }
+
+    fn close(self: *Handshake) !void {
+        try self.io.close(self.completion.with(onClose), self.fd);
+    }
+
+    fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         const n = Io.result(cqe) catch |err| {
-            log.info("handshake recv failed {}", .{err});
-            try self.io.close(completion.with(close), self.fd);
+            switch (err) {
+                error.SignalInterrupt, error.NoBufferSpaceAvailable => {
+                    try self.recv();
+                },
+                else => {
+                    log.info("fd :{} handshake recv failed {}", .{ self.fd, err });
+                    try self.close();
+                },
+            }
             return;
         };
         if (n == 0) {
-            try self.io.close(completion.with(close), self.fd);
+            try self.close();
             return;
         }
         const input_buf = try self.input_buf.append(self.gpa, try self.io.getRecvBuffer(cqe));
@@ -158,31 +176,31 @@ const Handshake = struct {
 
         const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
             log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
-            try self.io.close(completion.with(close), self.fd);
+            try self.close();
             return;
         };
 
         try self.input_buf.set(self.gpa, res.unused_recv);
         if (res.send_pos > 0) {
-            try self.io.send(completion.with(send), self.fd, res.send);
+            try self.io.send(completion.with(onSend), self.fd, res.send);
             return;
         }
         if (self.hs.cipher()) |cipher| {
             self.ktls = Ktls.init(cipher);
-            try self.io.ktlsUgrade(completion.with(upgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+            try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
             return;
         }
-        try self.io.recv(completion.with(recv), self.fd);
+        try self.io.recv(completion.with(onRecv), self.fd);
     }
 
-    fn send(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
-        try self.io.recv(completion.with(recv), self.fd);
+        try self.io.recv(completion.with(onRecv), self.fd);
     }
 
-    fn upgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
@@ -194,7 +212,7 @@ const Handshake = struct {
         self.deinit();
     }
 
-    fn close(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
@@ -215,10 +233,10 @@ const Connection = struct {
     completion: Io.Completion = .{},
 
     fn init(self: *Connection) !void {
-        try self.io.recv(self.completion.with(recv), self.fd);
+        try self.io.recv(self.completion.with(onRecv), self.fd);
     }
 
-    fn recv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         // TODO retry on interrupt, no_buffs, close on all other
@@ -236,17 +254,21 @@ const Connection = struct {
             log.debug("http header not found", .{});
         }
 
-        try self.io.send(completion.with(send), self.fd, not_found);
+        try self.io.send(completion.with(onSend), self.fd, not_found);
     }
 
-    fn send(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
-        try self.io.close(completion.with(close), self.fd);
+        try self.close();
     }
 
-    fn close(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn close(self: *Connection) !void {
+        try self.io.close(self.completion.with(onClose), self.fd);
+    }
+
+    fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
@@ -297,112 +319,6 @@ pub const UnusedDataBuffer = struct {
     pub fn deinit(self: *Self, allocator: Allocator) void {
         allocator.free(self.buffer);
         self.buffer = &.{};
-    }
-};
-
-// Kernel structs and constants from: /usr/include/linux/tls.h or
-// https://github.com/torvalds/linux/blob/master/include/uapi/linux/tls.h
-const Ktls = struct {
-    const U = union(enum) {
-        aes_gcm_128: AesGcm128,
-        aes_gcm_256: AesGcm256,
-        chacha20_poly1305: Chacha20Poly1305,
-    };
-
-    tx: U,
-    rx: U,
-
-    pub fn txBytes(k: *Ktls) []const u8 {
-        return switch (k.tx) {
-            inline else => |*v| mem.asBytes(v),
-        };
-    }
-
-    pub fn rxBytes(k: *Ktls) []const u8 {
-        return switch (k.rx) {
-            inline else => |*v| mem.asBytes(v),
-        };
-    }
-
-    pub const VERSION_1_2 = 0x0303;
-    pub const VERSION_1_3 = 0x0304;
-    pub const TX = 1;
-    pub const RX = 2;
-
-    pub const AES_GCM_128 = 51;
-    pub const AES_GCM_256 = 52;
-    pub const CHACHA20_POLY1305 = 54;
-
-    pub const Info = extern struct {
-        version: u16 = VERSION_1_3,
-        cipher_type: u16 = mem.zeroes(u16),
-    };
-    pub const AesGcm128 = extern struct {
-        info: Info = mem.zeroes(Info),
-        iv: [8]u8 = mem.zeroes([8]u8),
-        key: [16]u8 = mem.zeroes([16]u8),
-        salt: [4]u8 = mem.zeroes([4]u8),
-        rec_seq: [8]u8 = mem.zeroes([8]u8),
-    };
-    pub const AesGcm256 = extern struct {
-        info: Info = mem.zeroes(Info),
-        iv: [8]u8 = mem.zeroes([8]u8),
-        key: [32]u8 = mem.zeroes([32]u8),
-        salt: [4]u8 = mem.zeroes([4]u8),
-        rec_seq: [8]u8 = mem.zeroes([8]u8),
-    };
-    pub const Chacha20Poly1305 = extern struct {
-        info: Info = mem.zeroes(Info),
-        iv: [12]u8 = mem.zeroes([12]u8),
-        key: [32]u8 = mem.zeroes([32]u8),
-        salt: [0]u8 = mem.zeroes([0]u8),
-        rec_seq: [8]u8 = mem.zeroes([8]u8),
-    };
-
-    fn init(cipher: tls.Cipher) Ktls {
-        switch (cipher) {
-            .AES_128_GCM_SHA256 => |keys| {
-                const k = makeKeys(AesGcm128, .{ .cipher_type = AES_GCM_128 }, keys);
-                return .{
-                    .tx = .{ .aes_gcm_128 = k.tx },
-                    .rx = .{ .aes_gcm_128 = k.rx },
-                };
-            },
-            .AES_256_GCM_SHA384 => |keys| {
-                const k = makeKeys(AesGcm256, .{ .cipher_type = AES_GCM_256 }, keys);
-                return .{
-                    .tx = .{ .aes_gcm_256 = k.tx },
-                    .rx = .{ .aes_gcm_256 = k.rx },
-                };
-            },
-            .CHACHA20_POLY1305_SHA256 => |keys| {
-                const k = makeKeys(Chacha20Poly1305, .{ .cipher_type = CHACHA20_POLY1305 }, keys);
-                return .{
-                    .tx = .{ .chacha20_poly1305 = k.tx },
-                    .rx = .{ .chacha20_poly1305 = k.rx },
-                };
-            },
-            else => unreachable,
-        }
-    }
-
-    fn makeKeys(comptime T: type, info: Info, keys: anytype) struct { tx: T, rx: T } {
-        return .{
-            .tx = makeKey(T, info, keys.encrypt_iv, keys.encrypt_key, keys.encrypt_seq),
-            .rx = makeKey(T, info, keys.decrypt_iv, keys.decrypt_key, keys.decrypt_seq),
-        };
-    }
-
-    fn makeKey(comptime T: type, info: Info, iv: anytype, key: anytype, seq: u64) T {
-        const salt_size = @sizeOf(@FieldType(T, "salt"));
-        var t: T = .{
-            .info = info,
-            .salt = iv[0..salt_size].*,
-            .iv = if (iv.len > salt_size) iv[salt_size..].* else @splat(0),
-            .key = key,
-        };
-        std.mem.writeInt(u64, &t.rec_seq, seq, .big);
-        return t;
     }
 };
 
