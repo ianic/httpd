@@ -11,8 +11,11 @@ const Io = @import("Io.zig");
 const log = std.log.scoped(.main);
 const tls = @import("tls");
 const mem = std.mem;
+const signal = @import("signal.zig");
 
 pub fn main() !void {
+    signal.watch();
+
     var dbga = std.heap.DebugAllocator(.{}){};
     defer _ = dbga.deinit();
     const gpa = dbga.allocator();
@@ -45,7 +48,22 @@ pub fn main() !void {
     var https_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = https_addr, .protocol = .{ .https = tls_config } };
     try https_listener.init();
 
-    try io.loop();
+    while (true) {
+        io.tick() catch |err| switch (err) {
+            error.SignalInterrupt => {},
+            else => return err,
+        };
+        if (signal.get()) |sig| switch (sig) {
+            posix.SIG.TERM, posix.SIG.INT => break,
+            else => {
+                log.info("ignoring signal {}", .{sig});
+            },
+        };
+    }
+
+    try http_listener.close();
+    try https_listener.close();
+    try io.drain();
 }
 
 const Listener = struct {
@@ -82,9 +100,13 @@ const Listener = struct {
     fn accept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
+        const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
+            error.OperationCanceled => return,
+            else => return err,
+        };
+
         try self.io.accept(completion.with(accept), self.fd);
 
-        const fd: fd_t = try Io.result(cqe);
         switch (self.protocol) {
             .http => {
                 const conn = try self.gpa.create(Connection);
@@ -97,6 +119,10 @@ const Listener = struct {
                 try handshake.init(config);
             },
         }
+    }
+
+    fn close(self: *Listener) !void {
+        try self.io.cancel(&Io.Completion.noop, self.fd);
     }
 };
 
