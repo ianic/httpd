@@ -37,318 +37,199 @@ pub fn main() !void {
             .CHACHA20_POLY1305_SHA256,
         },
     };
+
     const http_addr = try std.net.Address.resolveIp("127.0.0.1", 8080);
     const https_addr = try std.net.Address.resolveIp("127.0.0.1", 8443);
+    var http_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = http_addr };
+    try http_listener.init();
+    var https_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = https_addr, .protocol = .{ .https = tls_config } };
+    try https_listener.init();
 
-    var srv: Server = .{ .gpa = gpa, .io = &io, .tls_config = tls_config };
-    try srv.newListener(http_addr, .http);
-    try srv.newListener(https_addr, .https);
-
-    while (true) {
-        const cqe = try io.peek();
-        // TODO: handle sqe exhaustion
-        try srv.complete(cqe);
-        io.advance();
-    }
+    try io.loop();
 }
-
-const Server = struct {
-    gpa: Allocator,
-    io: *Io,
-    tls_config: tls.config.Server,
-    pool: Pool = .{},
-
-    fn newListener(self: *Server, addr: net.Address, protocol: Listener.Protocol) !void {
-        const listener = try self.gpa.create(Listener);
-        errdefer self.gpa.destroy(listener);
-        const id = try self.pool.put(self.gpa, @intFromPtr(listener));
-        errdefer self.pool.remove(self.gpa, id) catch {};
-        listener.* = .{
-            .srv = self,
-            .id = id,
-            .fd = -1,
-            .addr = addr,
-            .protocol = protocol,
-        };
-        try listener.init();
-    }
-
-    fn newConnection(self: *Server, fd: fd_t) !void {
-        const conn = try self.gpa.create(Connection);
-        errdefer self.gpa.destroy(conn);
-        const id = try self.pool.put(self.gpa, @intFromPtr(conn));
-        errdefer self.pool.remove(self.gpa, id) catch {};
-        conn.* = .{
-            .srv = self,
-            .id = id,
-            .fd = fd,
-        };
-        try conn.init();
-    }
-
-    fn newHandshake(self: *Server, fd: fd_t) !void {
-        const hs = try self.gpa.create(Handshake);
-        errdefer self.gpa.destroy(hs);
-        const id = try self.pool.put(self.gpa, @intFromPtr(hs));
-        errdefer self.pool.remove(self.gpa, id) catch {};
-        hs.* = .{
-            .srv = self,
-            .id = id,
-            .fd = fd,
-        };
-        try hs.init();
-    }
-
-    fn remove(self: *Server, id: u32) !void {
-        try self.pool.remove(self.gpa, id);
-    }
-
-    fn complete(self: *Server, cqe: linux.io_uring_cqe) !void {
-        const ud: UserData = @bitCast(cqe.user_data);
-        const ptr = self.pool.get(ud.id);
-        switch (ud.kind) {
-            .listener => try Listener.complete(@ptrFromInt(ptr), cqe),
-            .connection => try Connection.complete(@ptrFromInt(ptr), cqe),
-            .handshake => try Handshake.complete(@ptrFromInt(ptr), cqe),
-        }
-    }
-};
-
-const UserData = packed struct {
-    const Kind = enum(u8) {
-        listener,
-        handshake,
-        connection,
-    };
-
-    operation: Io.Operation = .nop, // 8
-    _: u16 = 0, //  16 - unused
-    kind: Kind, // 8
-    id: u32, // 32
-};
-
-comptime {
-    assert(@bitSizeOf(UserData) == 64);
-}
-
-test UserData {
-    try testing.expectEqual(8, @sizeOf(UserData));
-    try testing.expectEqual(64, @bitSizeOf(UserData));
-
-    const user_data: UserData = .{ .operation = .send, .kind = .connection, .id = 0x0abbccdd };
-    try testing.expectEqual(0x0a_bb_cc_dd_02_00_00_09, @as(u64, @bitCast(user_data)));
-}
-
-const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-
-const Pool = struct {
-    ptrs: std.ArrayList(usize) = .empty,
-    free: std.ArrayList(u32) = .empty,
-
-    pub fn put(self: *Pool, gpa: Allocator, ptr: usize) !u32 {
-        if (self.free.pop()) |idx| {
-            self.ptrs.items[idx] = @intCast(ptr);
-            return idx;
-        }
-        try self.ptrs.append(gpa, ptr);
-        return @intCast(self.ptrs.items.len - 1);
-    }
-
-    pub fn get(self: *Pool, idx: u32) usize {
-        return self.ptrs.items[idx];
-    }
-
-    pub fn remove(self: *Pool, gpa: Allocator, idx: u32) !void {
-        if (self.ptrs.items.len - 1 == idx) {
-            _ = self.ptrs.pop();
-            return;
-        }
-        try self.free.append(gpa, idx);
-    }
-};
 
 const Listener = struct {
-    srv: *Server,
-    id: u32,
-    fd: fd_t,
+    const Protocol = union(enum) {
+        http: void,
+        https: tls.config.Server,
+    };
+
+    gpa: Allocator,
+    io: *Io,
     addr: net.Address,
     protocol: Protocol = .http,
+    fd: fd_t = -1,
 
-    const Protocol = enum { http, https };
-
-    fn userData(self: *Listener) u64 {
-        return @bitCast(UserData{ .id = self.id, .kind = .listener });
-    }
+    completion: Io.Completion = .{},
 
     fn init(self: *Listener) !void {
-        const io = self.srv.io;
-        try io.socket(self.userData(), &self.addr);
+        try self.io.socket(&self.completion, socket, &self.addr);
     }
 
-    fn complete(self: *Listener, cqe: linux.io_uring_cqe) !void {
-        const io = self.srv.io;
-        const ud: UserData = @bitCast(cqe.user_data);
-        assert(ud.kind == .listener);
+    fn socket(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
 
-        switch (ud.operation) {
-            .socket => {
-                self.fd = try Io.result(cqe);
-                try io.listen(self.userData(), &self.addr, self.fd);
+        self.fd = try Io.result(cqe);
+        try self.io.listen(&self.completion, listen, &self.addr, self.fd);
+    }
+
+    fn listen(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
+
+        assert(0 == try Io.result(cqe));
+        try self.io.accept(&self.completion, accept, self.fd);
+    }
+
+    fn accept(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
+
+        try self.io.accept(&self.completion, accept, self.fd);
+        const fd: fd_t = try Io.result(cqe);
+        switch (self.protocol) {
+            .http => {
+                const conn = try self.gpa.create(Connection);
+                conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = fd };
+                try conn.init();
             },
-            .listen => {
-                assert(0 == try Io.result(cqe));
-                try io.accept(self.userData(), self.fd);
+            .https => |config| {
+                const handshake = try self.gpa.create(Handshake);
+                handshake.* = .{ .gpa = self.gpa, .io = self.io, .fd = fd };
+                try handshake.init(config);
             },
-            .accept => {
-                try io.accept(@bitCast(ud), self.fd);
-                const fd: fd_t = try Io.result(cqe);
-                switch (self.protocol) {
-                    .http => try self.srv.newConnection(fd),
-                    .https => try self.srv.newHandshake(fd),
-                }
-            },
-            else => unreachable,
         }
     }
 };
 
 const Handshake = struct {
-    srv: *Server,
-    id: u32,
+    gpa: Allocator,
+    io: *Io,
     fd: fd_t,
     hs: tls.nonblock.Server = undefined,
     input_buf: UnusedDataBuffer = .{},
     output_buf: [tls.output_buffer_len]u8 = undefined,
     ktls: Ktls = undefined,
+    completion: Io.Completion = .{},
 
-    fn userData(self: *Handshake) u64 {
-        return @bitCast(UserData{ .id = self.id, .kind = .handshake });
+    fn init(self: *Handshake, config: tls.config.Server) !void {
+        self.hs = .init(config);
+        try self.io.recv(&self.completion, recv, self.fd);
     }
 
-    fn init(self: *Handshake) !void {
-        const io = self.srv.io;
-        self.hs = .init(self.srv.tls_config);
-        try io.recv(self.userData(), self.fd);
+    fn recv(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+
+        const n = Io.result(cqe) catch |err| {
+            log.info("handshake recv failed {}", .{err});
+            try self.io.close(&self.completion, close, self.fd);
+            return;
+        };
+        if (n == 0) {
+            try self.io.close(&self.completion, close, self.fd);
+            return;
+        }
+        const input_buf = try self.input_buf.append(self.gpa, try self.io.getRecvBuffer(cqe));
+        defer self.io.putRecvBuffer(cqe) catch {};
+
+        const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
+            log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
+            try self.io.close(&self.completion, close, self.fd);
+            return;
+        };
+
+        try self.input_buf.set(self.gpa, res.unused_recv);
+        if (res.send_pos > 0) {
+            try self.io.send(&self.completion, send, self.fd, res.send);
+            return;
+        }
+        if (self.hs.cipher()) |cipher| {
+            self.ktls = Ktls.init(cipher);
+            try self.io.ktlsUgrade(&self.completion, upgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+            return;
+        }
+        try self.io.recv(&self.completion, recv, self.fd);
+    }
+
+    fn send(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+
+        _ = try Io.result(cqe);
+        try self.io.recv(&self.completion, recv, self.fd);
+    }
+
+    fn upgrade(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+
+        _ = try Io.result(cqe);
+        // TODO sto ako je nesto ostalo u input_buf
+        assert(self.input_buf.buffer.len == 0);
+        const conn = try self.gpa.create(Connection);
+        conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = self.fd };
+        try conn.init();
+        self.deinit();
+    }
+
+    fn close(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+
+        _ = try Io.result(cqe);
+        self.deinit();
     }
 
     fn deinit(self: *Handshake) void {
-        const gpa = self.srv.gpa;
-        self.input_buf.deinit(gpa);
-        self.srv.remove(self.id) catch {};
-        gpa.destroy(self);
-    }
-
-    fn complete(self: *Handshake, cqe: linux.io_uring_cqe) !void {
-        const io = self.srv.io;
-        const gpa = self.srv.gpa;
-        const ud: UserData = @bitCast(cqe.user_data);
-        assert(ud.kind == .handshake);
-
-        switch (ud.operation) {
-            .recv => {
-                const n = Io.result(cqe) catch |err| {
-                    log.info("handshake recv failed {}", .{err});
-                    try io.close(self.userData(), self.fd);
-                    return;
-                };
-                if (n == 0) {
-                    try io.close(self.userData(), self.fd);
-                    return;
-                }
-                const input_buf = try self.input_buf.append(gpa, try io.getRecvBuffer(cqe));
-                defer io.putRecvBuffer(cqe) catch {};
-
-                const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
-                    log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
-                    try io.close(self.userData(), self.fd);
-                    return;
-                };
-
-                try self.input_buf.set(gpa, res.unused_recv);
-                if (res.send_pos > 0) {
-                    try io.send(self.userData(), self.fd, res.send);
-                    return;
-                }
-                if (self.hs.cipher()) |cipher| {
-                    self.ktls = Ktls.init(cipher);
-                    try io.ktlsUgrade(self.userData(), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
-                    return;
-                }
-                try io.recv(self.userData(), self.fd);
-            },
-            .send => {
-                try io.recv(self.userData(), self.fd);
-            },
-            .ktls_upgrade => {
-                _ = try Io.result(cqe);
-                // TODO sto ako je nesto ostalo u input_buf
-                assert(self.input_buf.buffer.len == 0);
-                try self.srv.newConnection(self.fd);
-                self.deinit();
-            },
-            .close => {
-                self.deinit();
-            },
-            else => unreachable,
-        }
+        log.debug("handshake deinit", .{});
+        self.input_buf.deinit(self.gpa);
+        self.gpa.destroy(self);
     }
 };
 
 const Connection = struct {
-    srv: *Server,
-    id: u32,
+    gpa: Allocator,
+    io: *Io,
     fd: fd_t,
-
-    fn userData(self: *Connection) u64 {
-        return @bitCast(UserData{ .id = self.id, .kind = .connection });
-    }
+    completion: Io.Completion = .{},
 
     fn init(self: *Connection) !void {
-        const io = self.srv.io;
-        try io.recv(self.userData(), self.fd);
+        try self.io.recv(&self.completion, recv, self.fd);
+    }
+
+    fn recv(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+
+        // TODO retry on interrupt, no_buffs, close on all other
+        _ = try Io.result(cqe);
+        const bytes = try self.io.getRecvBuffer(cqe);
+        defer self.io.putRecvBuffer(cqe) catch {};
+
+        var hp: http.HeadParser = .{};
+        const n = hp.feed(bytes);
+        if (hp.state == .finished) {
+            // TODO close on error
+            const head = try http.Server.Request.Head.parse(bytes[0..n]);
+            log.debug("head: {}", .{head});
+        } else {
+            log.debug("http header not found", .{});
+        }
+
+        try self.io.send(&self.completion, send, self.fd, not_found);
+    }
+
+    fn send(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+
+        _ = try Io.result(cqe);
+        try self.io.close(&self.completion, close, self.fd);
+    }
+
+    fn close(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+
+        _ = try Io.result(cqe);
+        self.deinit();
     }
 
     fn deinit(self: *Connection) void {
-        self.srv.remove(self.id) catch {};
-        self.srv.gpa.destroy(self);
-    }
-
-    fn complete(self: *Connection, cqe: linux.io_uring_cqe) !void {
-        const io = self.srv.io;
-        const ud: UserData = @bitCast(cqe.user_data);
-        assert(ud.kind == .connection);
-
-        switch (ud.operation) {
-            .recv => {
-                // TODO retry on interrupt, no_buffs, close on all other
-                _ = try Io.result(cqe);
-                const bytes = try io.getRecvBuffer(cqe);
-                defer io.putRecvBuffer(cqe) catch {};
-
-                var hp: http.HeadParser = .{};
-                const n = hp.feed(bytes);
-                if (hp.state == .finished) {
-                    // TODO close on error
-                    const head = try http.Server.Request.Head.parse(bytes[0..n]);
-                    log.debug("head: {}", .{head});
-                } else {
-                    log.debug("http header not found", .{});
-                }
-
-                try io.send(self.userData(), self.fd, not_found);
-            },
-            .send => {
-                // TODO: close on error, handle short send
-                _ = try Io.result(cqe);
-                try io.close(self.userData(), self.fd);
-            },
-            .close => {
-                // TODO: log error
-                _ = try Io.result(cqe);
-                self.deinit();
-            },
-            else => unreachable,
-        }
+        log.debug("connection deinit", .{});
+        self.gpa.destroy(self);
     }
 };
 
@@ -499,31 +380,4 @@ const Ktls = struct {
     }
 };
 
-test "sizes" {
-    std.debug.print("size 1: {} {}\n", .{ @sizeOf(Ktls.AesGcm256), @alignOf(Ktls.AesGcm256) });
-    std.debug.print("size 2: {} {}\n", .{ @sizeOf(Ktls.AesGcm128), @alignOf(Ktls.AesGcm128) });
-    std.debug.print("size 2: {} {}\n", .{ @sizeOf(Ktls.Chacha20Poly1305), @alignOf(Ktls.Chacha20Poly1305) });
-}
-
-test "dealloc" {
-    const gpa = testing.allocator;
-
-    gpa.free(try allocMem());
-}
-
-fn freeMem(m: []const u8) void {
-    const gpa = testing.allocator;
-    gpa.free(m);
-}
-
-fn allocMem() ![]align(2) const u8 {
-    const gpa = testing.allocator;
-    const T = Ktls.AesGcm256;
-    const o = try gpa.create(T);
-    const m = mem.asBytes(o);
-    return m;
-    // const buf = try gpa.alignedAlloc(u8, mem.Alignment.of(T), @sizeOf(T));
-    // @memcpy(buf, mem.asBytes(o));
-    // gpa.destroy(o);
-    // return buf;
-}
+const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
