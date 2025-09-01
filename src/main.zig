@@ -30,6 +30,12 @@ pub fn main() !void {
     defer auth.deinit(gpa);
     const tls_config: tls.config.Server = .{
         .auth = &auth,
+        // only ciphers supported by both handshake library and kernel
+        .cipher_suites = &[_]tls.config.CipherSuite{
+            .AES_128_GCM_SHA256,
+            .AES_256_GCM_SHA384,
+            .CHACHA20_POLY1305_SHA256,
+        },
     };
     const http_addr = try std.net.Address.resolveIp("127.0.0.1", 8080);
     const https_addr = try std.net.Address.resolveIp("127.0.0.1", 8443);
@@ -51,12 +57,6 @@ const Server = struct {
     io: *Io,
     tls_config: tls.config.Server,
     pool: Pool = .{},
-
-    // fn init(srv: *Server) !void {
-    //     const io = srv.io;
-    //     try io.socket(@bitCast(UserData{ .kind = .http_listener }), &srv.http_addr);
-    //     try io.socket(@bitCast(UserData{ .kind = .https_listener }), &srv.https_addr);
-    // }
 
     fn newListener(self: *Server, addr: net.Address, protocol: Listener.Protocol) !void {
         const listener = try self.gpa.create(Listener);
@@ -106,74 +106,6 @@ const Server = struct {
             .listener => try Listener.complete(@ptrFromInt(ptr), cqe),
             .connection => try Connection.complete(@ptrFromInt(ptr), cqe),
             .handshake => try Handshake.complete(@ptrFromInt(ptr), cqe),
-
-            // .https_listener => {
-            //     switch (ud.operation) {
-            //         .socket => {
-            //             const fd = try Io.result(cqe);
-            //             try io.listen(@bitCast(UserData{ .fd = fd, .kind = .https_listener }), &self.https_addr, fd);
-            //         },
-            //         .listen => {
-            //             assert(0 == try Io.result(cqe));
-            //             try io.accept(@bitCast(ud), ud.fd);
-            //         },
-            //         .accept => {
-            //             try io.accept(@bitCast(ud), ud.fd);
-
-            //             const fd: fd_t = try Io.result(cqe);
-            //             const hs = try self.gpa.create(Handshake);
-            //             const id = self.pool.put(hs);
-            //             hs.* = .{
-            //                 .id = id,
-            //                 .srv = self,
-            //                 .fd = fd,
-            //             };
-            //             try hs.init();
-
-            //             log.debug("https connection {}", .{fd});
-            //         },
-            //         else => unreachable,
-            //     }
-            // },
-            // .https_handshake => {
-            //     switch (ud.operation) {
-            //         .recv => {
-            //             const bytes = try io.getRecvBuffer(cqe);
-            //             std.debug.print("{s}", .{bytes});
-            //             try io.putRecvBuffer(cqe);
-            //         },
-            //         else => unreachable,
-            //     }
-            // },
-            // .connection => {
-            //     switch (ud.operation) {
-            //         .recv => {
-            //             // TODO retry on interrupt, no_buffs
-            //             _ = try Io.result(cqe);
-            //             const bytes = try io.getRecvBuffer(cqe);
-
-            //             var hp: http.HeadParser = .{};
-            //             const n = hp.feed(bytes);
-            //             if (hp.state == .finished) {
-            //                 // TODO close on error
-            //                 const head = try http.Server.Request.Head.parse(bytes[0..n]);
-            //                 log.debug("head: {}", .{head});
-            //             } else {
-            //                 log.debug("http header not found", .{});
-            //             }
-
-            //             try io.send(@bitCast(ud), ud.fd, not_found);
-            //             try io.putRecvBuffer(cqe);
-            //         },
-            //         .send => {
-            //             try io.close(@bitCast(ud), ud.fd);
-            //         },
-            //         .close => {
-            //             log.debug("connection closed", .{});
-            //         },
-            //         else => unreachable,
-            //     }
-            // },
         }
     }
 };
@@ -283,8 +215,7 @@ const Handshake = struct {
     hs: tls.nonblock.Server = undefined,
     input_buf: UnusedDataBuffer = .{},
     output_buf: [tls.output_buffer_len]u8 = undefined,
-    tx_opt_buf: []const u8 = &.{},
-    rx_opt_buf: []const u8 = &.{},
+    ktls: Ktls = undefined,
 
     fn userData(self: *Handshake) u64 {
         return @bitCast(UserData{ .id = self.id, .kind = .handshake });
@@ -317,8 +248,8 @@ const Handshake = struct {
                     return;
                 }
                 if (self.hs.cipher()) |cipher| {
-                    self.tx_opt_buf, self.rx_opt_buf = try KTls.init(gpa, cipher);
-                    try io.ktlsUgrade(self.userData(), self.fd, self.tx_opt_buf, self.rx_opt_buf);
+                    self.ktls = Ktls.init(cipher);
+                    try io.ktlsUgrade(self.userData(), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
 
                     //log.debug("tls connected {}", .{cipher});
                     //log.debug("tx_buf {x}", .{self.tx_opt_buf});
@@ -439,78 +370,101 @@ pub const UnusedDataBuffer = struct {
 
 // Kernel structs and constants from: /usr/include/linux/tls.h or
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/tls.h
-//
-// Generated by zig translate and than cleaned a little bit.
-//$ zig translate-c -I/usr/include /usr/include/linux/tls.h
-//
-const KTls = struct {
-    const U = union {
-        aes_gcm_128: aes_gcm_128,
-        aes_gcm_256: aes_gcm_256,
-        chacha20_poly1305: chacha20_poly1305,
+const Ktls = struct {
+    const U = union(enum) {
+        aes_gcm_128: AesGcm128,
+        aes_gcm_256: AesGcm256,
+        chacha20_poly1305: Chacha20Poly1305,
     };
 
     tx: U,
     rx: U,
 
+    pub fn txBytes(k: *Ktls) []const u8 {
+        return switch (k.tx) {
+            inline else => |*v| mem.asBytes(v),
+        };
+    }
+
+    pub fn rxBytes(k: *Ktls) []const u8 {
+        return switch (k.rx) {
+            inline else => |*v| mem.asBytes(v),
+        };
+    }
+
     pub const VERSION_1_2 = 0x0303;
     pub const VERSION_1_3 = 0x0304;
-    pub const TX = @as(c_int, 1);
-    pub const RX = @as(c_int, 2);
+    pub const TX = 1;
+    pub const RX = 2;
 
-    pub const AES_GCM_128 = @as(c_int, 51);
-    pub const AES_GCM_256 = @as(c_int, 52);
-    pub const CHACHA20_POLY1305 = @as(c_int, 54);
+    pub const AES_GCM_128 = 51;
+    pub const AES_GCM_256 = 52;
+    pub const CHACHA20_POLY1305 = 54;
 
-    pub const info = extern struct {
-        version: u16 = mem.zeroes(u16),
+    pub const Info = extern struct {
+        version: u16 = VERSION_1_3,
         cipher_type: u16 = mem.zeroes(u16),
     };
-    pub const aes_gcm_128 = extern struct {
-        info: info = mem.zeroes(info),
+    pub const AesGcm128 = extern struct {
+        info: Info = mem.zeroes(Info),
         iv: [8]u8 = mem.zeroes([8]u8),
         key: [16]u8 = mem.zeroes([16]u8),
         salt: [4]u8 = mem.zeroes([4]u8),
         rec_seq: [8]u8 = mem.zeroes([8]u8),
     };
-    pub const aes_gcm_256 = extern struct {
-        info: info = mem.zeroes(info),
+    pub const AesGcm256 = extern struct {
+        info: Info = mem.zeroes(Info),
         iv: [8]u8 = mem.zeroes([8]u8),
         key: [32]u8 = mem.zeroes([32]u8),
         salt: [4]u8 = mem.zeroes([4]u8),
         rec_seq: [8]u8 = mem.zeroes([8]u8),
     };
-    pub const chacha20_poly1305 = extern struct {
-        info: info = mem.zeroes(info),
+    pub const Chacha20Poly1305 = extern struct {
+        info: Info = mem.zeroes(Info),
         iv: [12]u8 = mem.zeroes([12]u8),
         key: [32]u8 = mem.zeroes([32]u8),
         salt: [0]u8 = mem.zeroes([0]u8),
         rec_seq: [8]u8 = mem.zeroes([8]u8),
     };
 
-    fn init(gpa: Allocator, cipher: tls.Cipher) !struct { []const u8, []const u8 } {
+    fn init(cipher: tls.Cipher) Ktls {
         switch (cipher) {
-            .AES_256_GCM_SHA384 => |c| {
-                const T = aes_gcm_256;
-                const i: info = .{ .version = VERSION_1_3, .cipher_type = AES_GCM_256 };
-                const tx = make(T, i, c.encrypt_iv, c.encrypt_key, c.encrypt_seq);
-                const rx = make(T, i, c.decrypt_iv, c.decrypt_key, c.decrypt_seq);
-
-                const tx_buf = try gpa.alignedAlloc(u8, mem.Alignment.of(T), @sizeOf(T));
-                const rx_buf = try gpa.alignedAlloc(u8, mem.Alignment.of(T), @sizeOf(T));
-                @memcpy(tx_buf, mem.asBytes(&tx));
-                @memcpy(rx_buf, mem.asBytes(&rx));
-
-                return .{ tx_buf, rx_buf };
+            .AES_128_GCM_SHA256 => |keys| {
+                const k = makeKeys(AesGcm128, .{ .cipher_type = AES_GCM_128 }, keys);
+                return .{
+                    .tx = .{ .aes_gcm_128 = k.tx },
+                    .rx = .{ .aes_gcm_128 = k.rx },
+                };
+            },
+            .AES_256_GCM_SHA384 => |keys| {
+                const k = makeKeys(AesGcm256, .{ .cipher_type = AES_GCM_256 }, keys);
+                return .{
+                    .tx = .{ .aes_gcm_256 = k.tx },
+                    .rx = .{ .aes_gcm_256 = k.rx },
+                };
+            },
+            .CHACHA20_POLY1305_SHA256 => |keys| {
+                const k = makeKeys(Chacha20Poly1305, .{ .cipher_type = CHACHA20_POLY1305 }, keys);
+                return .{
+                    .tx = .{ .chacha20_poly1305 = k.tx },
+                    .rx = .{ .chacha20_poly1305 = k.rx },
+                };
             },
             else => unreachable,
         }
     }
 
-    fn make(comptime T: type, i: info, iv: anytype, key: anytype, seq: u64) T {
+    fn makeKeys(comptime T: type, info: Info, keys: anytype) struct { tx: T, rx: T } {
+        return .{
+            .tx = makeKey(T, info, keys.encrypt_iv, keys.encrypt_key, keys.encrypt_seq),
+            .rx = makeKey(T, info, keys.decrypt_iv, keys.decrypt_key, keys.decrypt_seq),
+        };
+    }
+
+    fn makeKey(comptime T: type, info: Info, iv: anytype, key: anytype, seq: u64) T {
         const salt_size = @sizeOf(@FieldType(T, "salt"));
         var t: T = .{
-            .info = i,
+            .info = info,
             .salt = iv[0..salt_size].*,
             .iv = if (iv.len > salt_size) iv[salt_size..].* else @splat(0),
             .key = key,
@@ -521,7 +475,30 @@ const KTls = struct {
 };
 
 test "sizes" {
-    std.debug.print("size 1: {} {}\n", .{ @sizeOf(KTls.aes_gcm_256), @alignOf(KTls.aes_gcm_256) });
-    std.debug.print("size 2: {} {}\n", .{ @sizeOf(KTls.aes_gcm_128), @alignOf(KTls.aes_gcm_128) });
-    std.debug.print("size 2: {} {}\n", .{ @sizeOf(KTls.chacha20_poly1305), @alignOf(KTls.chacha20_poly1305) });
+    std.debug.print("size 1: {} {}\n", .{ @sizeOf(Ktls.AesGcm256), @alignOf(Ktls.AesGcm256) });
+    std.debug.print("size 2: {} {}\n", .{ @sizeOf(Ktls.AesGcm128), @alignOf(Ktls.AesGcm128) });
+    std.debug.print("size 2: {} {}\n", .{ @sizeOf(Ktls.Chacha20Poly1305), @alignOf(Ktls.Chacha20Poly1305) });
+}
+
+test "dealloc" {
+    const gpa = testing.allocator;
+
+    gpa.free(try allocMem());
+}
+
+fn freeMem(m: []const u8) void {
+    const gpa = testing.allocator;
+    gpa.free(m);
+}
+
+fn allocMem() ![]align(2) const u8 {
+    const gpa = testing.allocator;
+    const T = Ktls.AesGcm256;
+    const o = try gpa.create(T);
+    const m = mem.asBytes(o);
+    return m;
+    // const buf = try gpa.alignedAlloc(u8, mem.Alignment.of(T), @sizeOf(T));
+    // @memcpy(buf, mem.asBytes(o));
+    // gpa.destroy(o);
+    // return buf;
 }
