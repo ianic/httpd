@@ -59,31 +59,31 @@ const Listener = struct {
     addr: net.Address,
     protocol: Protocol = .http,
     fd: fd_t = -1,
-
     completion: Io.Completion = .{},
 
     fn init(self: *Listener) !void {
-        try self.io.socket(&self.completion, socket, &self.addr);
+        try self.io.socket(self.completion.with(socket), &self.addr);
     }
 
-    fn socket(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
+    fn socket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
         self.fd = try Io.result(cqe);
-        try self.io.listen(&self.completion, listen, &self.addr, self.fd);
+        try self.io.listen(completion.with(listen), &self.addr, self.fd);
     }
 
-    fn listen(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
+    fn listen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
         assert(0 == try Io.result(cqe));
-        try self.io.accept(&self.completion, accept, self.fd);
+        try self.io.accept(completion.with(accept), self.fd);
     }
 
-    fn accept(c: *Io.Completion, cqe: linux.io_uring_cqe) anyerror!void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", c));
+    fn accept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
 
-        try self.io.accept(&self.completion, accept, self.fd);
+        try self.io.accept(completion.with(accept), self.fd);
+
         const fd: fd_t = try Io.result(cqe);
         switch (self.protocol) {
             .http => {
@@ -112,19 +112,19 @@ const Handshake = struct {
 
     fn init(self: *Handshake, config: tls.config.Server) !void {
         self.hs = .init(config);
-        try self.io.recv(&self.completion, recv, self.fd);
+        try self.io.recv(self.completion.with(recv), self.fd);
     }
 
-    fn recv(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+    fn recv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         const n = Io.result(cqe) catch |err| {
             log.info("handshake recv failed {}", .{err});
-            try self.io.close(&self.completion, close, self.fd);
+            try self.io.close(completion.with(close), self.fd);
             return;
         };
         if (n == 0) {
-            try self.io.close(&self.completion, close, self.fd);
+            try self.io.close(completion.with(close), self.fd);
             return;
         }
         const input_buf = try self.input_buf.append(self.gpa, try self.io.getRecvBuffer(cqe));
@@ -132,32 +132,32 @@ const Handshake = struct {
 
         const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
             log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
-            try self.io.close(&self.completion, close, self.fd);
+            try self.io.close(completion.with(close), self.fd);
             return;
         };
 
         try self.input_buf.set(self.gpa, res.unused_recv);
         if (res.send_pos > 0) {
-            try self.io.send(&self.completion, send, self.fd, res.send);
+            try self.io.send(completion.with(send), self.fd, res.send);
             return;
         }
         if (self.hs.cipher()) |cipher| {
             self.ktls = Ktls.init(cipher);
-            try self.io.ktlsUgrade(&self.completion, upgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+            try self.io.ktlsUgrade(completion.with(upgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
             return;
         }
-        try self.io.recv(&self.completion, recv, self.fd);
+        try self.io.recv(completion.with(recv), self.fd);
     }
 
-    fn send(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+    fn send(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
-        try self.io.recv(&self.completion, recv, self.fd);
+        try self.io.recv(completion.with(recv), self.fd);
     }
 
-    fn upgrade(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+    fn upgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
         // TODO sto ako je nesto ostalo u input_buf
@@ -168,8 +168,8 @@ const Handshake = struct {
         self.deinit();
     }
 
-    fn close(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", c));
+    fn close(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
         self.deinit();
@@ -189,11 +189,11 @@ const Connection = struct {
     completion: Io.Completion = .{},
 
     fn init(self: *Connection) !void {
-        try self.io.recv(&self.completion, recv, self.fd);
+        try self.io.recv(self.completion.with(recv), self.fd);
     }
 
-    fn recv(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+    fn recv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         // TODO retry on interrupt, no_buffs, close on all other
         _ = try Io.result(cqe);
@@ -210,18 +210,18 @@ const Connection = struct {
             log.debug("http header not found", .{});
         }
 
-        try self.io.send(&self.completion, send, self.fd, not_found);
+        try self.io.send(completion.with(send), self.fd, not_found);
     }
 
-    fn send(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+    fn send(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
-        try self.io.close(&self.completion, close, self.fd);
+        try self.io.close(completion.with(close), self.fd);
     }
 
-    fn close(c: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", c));
+    fn close(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
         self.deinit();

@@ -24,7 +24,14 @@ pub const Options = struct {
 
 pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
 pub const Completion = struct {
-    callback: Callback = undefined,
+    callback: Callback = noopCallback,
+
+    /// Complete by calling this callback
+    pub fn with(self: *Completion, callback: Callback) *Completion {
+        assert(self.callback == noopCallback);
+        self.callback = callback;
+        return self;
+    }
 };
 
 var noop: Completion = .{ .callback = noopCallback };
@@ -73,23 +80,25 @@ pub fn loop(io: *Io) !void {
         }
         const cqe = io.cqes[0];
 
-        var c: *Completion = @ptrFromInt(cqe.user_data);
-        try c.callback(c, cqe);
+        const completion: *Completion = @ptrFromInt(cqe.user_data);
+        // Reset completion.callback so that completion can be reused during callback.
+        const callback = completion.callback;
+        completion.callback = noopCallback;
+        // TODO: catch no more sqe's and retry
+        try callback(completion, cqe);
         io.cqes = io.cqes[1..];
     }
 }
 
-pub fn socket(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address) !void {
-    c.callback = cb;
+pub fn socket(io: *Io, c: *Completion, addr: *const net.Address) !void {
     _ = try io.ring.socket_direct_alloc(@intFromPtr(c), addr.any.family, linux.SOCK.STREAM, 0, 0);
 }
 
-pub fn listen(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address, fd: posix.fd_t) !void {
+pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: posix.fd_t) !void {
     // TODO move this into option
     const reuse_address = true;
     const kernel_backlog: u31 = 128;
 
-    c.callback = cb;
     var sqe: *linux.io_uring_sqe = undefined;
     if (reuse_address) {
         sqe = try io.ring.setsockopt(@intFromPtr(&noop), fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
@@ -103,10 +112,10 @@ pub fn listen(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address, f
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn ktlsUgrade(io: *Io, c: *Completion, cb: Callback, fd: posix.fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
+pub fn ktlsUgrade(io: *Io, c: *Completion, fd: posix.fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
     const TX = @as(c_int, 1);
     const RX = @as(c_int, 2);
-    c.callback = cb;
+
     var sqe = try io.ring.setsockopt(@intFromPtr(&noop), fd, linux.IPPROTO.TCP, linux.TCP.ULP, "tls");
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(@intFromPtr(&noop), fd, linux.SOL.TLS, TX, tx_opt);
@@ -115,14 +124,12 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, cb: Callback, fd: posix.fd_t, tx_opt:
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn accept(io: *Io, c: *Completion, cb: Callback, fd: posix.fd_t) !void {
-    c.callback = cb;
+pub fn accept(io: *Io, c: *Completion, fd: posix.fd_t) !void {
     var sqe = try io.ring.accept_direct(@intFromPtr(c), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn recv(io: *Io, c: *Completion, cb: Callback, fd: posix.fd_t) !void {
-    c.callback = cb;
+pub fn recv(io: *Io, c: *Completion, fd: posix.fd_t) !void {
     var sqe = try io.recv_buffer_group.recv(@intFromPtr(c), fd, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -136,22 +143,19 @@ pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: *Completion, cb: Callback, fd: linux.fd_t) !void {
-    c.callback = cb;
+pub fn close(io: *Io, c: *Completion, fd: linux.fd_t) !void {
     _ = try io.ring.close_direct(@intFromPtr(c), @intCast(fd));
 }
 
 /// Cancel any fd operations
-pub fn cancel(io: *Io, c: *Completion, cb: Callback, fd: linux.fd_t) !void {
-    c.callback = cb;
+pub fn cancel(io: *Io, c: *Completion, fd: linux.fd_t) !void {
     var sqe = try io.ring.get_sqe();
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.user_data = @intFromPtr(c);
 }
 
-pub fn send(io: *Io, c: *Completion, cb: Callback, fd: linux.fd_t, buffer: []const u8) !void {
-    c.callback = cb;
+pub fn send(io: *Io, c: *Completion, fd: linux.fd_t, buffer: []const u8) !void {
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, linux.MSG.NOSIGNAL);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
