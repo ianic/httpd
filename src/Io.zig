@@ -107,7 +107,7 @@ pub fn tick(io: *Io) !void {
     }
     while (io.cqes.len > 0) {
         const cqe = io.cqes[0];
-        if (cqe.user_data != @intFromPtr(&Completion.noop)) {
+        if (cqe.user_data > 0 and cqe.user_data != @intFromPtr(&Completion.noop)) {
             const completion: *Completion = @ptrFromInt(cqe.user_data);
             // Reset completion.callback so that completion can be reused during callback.
             const callback = completion.callback;
@@ -186,9 +186,10 @@ pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: *Completion, fd: linux.fd_t) !void {
-    _ = try io.ring.close_direct(@intFromPtr(c), @intCast(fd));
-    io.metric.prep(c);
+pub fn close(io: *Io, c: ?*Completion, fd: linux.fd_t) !void {
+    const user_data: u64 = if (c) |ptr| @intFromPtr(ptr) else 0;
+    _ = try io.ring.close_direct(user_data, @intCast(fd));
+    if (c) |ptr| io.metric.prep(ptr);
 }
 
 /// Cancel any fd operations
@@ -200,9 +201,21 @@ pub fn cancel(io: *Io, c: *Completion, fd: linux.fd_t) !void {
     io.metric.prep(c);
 }
 
-pub fn send(io: *Io, c: *Completion, fd: linux.fd_t, buffer: []const u8) !void {
-    var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, linux.MSG.NOSIGNAL);
+pub fn send(io: *Io, c: *Completion, fd: linux.fd_t, buffer: []const u8, flags: SendFlags) !void {
+    var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
+    io.metric.prep(c);
+}
+
+const SendFlags = packed struct {
+    _reserved1: u14 = 0,
+    no_signal: bool = true,
+    more: bool = false,
+    _reserved2: u16 = 0,
+};
+
+pub fn statx(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
+    _ = try io.ring.statx(@intFromPtr(c), dir, path, 0, linux.STATX_SIZE, stat);
     io.metric.prep(c);
 }
 
@@ -213,6 +226,18 @@ pub fn openAt(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8, flags: li
 
 pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8) !void {
     return io.openAt(c, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
+}
+
+pub fn sendfile(io: *Io, c: *Completion, fd_out: linux.fd_t, fd_in: linux.fd_t, pipe_fds: [2]linux.fd_t, offset: u64, len: u32) !void {
+    const SPLICE_F_NONBLOCK = 0x02;
+    const no_offset = std.math.maxInt(u64);
+    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], no_offset, len);
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK;
+    sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], no_offset, fd_out, no_offset, len);
+    sqe.rw_flags = SPLICE_F_NONBLOCK;
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    io.metric.prep(c);
 }
 
 const yes_socket_option = std.mem.asBytes(&@as(u32, 1));

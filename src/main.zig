@@ -28,6 +28,10 @@ pub fn main() !void {
     const gpa = dbga.allocator();
 
     server.root = std.fs.cwd();
+    // Get real/absolute path string for cwd
+    const path = try server.root.realpathAlloc(gpa, ".");
+    std.debug.print("Current working directory: {s}\n", .{path});
+    defer gpa.free(path);
 
     var io: Io = .{};
     try io.init(gpa, .{
@@ -194,7 +198,7 @@ const Handshake = struct {
 
         try self.unused_recv.set(self.gpa, res.unused_recv);
         if (res.send_pos > 0) {
-            try self.io.send(completion.with(onSend), self.fd, res.send);
+            try self.io.send(completion.with(onSend), self.fd, res.send, .{});
             return;
         }
         if (self.hs.cipher()) |cipher| {
@@ -269,7 +273,16 @@ const Connection = struct {
     fd: fd_t,
     completion: Io.Completion = .{},
     unused_recv: UnusedDataBuffer = .{},
-    path: ?[:0]const u8 = null,
+
+    file: struct {
+        fd: fd_t = -1,
+        path: ?[:0]const u8 = null,
+        stat: ?linux.Statx = null,
+        header: ?[]u8 = null,
+    } = .{},
+    // Pipe file descriptors used in sendfile splices.
+    // Created by sync system call on first use.
+    pipe_fds: [2]linux.fd_t = .{ -1, -1 },
 
     fn init(self: *Connection, recv_buf: []const u8) !void {
         if (recv_buf.len > 0) {
@@ -328,25 +341,86 @@ const Connection = struct {
         };
         if (head.method == .GET and head.target.len > 0) {
             //log.debug("target: {s}", .{head.target});
-            const path = try self.gpa.dupeZ(u8, head.target);
-            self.path = path;
+            const path = try self.gpa.dupeZ(u8, head.target[1..]);
+            self.file.path = path;
             try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
-            try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
+
+            self.file.stat = mem.zeroes(linux.Statx);
+            try self.io.statx(self.completion.with(onStat), server.root.fd, path, &self.file.stat.?);
             return;
         }
         try self.close();
     }
 
+    fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const path = self.file.path.?;
+        const stat = self.file.stat.?;
+
+        _ = Io.result(cqe) catch |err| {
+            switch (err) {
+                error.NoSuchFileOrDirectory => try self.notFound(),
+                else => {
+                    log.info("stat '{s}' failed {}", .{ path, err });
+                    try self.close();
+                },
+            }
+            return;
+        };
+        // TODO ovdje je prilika da provjerim etag na osnovu mtime i odlucim da mogu odgovorti s not modified
+
+        log.debug("statx: {}", .{stat});
+        try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
+    }
+
     fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const path = self.file.path.?;
+        const stat = self.file.stat.?;
 
-        _ = Io.result(cqe) catch |err| switch (err) {
-            error.NoSuchFileOrDirectory => try self.notFound(),
-            else => {
-                log.info("open '{s}' failed {}", .{ self.path.?, err });
-                try self.close();
-            },
+        const fd = Io.result(cqe) catch |err| {
+            switch (err) {
+                error.NoSuchFileOrDirectory => try self.notFound(),
+                else => {
+                    log.info("open '{s}' failed {}", .{ path, err });
+                    try self.close();
+                },
+            }
+            return;
         };
+        self.file.fd = fd;
+
+        const header_fmt = "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n\r\n";
+        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{stat.size});
+        try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
+
+        log.debug("file opened {s} fd: {}", .{ path, fd });
+    }
+
+    fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const stat = self.file.stat.?;
+
+        _ = try Io.result(cqe);
+        self.pipe_fds = try std.posix.pipe();
+        try self.io.sendfile(self.completion.with(onBody), self.fd, self.file.fd, self.pipe_fds, 0, @intCast(stat.size));
+    }
+
+    fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+
+        _ = try Io.result(cqe);
+        try self.io.close(self.completion.with(onFileClose), self.file.fd);
+    }
+
+    fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+
+        _ = try Io.result(cqe);
+        try self.close();
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -357,7 +431,7 @@ const Connection = struct {
     }
 
     fn notFound(self: *Connection) !void {
-        try self.io.send(self.completion.with(onSend), self.fd, not_found);
+        try self.io.send(self.completion.with(onSend), self.fd, not_found, .{});
     }
 
     fn close(self: *Connection) !void {
@@ -372,9 +446,17 @@ const Connection = struct {
     }
 
     fn deinit(self: *Connection) void {
-        if (self.path) |path| {
-            self.gpa.free(path);
-        }
+        if (self.file.path) |path| self.gpa.free(path);
+        if (self.file.header) |header| self.gpa.free(header);
+
+        // if (self.pipe_fds[0] != -1) {
+        //     if (self.loop.closePipe(self.pipe_fds)) {
+        //         self.pipe_fds = .{ -1, -1 };
+        //     } else |err| {
+        //         log.err("tcp close pipe {}", .{err});
+        //     }
+        // }
+
         self.gpa.destroy(self);
     }
 };
