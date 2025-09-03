@@ -5,6 +5,7 @@ const posix = std.posix;
 const net = std.net;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
+const fd_t = posix.fd_t;
 
 const log = std.log.scoped(.io);
 
@@ -132,7 +133,7 @@ pub fn socket(io: *Io, c: *Completion, addr: *const net.Address) !void {
     io.metric.prep(c);
 }
 
-pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: posix.fd_t) !void {
+pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: fd_t) !void {
     // TODO move this into option
     const reuse_address = true;
     const kernel_backlog: u31 = 128;
@@ -151,7 +152,7 @@ pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: posix.fd_t)
     io.metric.prep(c);
 }
 
-pub fn ktlsUgrade(io: *Io, c: *Completion, fd: posix.fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
+pub fn ktlsUgrade(io: *Io, c: *Completion, fd: fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
     const TX = @as(c_int, 1);
     const RX = @as(c_int, 2);
 
@@ -164,13 +165,13 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, fd: posix.fd_t, tx_opt: []const u8, r
     io.metric.prep(c);
 }
 
-pub fn accept(io: *Io, c: *Completion, fd: posix.fd_t) !void {
+pub fn accept(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.accept_direct(@intFromPtr(c), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.prep(c);
 }
 
-pub fn recv(io: *Io, c: *Completion, fd: posix.fd_t) !void {
+pub fn recv(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.recv_buffer_group.recv(@intFromPtr(c), fd, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.prep(c);
@@ -203,6 +204,15 @@ pub fn send(io: *Io, c: *Completion, fd: linux.fd_t, buffer: []const u8) !void {
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, linux.MSG.NOSIGNAL);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.prep(c);
+}
+
+pub fn openAt(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
+    _ = try io.ring.openat_direct(@intFromPtr(c), dir, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC);
+    io.metric.prep(c);
+}
+
+pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8) !void {
+    return io.openAt(c, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
 const yes_socket_option = std.mem.asBytes(&@as(u32, 1));

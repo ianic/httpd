@@ -14,12 +14,20 @@ const mem = std.mem;
 const signal = @import("signal.zig");
 const Ktls = @import("Ktls.zig");
 
+var server: struct {
+    root: std.fs.Dir,
+} = .{
+    .root = undefined,
+};
+
 pub fn main() !void {
     signal.watch();
 
     var dbga = std.heap.DebugAllocator(.{}){};
     defer _ = dbga.deinit();
     const gpa = dbga.allocator();
+
+    server.root = std.fs.cwd();
 
     var io: Io = .{};
     try io.init(gpa, .{
@@ -114,7 +122,7 @@ const Listener = struct {
             .http => {
                 const conn = try self.gpa.create(Connection);
                 conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = fd };
-                try conn.init();
+                try conn.init(&.{});
             },
             .https => |config| {
                 const handshake = try self.gpa.create(Handshake);
@@ -134,7 +142,7 @@ const Handshake = struct {
     io: *Io,
     fd: fd_t,
     hs: tls.nonblock.Server = undefined,
-    input_buf: UnusedDataBuffer = .{},
+    unused_recv: UnusedDataBuffer = .{},
     output_buf: [tls.output_buffer_len]u8 = undefined,
     ktls: Ktls = undefined,
     completion: Io.Completion = .{},
@@ -161,7 +169,7 @@ const Handshake = struct {
                     try self.recv();
                 },
                 else => {
-                    log.info("fd :{} handshake recv failed {}", .{ self.fd, err });
+                    log.info("handshake recv failed {}", .{err});
                     try self.close();
                 },
             }
@@ -171,26 +179,57 @@ const Handshake = struct {
             try self.close();
             return;
         }
-        const input_buf = try self.input_buf.append(self.gpa, try self.io.getRecvBuffer(cqe));
+        const recv_buf = try self.io.getRecvBuffer(cqe);
         defer self.io.putRecvBuffer(cqe) catch {};
+        const input_buf = try self.unused_recv.append(self.gpa, recv_buf);
 
         const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
-            log.info("fd: {} tls handsake failed {}", .{ self.fd, err });
+            log.info("tls handsake failed {}", .{err});
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpStackTrace(trace.*);
+            }
             try self.close();
             return;
         };
 
-        try self.input_buf.set(self.gpa, res.unused_recv);
+        try self.unused_recv.set(self.gpa, res.unused_recv);
         if (res.send_pos > 0) {
             try self.io.send(completion.with(onSend), self.fd, res.send);
             return;
         }
         if (self.hs.cipher()) |cipher| {
+            // handsake done
+            const unused = self.unused_recv.buffer;
+            if (unused.len > 0) {
+                // Handshake done but there are unused recv ciphertext. We need
+                // to decrypt that before passing to the connection. There are
+                // chances that we don't have full tls record in unused!
+                var input_rdr = std.Io.Reader.fixed(unused);
+                var output_wrt = std.Io.Writer.fixed(&.{});
+                var conn: tls.Connection = .{ .cipher = cipher, .output = &output_wrt, .input = &input_rdr };
+                if (conn.next() catch |err| {
+                    log.err("handshake unable to decrypt unused recv {} bytes {}", .{ unused.len, err });
+                    try self.close();
+                    return;
+                }) |cleartext| {
+                    log.debug("handsake unused cleartext {}", .{cleartext.len});
+                    try self.unused_recv.set(self.gpa, cleartext);
+                } else {
+                    log.err("hadshake parital record in unused bytes {}", .{unused.len});
+                    try self.close();
+                    return;
+                }
+
+                self.ktls = Ktls.init(conn.cipher);
+                try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+                return;
+            }
+
             self.ktls = Ktls.init(cipher);
             try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
             return;
         }
-        try self.io.recv(completion.with(onRecv), self.fd);
+        try self.recv();
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -202,13 +241,11 @@ const Handshake = struct {
 
     fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
-
+        // TODO handle errors
         _ = try Io.result(cqe);
-        // TODO sto ako je nesto ostalo u input_buf
-        assert(self.input_buf.buffer.len == 0);
         const conn = try self.gpa.create(Connection);
         conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = self.fd };
-        try conn.init();
+        try conn.init(self.unused_recv.buffer);
         self.deinit();
     }
 
@@ -220,8 +257,8 @@ const Handshake = struct {
     }
 
     fn deinit(self: *Handshake) void {
-        log.debug("handshake deinit", .{});
-        self.input_buf.deinit(self.gpa);
+        // log.debug("handshake deinit", .{});
+        self.unused_recv.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 };
@@ -231,30 +268,85 @@ const Connection = struct {
     io: *Io,
     fd: fd_t,
     completion: Io.Completion = .{},
+    unused_recv: UnusedDataBuffer = .{},
+    path: ?[:0]const u8 = null,
 
-    fn init(self: *Connection) !void {
+    fn init(self: *Connection, recv_buf: []const u8) !void {
+        if (recv_buf.len > 0) {
+            //log.debug("connection init with {}", .{recv_buf.len});
+            try self.parseHeader(recv_buf);
+            return;
+        }
+        try self.recv();
+    }
+
+    fn recv(self: *Connection) !void {
         try self.io.recv(self.completion.with(onRecv), self.fd);
     }
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
-        // TODO retry on interrupt, no_buffs, close on all other
-        _ = try Io.result(cqe);
-        const bytes = try self.io.getRecvBuffer(cqe);
+        const n = Io.result(cqe) catch |err| {
+            switch (err) {
+                error.SignalInterrupt, error.NoBufferSpaceAvailable => {
+                    try self.recv();
+                },
+                else => {
+                    log.info("connection recv failed {}", .{err});
+                    try self.close();
+                },
+            }
+            return;
+        };
+        if (n == 0) {
+            try self.close();
+            return;
+        }
+        const recv_buf = try self.io.getRecvBuffer(cqe);
         defer self.io.putRecvBuffer(cqe) catch {};
 
-        var hp: http.HeadParser = .{};
-        const n = hp.feed(bytes);
-        if (hp.state == .finished) {
-            // TODO close on error
-            const head = try http.Server.Request.Head.parse(bytes[0..n]);
-            log.debug("head: {}", .{head});
-        } else {
-            log.debug("http header not found", .{});
-        }
+        try self.parseHeader(recv_buf);
+    }
 
-        try self.io.send(completion.with(onSend), self.fd, not_found);
+    fn parseHeader(self: *Connection, recv_buf: []const u8) !void {
+        const input_buf = try self.unused_recv.append(self.gpa, recv_buf);
+        var hp: http.HeadParser = .{};
+        const head_tail = hp.feed(input_buf);
+        if (hp.state != .finished) {
+            try self.unused_recv.set(self.gpa, input_buf);
+            //log.debug("short header {s}", .{input_buf});
+            // Short read, read more
+            try self.recv();
+            return;
+        }
+        const head_buf = input_buf[0..head_tail];
+        const head = http.Server.Request.Head.parse(head_buf) catch |err| {
+            log.info("connection head parse {}", .{err});
+            try self.close();
+            return;
+        };
+        if (head.method == .GET and head.target.len > 0) {
+            //log.debug("target: {s}", .{head.target});
+            const path = try self.gpa.dupeZ(u8, head.target);
+            self.path = path;
+            try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
+            try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
+            return;
+        }
+        try self.close();
+    }
+
+    fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+
+        _ = Io.result(cqe) catch |err| switch (err) {
+            error.NoSuchFileOrDirectory => try self.notFound(),
+            else => {
+                log.info("open '{s}' failed {}", .{ self.path.?, err });
+                try self.close();
+            },
+        };
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -262,6 +354,10 @@ const Connection = struct {
 
         _ = try Io.result(cqe);
         try self.close();
+    }
+
+    fn notFound(self: *Connection) !void {
+        try self.io.send(self.completion.with(onSend), self.fd, not_found);
     }
 
     fn close(self: *Connection) !void {
@@ -276,7 +372,9 @@ const Connection = struct {
     }
 
     fn deinit(self: *Connection) void {
-        log.debug("connection deinit", .{});
+        if (self.path) |path| {
+            self.gpa.free(path);
+        }
         self.gpa.destroy(self);
     }
 };
