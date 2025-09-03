@@ -1,10 +1,6 @@
 //! Kernel structs and constants from: /usr/include/linux/tls.h or
 //! https://github.com/torvalds/linux/blob/master/include/uapi/linux/tls.h
 
-const std = @import("std");
-const mem = std.mem;
-const tls = @import("tls");
-
 const Ktls = @This();
 
 const U = union(enum) {
@@ -108,3 +104,7 @@ fn makeKey(comptime T: type, info: Info, iv: anytype, key: anytype, seq: u64) T 
     mem.writeInt(u64, &t.rec_seq, seq, .big);
     return t;
 }
+
+const std = @import("std");
+const mem = std.mem;
+const tls = @import("tls");

@@ -10,3 +10,8 @@ signature is created with code from Zig std library
 
 - forcibly closing tls connection, not sending close notify tls message
 
+
+# Notes 
+
+[ktls](https://docs.kernel.org/networking/tls.html)  
+[curl and tls libraries](https://everything.curl.dev/build/tls.html)  

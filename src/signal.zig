@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.signal);
 
+var signal = std.atomic.Value(c_int).init(posix.SIG.UNUSED);
+
 pub fn get() ?c_int {
     const sig = signal.load(.monotonic);
     if (sig == posix.SIG.UNUSED)
@@ -9,8 +11,6 @@ pub fn get() ?c_int {
     signal.store(posix.SIG.UNUSED, .release);
     return sig;
 }
-
-var signal = std.atomic.Value(c_int).init(posix.SIG.UNUSED);
 
 pub fn watch() void {
     var act = posix.Sigaction{

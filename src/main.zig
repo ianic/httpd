@@ -1,39 +1,3 @@
-const std = @import("std");
-const linux = std.os.linux;
-const posix = std.posix;
-const net = std.net;
-const http = std.http;
-const assert = std.debug.assert;
-const fd_t = posix.fd_t;
-const testing = std.testing;
-const Allocator = std.mem.Allocator;
-const Io = @import("Io.zig");
-const log = std.log.scoped(.main);
-const tls = @import("tls");
-const mem = std.mem;
-const signal = @import("signal.zig");
-const Ktls = @import("Ktls.zig");
-
-var server: Server = undefined;
-
-const Server = struct {
-    gpa: Allocator,
-    root: std.fs.Dir,
-    pipes: std.ArrayList([2]fd_t) = .empty,
-
-    fn getPipe(self: *Server) ![2]fd_t {
-        if (self.pipes.pop()) |p| {
-            return p;
-        }
-        const p = try posix.pipe();
-        return p;
-    }
-
-    fn putPipe(self: *Server, p: [2]fd_t) !void {
-        try self.pipes.append(self.gpa, p);
-    }
-};
-
 pub fn main() !void {
     signal.watch();
 
@@ -110,20 +74,22 @@ const Listener = struct {
     fd: fd_t = -1,
     completion: Io.Completion = .{},
 
+    inline fn parent(completion: *Io.Completion) *Listener {
+        return @alignCast(@fieldParentPtr("completion", completion));
+    }
+
     fn init(self: *Listener) !void {
         try self.io.socket(self.completion.with(onSocket), &self.addr);
     }
 
     fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         self.fd = try Io.result(cqe);
-        try self.io.listen(completion.with(onListen), &self.addr, self.fd);
+        try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{});
     }
 
     fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         assert(0 == try Io.result(cqe));
         try self.accept();
     }
@@ -133,7 +99,7 @@ const Listener = struct {
     }
 
     fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Listener = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
 
         const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
             error.OperationCanceled => return,
@@ -155,7 +121,7 @@ const Listener = struct {
     }
 
     fn close(self: *Listener) !void {
-        try self.io.cancel(&Io.Completion.noop, self.fd);
+        try self.io.cancel(null, self.fd);
     }
 };
 
@@ -168,6 +134,10 @@ const Handshake = struct {
     output_buf: [tls.output_buffer_len]u8 = undefined,
     ktls: Ktls = undefined,
     completion: Io.Completion = .{},
+
+    inline fn parent(completion: *Io.Completion) *Handshake {
+        return @alignCast(@fieldParentPtr("completion", completion));
+    }
 
     fn init(self: *Handshake, config: tls.config.Server) !void {
         self.hs = .init(config);
@@ -183,7 +153,7 @@ const Handshake = struct {
     }
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
 
         const n = Io.result(cqe) catch |err| {
             switch (err) {
@@ -255,14 +225,14 @@ const Handshake = struct {
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
 
         _ = try Io.result(cqe);
         try self.io.recv(completion.with(onRecv), self.fd);
     }
 
     fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
         // TODO handle errors
         _ = try Io.result(cqe);
         const conn = try self.gpa.create(Connection);
@@ -272,8 +242,7 @@ const Handshake = struct {
     }
 
     fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Handshake = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         _ = try Io.result(cqe);
         self.deinit();
     }
@@ -301,6 +270,10 @@ const Connection = struct {
         pipe: ?[2]fd_t = null,
     } = .{},
 
+    inline fn parent(completion: *Io.Completion) *Connection {
+        return @alignCast(@fieldParentPtr("completion", completion));
+    }
+
     fn init(self: *Connection, recv_buf: []const u8) !void {
         if (recv_buf.len > 0) {
             //log.debug("connection init with {}", .{recv_buf.len});
@@ -315,7 +288,7 @@ const Connection = struct {
     }
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
 
         const n = Io.result(cqe) catch |err| {
             switch (err) {
@@ -370,9 +343,8 @@ const Connection = struct {
     }
 
     fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
         const path = self.file.path.?;
-        //const stat = self.file.stat.?;
 
         _ = Io.result(cqe) catch |err| {
             switch (err) {
@@ -385,13 +357,11 @@ const Connection = struct {
             return;
         };
         // TODO ovdje je prilika da provjerim etag na osnovu mtime i odlucim da mogu odgovorti s not modified
-
-        //log.debug("statx: {}", .{stat});
         try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
     }
 
     fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
         const path = self.file.path.?;
         const stat = self.file.stat.?;
 
@@ -412,14 +382,11 @@ const Connection = struct {
     }
 
     fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         _ = try Io.result(cqe);
-
         self.gpa.free(self.file.header.?);
         self.file.header = null;
         self.file.pipe = try server.getPipe();
-        //log.debug("pipe: {any}", .{self.file.pipe.?});
         try self.sendBody();
     }
 
@@ -430,12 +397,11 @@ const Connection = struct {
     }
 
     fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const self = parent(completion);
         const stat = self.file.stat.?;
         const pipe = self.file.pipe.?;
 
         self.file.offset += @intCast(try Io.result(cqe));
-        //log.debug("sent {} of {}", .{ self.file.offset, stat.size });
         if (self.file.offset == stat.size) {
             try server.putPipe(pipe);
             self.file.pipe = null;
@@ -446,8 +412,7 @@ const Connection = struct {
     }
 
     fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         _ = try Io.result(cqe);
         self.file.fd = -1;
         self.file.stat = null;
@@ -455,8 +420,7 @@ const Connection = struct {
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         _ = try Io.result(cqe);
         try self.close();
     }
@@ -470,8 +434,7 @@ const Connection = struct {
     }
 
     fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
-
+        const self = parent(completion);
         _ = try Io.result(cqe);
         self.deinit();
     }
@@ -524,8 +487,44 @@ pub const UnusedDataBuffer = struct {
     }
 };
 
+var server: Server = undefined;
+
+const Server = struct {
+    gpa: Allocator,
+    root: std.fs.Dir,
+    pipes: std.ArrayList([2]fd_t) = .empty,
+
+    fn getPipe(self: *Server) ![2]fd_t {
+        if (self.pipes.pop()) |p| {
+            return p;
+        }
+        const p = try posix.pipe();
+        return p;
+    }
+
+    fn putPipe(self: *Server, p: [2]fd_t) !void {
+        try self.pipes.append(self.gpa, p);
+    }
+};
+
 const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 const header_fmt = "HTTP/1.1 200 OK\r\n" ++
     "Content-Type: application/octet-stream\r\n" ++
     "Content-Length: {d}\r\n" ++
     "Connection: close\r\n\r\n";
+
+const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
+const net = std.net;
+const http = std.http;
+const assert = std.debug.assert;
+const fd_t = posix.fd_t;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const Io = @import("Io.zig");
+const log = std.log.scoped(.main);
+const tls = @import("tls");
+const mem = std.mem;
+const signal = @import("signal.zig");
+const Ktls = @import("Ktls.zig");
