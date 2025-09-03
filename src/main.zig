@@ -14,10 +14,24 @@ const mem = std.mem;
 const signal = @import("signal.zig");
 const Ktls = @import("Ktls.zig");
 
-var server: struct {
+var server: Server = undefined;
+
+const Server = struct {
+    gpa: Allocator,
     root: std.fs.Dir,
-} = .{
-    .root = undefined,
+    pipes: std.ArrayList([2]fd_t) = .empty,
+
+    fn getPipe(self: *Server) ![2]fd_t {
+        if (self.pipes.pop()) |p| {
+            return p;
+        }
+        const p = try posix.pipe();
+        return p;
+    }
+
+    fn putPipe(self: *Server, p: [2]fd_t) !void {
+        try self.pipes.append(self.gpa, p);
+    }
 };
 
 pub fn main() !void {
@@ -27,7 +41,11 @@ pub fn main() !void {
     defer _ = dbga.deinit();
     const gpa = dbga.allocator();
 
-    server.root = std.fs.cwd();
+    server = .{
+        .root = std.fs.cwd(),
+        .gpa = gpa,
+        .pipes = .empty,
+    };
     // Get real/absolute path string for cwd
     const path = try server.root.realpathAlloc(gpa, ".");
     std.debug.print("Current working directory: {s}\n", .{path});
@@ -279,10 +297,9 @@ const Connection = struct {
         path: ?[:0]const u8 = null,
         stat: ?linux.Statx = null,
         header: ?[]u8 = null,
+        offset: u64 = 0,
+        pipe: ?[2]fd_t = null,
     } = .{},
-    // Pipe file descriptors used in sendfile splices.
-    // Created by sync system call on first use.
-    pipe_fds: [2]linux.fd_t = .{ -1, -1 },
 
     fn init(self: *Connection, recv_buf: []const u8) !void {
         if (recv_buf.len > 0) {
@@ -355,7 +372,7 @@ const Connection = struct {
     fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
         const path = self.file.path.?;
-        const stat = self.file.stat.?;
+        //const stat = self.file.stat.?;
 
         _ = Io.result(cqe) catch |err| {
             switch (err) {
@@ -369,7 +386,7 @@ const Connection = struct {
         };
         // TODO ovdje je prilika da provjerim etag na osnovu mtime i odlucim da mogu odgovorti s not modified
 
-        log.debug("statx: {}", .{stat});
+        //log.debug("statx: {}", .{stat});
         try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
     }
 
@@ -390,36 +407,50 @@ const Connection = struct {
         };
         self.file.fd = fd;
 
-        const header_fmt = "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: application/octet-stream\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n\r\n";
         self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{stat.size});
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
-
-        log.debug("file opened {s} fd: {}", .{ path, fd });
     }
 
     fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
-        const stat = self.file.stat.?;
 
         _ = try Io.result(cqe);
-        self.pipe_fds = try std.posix.pipe();
-        try self.io.sendfile(self.completion.with(onBody), self.fd, self.file.fd, self.pipe_fds, 0, @intCast(stat.size));
+
+        self.gpa.free(self.file.header.?);
+        self.file.header = null;
+        self.file.pipe = try server.getPipe();
+        //log.debug("pipe: {any}", .{self.file.pipe.?});
+        try self.sendBody();
+    }
+
+    fn sendBody(self: *Connection) !void {
+        const stat = self.file.stat.?;
+        const pipe = self.file.pipe.?;
+        try self.io.sendfile(self.completion.with(onBody), self.fd, self.file.fd, pipe, self.file.offset, @intCast(stat.size));
     }
 
     fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
+        const stat = self.file.stat.?;
+        const pipe = self.file.pipe.?;
 
-        _ = try Io.result(cqe);
-        try self.io.close(self.completion.with(onFileClose), self.file.fd);
+        self.file.offset += @intCast(try Io.result(cqe));
+        //log.debug("sent {} of {}", .{ self.file.offset, stat.size });
+        if (self.file.offset == stat.size) {
+            try server.putPipe(pipe);
+            self.file.pipe = null;
+            try self.io.close(self.completion.with(onFileClose), self.file.fd);
+            return;
+        }
+        try self.sendBody();
     }
 
     fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Connection = @alignCast(@fieldParentPtr("completion", completion));
 
         _ = try Io.result(cqe);
+        self.file.fd = -1;
+        self.file.stat = null;
         try self.close();
     }
 
@@ -448,15 +479,6 @@ const Connection = struct {
     fn deinit(self: *Connection) void {
         if (self.file.path) |path| self.gpa.free(path);
         if (self.file.header) |header| self.gpa.free(header);
-
-        // if (self.pipe_fds[0] != -1) {
-        //     if (self.loop.closePipe(self.pipe_fds)) {
-        //         self.pipe_fds = .{ -1, -1 };
-        //     } else |err| {
-        //         log.err("tcp close pipe {}", .{err});
-        //     }
-        // }
-
         self.gpa.destroy(self);
     }
 };
@@ -503,3 +525,7 @@ pub const UnusedDataBuffer = struct {
 };
 
 const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+const header_fmt = "HTTP/1.1 200 OK\r\n" ++
+    "Content-Type: application/octet-stream\r\n" ++
+    "Content-Length: {d}\r\n" ++
+    "Connection: close\r\n\r\n";

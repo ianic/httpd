@@ -5,7 +5,7 @@ const posix = std.posix;
 const net = std.net;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
-const fd_t = posix.fd_t;
+const fd_t = linux.fd_t;
 
 const log = std.log.scoped(.io);
 
@@ -186,14 +186,14 @@ pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: ?*Completion, fd: linux.fd_t) !void {
+pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
     const user_data: u64 = if (c) |ptr| @intFromPtr(ptr) else 0;
     _ = try io.ring.close_direct(user_data, @intCast(fd));
     if (c) |ptr| io.metric.prep(ptr);
 }
 
 /// Cancel any fd operations
-pub fn cancel(io: *Io, c: *Completion, fd: linux.fd_t) !void {
+pub fn cancel(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.get_sqe();
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -201,7 +201,7 @@ pub fn cancel(io: *Io, c: *Completion, fd: linux.fd_t) !void {
     io.metric.prep(c);
 }
 
-pub fn send(io: *Io, c: *Completion, fd: linux.fd_t, buffer: []const u8, flags: SendFlags) !void {
+pub fn send(io: *Io, c: *Completion, fd: fd_t, buffer: []const u8, flags: SendFlags) !void {
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.prep(c);
@@ -228,7 +228,7 @@ pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8) !void {
     return io.openAt(c, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
-pub fn sendfile(io: *Io, c: *Completion, fd_out: linux.fd_t, fd_in: linux.fd_t, pipe_fds: [2]linux.fd_t, offset: u64, len: u32) !void {
+pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     const SPLICE_F_NONBLOCK = 0x02;
     const no_offset = std.math.maxInt(u64);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], no_offset, len);
