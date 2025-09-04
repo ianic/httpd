@@ -10,6 +10,7 @@ pub fn main() !void {
         .gpa = gpa,
         .pipes = .empty,
     };
+    defer server.deinit();
     // Get real/absolute path string for cwd
     const path = try server.root.realpathAlloc(gpa, ".");
     std.debug.print("Current working directory: {s}\n", .{path});
@@ -23,8 +24,8 @@ pub fn main() !void {
     });
     defer io.deinit(gpa);
 
-    const cert_dir = try std.fs.cwd().openDir("../tls.zig/example/cert", .{});
-    var auth = try tls.config.CertKeyPair.fromFilePath(gpa, cert_dir, "localhost_ec/cert.pem", "localhost_ec/key.pem");
+    const cert_dir = try std.fs.cwd().openDir("../tls.zig/example/cert/localhost_ec", .{});
+    var auth = try tls.config.CertKeyPair.fromFilePath(gpa, cert_dir, "cert.pem", "key.pem");
     defer auth.deinit(gpa);
     const tls_config: tls.config.Server = .{
         .auth = &auth,
@@ -493,6 +494,10 @@ const Server = struct {
     gpa: Allocator,
     root: std.fs.Dir,
     pipes: std.ArrayList([2]fd_t) = .empty,
+
+    fn deinit(self: *Server) void {
+        self.pipes.deinit(self.gpa);
+    }
 
     fn getPipe(self: *Server) ![2]fd_t {
         if (self.pipes.pop()) |p| {
