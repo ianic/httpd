@@ -5,6 +5,7 @@ recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: [128]linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
+dev_null_fd: fd_t = -1,
 
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
@@ -12,7 +13,7 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     io.ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer io.ring.deinit();
     try io.ring.register_files_sparse(opt.fd_nr);
-
+    io.dev_null_fd = try posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     io.recv_buffer_group = try linux.IoUring.BufferGroup.init(
         &io.ring,
         allocator,
@@ -24,6 +25,7 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
     io.recv_buffer_group.deinit(allocator);
+    posix.close(io.dev_null_fd);
     io.ring.deinit();
 }
 
@@ -114,6 +116,24 @@ pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
     try io.recv_buffer_group.put(cqe);
 }
 
+pub fn peek(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
+    const flags: MsgFlags = .{ .peek = true };
+    var sqe = try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = buffer }, @bitCast(flags));
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    io.metric.sumbitted();
+}
+
+/// Discard len bytes from fd to the /dev/null, without copying them to the userspace.
+pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
+    const fd_out = io.dev_null_fd;
+    var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK;
+    sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    sqe.rw_flags = SPLICE_F_NONBLOCK;
+    io.metric.sumbitted();
+}
+
 /// Close file descriptor
 pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
     var sqe = try io.ring.close_direct(0, @intCast(fd));
@@ -138,14 +158,18 @@ pub fn cancel(io: *Io, c: ?*Completion, fd: fd_t) !void {
     }
 }
 
-pub const SendFlags = packed struct {
-    _reserved1: u14 = 0,
+pub const MsgFlags = packed struct {
+    _reserved1: u1 = 0,
+    peek: bool = false,
+    _reserved2: u3 = 0,
+    trunc: bool = false,
+    _reserved3: u8 = 0,
     no_signal: bool = true,
     more: bool = false,
-    _reserved2: u16 = 0,
+    _reserved4: u16 = 0,
 };
 
-pub fn send(io: *Io, c: *Completion, fd: fd_t, buffer: []const u8, flags: SendFlags) !void {
+pub fn send(io: *Io, c: *Completion, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
@@ -166,16 +190,18 @@ pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8) !void {
 }
 
 pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
-    const SPLICE_F_NONBLOCK = 0x02;
-    const no_offset = std.math.maxInt(u64);
-    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], no_offset, len);
+    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
     sqe.flags |= linux.IOSQE_IO_HARDLINK;
-    sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], no_offset, fd_out, no_offset, len);
+    sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = SPLICE_F_NONBLOCK;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
 }
+
+// from musl/include/fcnt.h
+const SPLICE_F_NONBLOCK = 0x02;
+const splice_no_offset = std.math.maxInt(u64);
 
 const yes_socket_option = std.mem.asBytes(&@as(u32, 1));
 
