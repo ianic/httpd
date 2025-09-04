@@ -116,6 +116,12 @@ pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
     try io.recv_buffer_group.put(cqe);
 }
 
+pub fn recvInto(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
+    var sqe = try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = buffer }, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    io.metric.sumbitted();
+}
+
 pub fn peek(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
     const flags: MsgFlags = .{ .peek = true };
     var sqe = try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = buffer }, @bitCast(flags));
@@ -257,6 +263,45 @@ pub const Completion = struct {
     var noop: Completion = .{ .callback = noopCallback };
     fn noopCallback(_: *Completion, _: linux.io_uring_cqe) !void {}
 };
+
+pub fn isConnectionCloseError(err: anyerror) bool {
+    return switch (err) {
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        => true,
+        else => false,
+    };
+}
+
+/// Application can retry on network error
+pub fn isNetworkError(err: anyerror) bool {
+    return switch (err) {
+        error.InterruptedSystemCall,
+        error.OperationCanceled, // Connect timeout
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        // Connect Network errors
+        error.ConnectionRefused, // ECONNREFUSED
+        error.NetworkIsUnreachable, // ENETUNREACH
+        error.NoRouteToHost, // EHOSTUNREACH
+        error.ConnectionTimedOut, // ETIMEDOUT
+        => true,
+        else => false,
+    };
+}
+
+pub fn isTimeoutError(err: anyerror) bool {
+    return switch (err) {
+        error.TimerExpired, // ETIME = 62
+        error.ConnectionTimedOut, // ETIMEDOUT = 110
+        => true,
+        else => false,
+    };
+}
 
 const std = @import("std");
 const assert = std.debug.assert;

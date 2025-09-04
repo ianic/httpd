@@ -103,6 +103,10 @@ const Listener = struct {
         const self = parent(completion);
 
         const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
+            error.SignalInterrupt, error.FileTableOverflow => {
+                try self.accept();
+                return;
+            },
             error.OperationCanceled => return,
             else => return err,
         };
@@ -111,7 +115,7 @@ const Listener = struct {
             .http => {
                 const conn = try self.gpa.create(Connection);
                 conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = fd };
-                try conn.init(&.{});
+                try conn.init();
             },
             .https => |config| {
                 const handshake = try self.gpa.create(Handshake);
@@ -129,12 +133,21 @@ const Listener = struct {
 const Handshake = struct {
     gpa: Allocator,
     io: *Io,
+    /// tcp connection fd
     fd: fd_t,
+    /// tls handsake algorithm
     hs: tls.nonblock.Server = undefined,
-    unused_recv: UnusedDataBuffer = .{},
-    output_buf: [tls.output_buffer_len]u8 = undefined,
+    /// buffer used for both read client messages and write server flight messages
+    buffer: [tls.output_buffer_len]u8 = undefined,
+    /// 0..pos part of the buffer read, written
+    pos: usize = 0,
+    /// pipe used in discard
+    pipe: ?[2]fd_t = null,
+    /// tls keys in kernel format
     ktls: Ktls = undefined,
     completion: Io.Completion = .{},
+    /// pointer to the part of the buffer used in send, needed in the case of short send
+    send_buf: []const u8 = &.{},
 
     inline fn parent(completion: *Io.Completion) *Handshake {
         return @alignCast(@fieldParentPtr("completion", completion));
@@ -146,7 +159,15 @@ const Handshake = struct {
     }
 
     fn recv(self: *Handshake) !void {
-        try self.io.recv(self.completion.with(onRecv), self.fd);
+        if (self.hs.state == .init) {
+            // Read client hello message in the buffer
+            try self.io.recvInto(self.completion.with(onRecv), self.fd, self.buffer[self.pos..]);
+            return;
+        }
+        // Peek client flight into buffer. We will later discard bytes consumed
+        // in handshake leaving other bytes for connection to consume.
+        self.pos = 0;
+        try self.io.peek(self.completion.with(onRecv), self.fd, &self.buffer);
     }
 
     fn close(self: *Handshake) !void {
@@ -155,12 +176,10 @@ const Handshake = struct {
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-
         const n = Io.result(cqe) catch |err| {
             switch (err) {
-                error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                    try self.recv();
-                },
+                error.SignalInterrupt => try self.recv(),
+                error.OperationCanceled => try self.close(), // recv timeout
                 else => {
                     log.info("handshake recv failed {}", .{err});
                     try self.close();
@@ -172,85 +191,101 @@ const Handshake = struct {
             try self.close();
             return;
         }
-        const recv_buf = try self.io.getRecvBuffer(cqe);
-        defer self.io.putRecvBuffer(cqe) catch {};
-        const input_buf = try self.unused_recv.append(self.gpa, recv_buf);
+        self.pos += @intCast(n);
 
-        const res = self.hs.run(input_buf, &self.output_buf) catch |err| {
+        const res = self.hs.run(self.buffer[0..self.pos], &self.buffer) catch |err| {
             log.info("tls handsake failed {}", .{err});
-            if (@errorReturnTrace()) |trace| {
-                std.debug.dumpStackTrace(trace.*);
-            }
+            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
             try self.close();
             return;
         };
-
-        try self.unused_recv.set(self.gpa, res.unused_recv);
         if (res.send_pos > 0) {
-            try self.io.send(completion.with(onSend), self.fd, res.send, .{});
+            // server flight
+            self.send_buf = res.send;
+            try self.io.send(completion.with(onSend), self.fd, self.send_buf, .{});
             return;
         }
-        if (self.hs.cipher()) |cipher| {
-            // handsake done
-            const unused = self.unused_recv.buffer;
-            if (unused.len > 0) {
-                // Handshake done but there are unused recv ciphertext. We need
-                // to decrypt that before passing to the connection. There are
-                // chances that we don't have full tls record in unused!
-                var input_rdr = std.Io.Reader.fixed(unused);
-                var output_wrt = std.Io.Writer.fixed(&.{});
-                var conn: tls.Connection = .{ .cipher = cipher, .output = &output_wrt, .input = &input_rdr };
-                if (conn.next() catch |err| {
-                    log.err("handshake unable to decrypt unused recv {} bytes {}", .{ unused.len, err });
-                    try self.close();
-                    return;
-                }) |cleartext| {
-                    log.debug("handsake unused cleartext {}", .{cleartext.len});
-                    try self.unused_recv.set(self.gpa, cleartext);
-                } else {
-                    log.err("hadshake parital record in unused bytes {}", .{unused.len});
-                    try self.close();
-                    return;
-                }
-
-                self.ktls = Ktls.init(conn.cipher);
-                try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
-                return;
+        if (self.hs.done()) {
+            // Hanshake done. Discard peeked bytes consumed in handshake leave
+            // the rest in the tcp buffer to be decompressed by kernel and
+            // consumed in connection.
+            self.pipe = try server.getPipe();
+            if (self.pos != res.recv_pos) {
+                log.debug("discard makes sense {} {}", .{ res.recv_pos, self.pos });
             }
-
-            self.ktls = Ktls.init(cipher);
-            try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+            self.pos = res.recv_pos;
+            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?, @intCast(self.pos));
             return;
         }
+        // short read, get more
         try self.recv();
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
+        const n = Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.SignalInterrupt => break :brk 0,
+                // client gone
+                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
+                else => log.info("handshake send failed {}", .{err}),
+            }
+            try self.close();
+            return;
+        };
+        if (n < self.send_buf.len) {
+            // short send, send rest
+            self.send_buf = self.send_buf[@intCast(n)..];
+            try self.io.send(completion.with(onSend), self.fd, self.send_buf, .{});
+            return;
+        }
+        // server flight sent, get client flight 2
+        try self.recv();
+    }
 
-        _ = try Io.result(cqe);
-        try self.io.recv(completion.with(onRecv), self.fd);
+    fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self = parent(completion);
+        const n = Io.result(cqe) catch |err| {
+            log.err("discard failed {}", .{err});
+            try self.close();
+            return;
+        };
+        self.pos -= @intCast(n);
+        if (self.pos > 0) {
+            // short discard
+            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?, @intCast(self.pos));
+            return;
+        }
+        // discard done
+        // upgrade connection, push cipher to the kernel
+        try server.putPipe(self.pipe.?);
+        self.pipe = null;
+        self.ktls = Ktls.init(self.hs.cipher().?);
+        try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
     }
 
     fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        // TODO handle errors
-        _ = try Io.result(cqe);
+        _ = Io.result(cqe) catch |err| {
+            log.err("kernel tls upgrade failed {}", .{err});
+            try self.close();
+            return;
+        };
+        // cipher keys are int the kernel
+        // create connection to handle cleartext stream
         const conn = try self.gpa.create(Connection);
         conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = self.fd };
-        try conn.init(self.unused_recv.buffer);
+        try conn.init();
         self.deinit();
     }
 
-    fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onClose(completion: *Io.Completion, _: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        _ = try Io.result(cqe);
         self.deinit();
     }
 
     fn deinit(self: *Handshake) void {
-        // log.debug("handshake deinit", .{});
-        self.unused_recv.deinit(self.gpa);
+        if (self.pipe) |pipe| server.putPipe(pipe) catch {};
         self.gpa.destroy(self);
     }
 };
@@ -275,12 +310,7 @@ const Connection = struct {
         return @alignCast(@fieldParentPtr("completion", completion));
     }
 
-    fn init(self: *Connection, recv_buf: []const u8) !void {
-        if (recv_buf.len > 0) {
-            //log.debug("connection init with {}", .{recv_buf.len});
-            try self.parseHeader(recv_buf);
-            return;
-        }
+    fn init(self: *Connection) !void {
         try self.recv();
     }
 
