@@ -21,6 +21,7 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.size,
         opt.recv_buffers.count,
     );
+    close_notify.init();
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
@@ -140,6 +141,12 @@ pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32
     io.metric.sumbitted();
 }
 
+pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
+    var sqe = try io.ring.sendmsg(0, fd, &close_notify.msg, 0);
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK + linux.IOSQE_CQE_SKIP_SUCCESS;
+    try io.close(c, fd);
+}
+
 /// Close file descriptor
 pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
     var sqe = try io.ring.close_direct(0, @intCast(fd));
@@ -177,6 +184,12 @@ pub const MsgFlags = packed struct {
 
 pub fn send(io: *Io, c: *Completion, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, @bitCast(flags));
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    io.metric.sumbitted();
+}
+
+pub fn sendmsg(io: *Io, c: *Completion, fd: fd_t, msg: *const posix.msghdr_const, flags: MsgFlags) !void {
+    var sqe = try io.ring.sendmsg(@intFromPtr(c), fd, msg, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
 }
@@ -302,6 +315,48 @@ pub fn isTimeoutError(err: anyerror) bool {
         else => false,
     };
 }
+
+var close_notify: CloseNotify = undefined;
+
+const CloseNotify = struct {
+    const body = [2]u8{ 1, 0 }; // alert body: warning, close notify
+    const cmsghdr = extern struct {
+        len: u32,
+        _: u32 = 0,
+        level: i32,
+        typ: i32,
+        record_type: u8,
+    };
+
+    cmsg: cmsghdr = mem.zeroes(cmsghdr),
+    msg: linux.msghdr_const = undefined,
+    iov: [1]posix.iovec_const = undefined,
+
+    fn init(self: *CloseNotify) void {
+        const TLS_SET_RECORD_TYPE = 1;
+        self.iov = .{
+            posix.iovec_const{
+                .base = &body,
+                .len = body.len,
+            },
+        };
+        self.cmsg = .{
+            .record_type = 21, // alert
+            .level = linux.SOL.TLS,
+            .typ = TLS_SET_RECORD_TYPE,
+            .len = @sizeOf(cmsghdr),
+        };
+        self.msg = .{
+            .name = null,
+            .control = &self.cmsg,
+            .controllen = @sizeOf(cmsghdr),
+            .namelen = 0,
+            .flags = 0,
+            .iov = &self.iov,
+            .iovlen = 1,
+        };
+    }
+};
 
 const std = @import("std");
 const assert = std.debug.assert;

@@ -210,9 +210,6 @@ const Handshake = struct {
             // the rest in the tcp buffer to be decompressed by kernel and
             // consumed in connection.
             self.pipe = try server.getPipe();
-            if (self.pos != res.recv_pos) {
-                log.debug("discard makes sense {} {}", .{ res.recv_pos, self.pos });
-            }
             self.pos = res.recv_pos;
             try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?, @intCast(self.pos));
             return;
@@ -274,7 +271,7 @@ const Handshake = struct {
         // cipher keys are int the kernel
         // create connection to handle cleartext stream
         const conn = try self.gpa.create(Connection);
-        conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = self.fd };
+        conn.* = .{ .gpa = self.gpa, .io = self.io, .fd = self.fd, .protocol = .https };
         try conn.init();
         self.deinit();
     }
@@ -291,11 +288,14 @@ const Handshake = struct {
 };
 
 const Connection = struct {
+    const Protocol = enum { http, https };
+
     gpa: Allocator,
     io: *Io,
     fd: fd_t,
     completion: Io.Completion = .{},
     unused_recv: UnusedDataBuffer = .{},
+    protocol: Protocol = .http,
 
     file: struct {
         fd: fd_t = -1,
@@ -461,12 +461,18 @@ const Connection = struct {
     }
 
     fn close(self: *Connection) !void {
-        try self.io.close(self.completion.with(onClose), self.fd);
+        const c = self.completion.with(onClose);
+        if (self.protocol == .https) {
+            try self.io.closeTls(c, self.fd);
+            return;
+        }
+        try self.io.close(c, self.fd);
     }
 
     fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
         _ = try Io.result(cqe);
+        log.debug("connection closed", .{});
         self.deinit();
     }
 
