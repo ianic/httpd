@@ -77,12 +77,12 @@ pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: fd_t, opt: 
     var sqe: *linux.io_uring_sqe = undefined;
     if (opt.reuse_address) {
         sqe = try io.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
         sqe = try io.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
     sqe = try io.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.listen(@intFromPtr(c), fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
@@ -93,9 +93,9 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, fd: fd_t, tx_opt: []const u8, rx_opt:
     const RX = @as(c_int, 2);
 
     var sqe = try io.ring.setsockopt(0, fd, linux.IPPROTO.TCP, linux.TCP.ULP, "tls");
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(0, fd, linux.SOL.TLS, TX, tx_opt);
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(@intFromPtr(c), fd, linux.SOL.TLS, RX, rx_opt);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
@@ -139,7 +139,7 @@ pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32
     const fd_out = io.dev_null_fd;
     var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
-    sqe.flags |= linux.IOSQE_IO_HARDLINK;
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = SPLICE_F_NONBLOCK;
     io.metric.sumbitted();
@@ -147,7 +147,7 @@ pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32
 
 pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.sendmsg(0, fd, &close_notify.msg, 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     try io.close(c, fd);
 }
 
@@ -207,7 +207,7 @@ pub fn openAt(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8, flags: li
 pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
     if (stat) |s| {
         var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_SIZE, s);
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
+        sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
     return io.openAt(c, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
@@ -215,7 +215,7 @@ pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: ?*
 pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
-    sqe.flags |= linux.IOSQE_IO_HARDLINK;
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.splice(@intFromPtr(c), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = SPLICE_F_NONBLOCK;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -325,7 +325,8 @@ var close_notify: CloseNotify = undefined;
 // linux.msghdr with 2 bytes close notify alert in iov and alert record type in control
 // reference: https://docs.kernel.org/networking/tls.html#send-tls-control-messages
 const CloseNotify = struct {
-    const body = [2]u8{ 1, 0 }; // alert body: warning, close notify
+    const tls_alert_payload = [2]u8{ 1, 0 }; // alert body: warning (1), close notify (0)
+
     const cmsghdr = extern struct {
         len: u32,
         _: u32 = 0,
@@ -339,17 +340,16 @@ const CloseNotify = struct {
     msg: linux.msghdr_const,
 
     fn init(self: *CloseNotify) void {
-        const TLS_SET_RECORD_TYPE = 1;
         self.iov = .{
             posix.iovec_const{
-                .base = &body,
-                .len = body.len,
+                .base = &tls_alert_payload,
+                .len = tls_alert_payload.len,
             },
         };
         self.cmsg = .{
             .record_type = 21, // alert
             .level = linux.SOL.TLS,
-            .typ = TLS_SET_RECORD_TYPE,
+            .typ = 1, // TLS_SET_RECORD_TYPE
             .len = @sizeOf(cmsghdr),
         };
         self.msg = .{
