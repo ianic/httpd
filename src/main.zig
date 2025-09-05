@@ -2,8 +2,14 @@ pub fn main() !void {
     signal.watch();
 
     var dbga = std.heap.DebugAllocator(.{}){};
-    defer _ = dbga.deinit();
-    const gpa = dbga.allocator();
+    const gpa = switch (builtin.mode) {
+        .Debug => dbga.allocator(),
+        else => std.heap.c_allocator,
+    };
+    defer switch (builtin.mode) {
+        .Debug => dbga.deinit(),
+        else => {},
+    };
 
     server = .{
         .root = std.fs.cwd(),
@@ -20,7 +26,7 @@ pub fn main() !void {
     try io.init(gpa, .{
         .entries = 256,
         .fd_nr = 1024,
-        .recv_buffers = .{ .count = 1, .size = 4096 },
+        .recv_buffers = .{ .count = 256, .size = 4096 },
     });
     defer io.deinit(gpa);
 
@@ -569,3 +575,4 @@ const tls = @import("tls");
 const mem = std.mem;
 const signal = @import("signal.zig");
 const Ktls = @import("Ktls.zig");
+const builtin = @import("builtin");
