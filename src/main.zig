@@ -11,16 +11,25 @@ pub fn main() !void {
         else => {},
     };
 
+    const args = try Args.parse(gpa);
+    defer args.deinit(gpa);
+    const root = if (args.root.len > 0)
+        std.fs.cwd().openDir(args.root, .{}) catch |err| {
+            fatal("cant't open root dir '{s}' {}", .{ args.root, err });
+        }
+    else
+        std.fs.cwd();
+
     server = .{
-        .root = std.fs.cwd(),
+        .root = root,
         .gpa = gpa,
         .pipes = .empty,
     };
     defer server.deinit();
-    // Get real/absolute path string for cwd
-    const path = try server.root.realpathAlloc(gpa, ".");
-    std.debug.print("Current working directory: {s}\n", .{path});
-    defer gpa.free(path);
+    // // Get real/absolute path string for cwd
+    // const path = try server.root.realpathAlloc(gpa, ".");
+    // std.debug.print("Current working directory: {s}\n", .{path});
+    // defer gpa.free(path);
 
     var io: Io = .{};
     try io.init(gpa, .{
@@ -591,3 +600,74 @@ const mem = std.mem;
 const signal = @import("signal.zig");
 const Ktls = @import("Ktls.zig");
 const builtin = @import("builtin");
+
+const Args = struct {
+    root: []const u8 = &.{},
+    http_port: u16 = 8080,
+    https_port: u16 = 8443,
+
+    fn deinit(self: Args, gpa: Allocator) void {
+        gpa.free(self.root);
+    }
+
+    pub fn parse(gpa: Allocator) !Args {
+        var iter = std.process.args();
+        _ = iter.next();
+        var args: Args = .{};
+
+        while (iter.next()) |arg| {
+            if (parseInt("http-port", arg, &iter)) |v| args.http_port = v;
+            if (parseInt("https-port", arg, &iter)) |v| args.https_port = v;
+            if (parseString("root", arg, &iter)) |v| args.root = try gpa.dupe(u8, v);
+        }
+        return args;
+    }
+
+    fn parseInt(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?u16 {
+        const arg_name1 = "--" ++ name ++ "=";
+        const arg_name2 = "--" ++ name;
+
+        if (std.mem.startsWith(u8, arg, arg_name1)) {
+            const suffix = arg[arg_name1.len..];
+            return std.fmt.parseInt(u16, suffix, 10) catch |err| fatal(
+                "bad {s} value '{s}': {s}",
+                .{ arg_name1, arg, @errorName(err) },
+            );
+        } else if (std.mem.eql(u8, arg, arg_name2)) {
+            if (iter.next()) |val| {
+                return std.fmt.parseInt(u16, val, 10) catch |err| fatal(
+                    "bad {s} value '{s}': {s}",
+                    .{ arg_name2, arg, @errorName(err) },
+                );
+            } else fatal(
+                "missing argument to '{s}'",
+                .{arg_name2},
+            );
+        }
+        return null;
+    }
+
+    fn parseString(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?[]const u8 {
+        const arg_name1 = "--" ++ name ++ "=";
+        const arg_name2 = "--" ++ name;
+
+        if (std.mem.startsWith(u8, arg, arg_name1)) {
+            const suffix = arg[arg_name1.len..];
+            return suffix;
+        } else if (std.mem.eql(u8, arg, arg_name2)) {
+            if (iter.next()) |val| {
+                return val;
+            } else fatal(
+                "missing argument to '{s}'",
+                .{arg_name2},
+            );
+        }
+        return null;
+    }
+};
+
+pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.debug.print("\n", .{});
+    std.process.exit(1);
+}
