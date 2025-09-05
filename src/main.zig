@@ -7,7 +7,7 @@ pub fn main() !void {
         else => std.heap.c_allocator,
     };
     defer switch (builtin.mode) {
-        .Debug => dbga.deinit(),
+        .Debug => _ = dbga.deinit(),
         else => {},
     };
 
@@ -24,7 +24,7 @@ pub fn main() !void {
 
     var io: Io = .{};
     try io.init(gpa, .{
-        .entries = 256,
+        .entries = 1024,
         .fd_nr = 1024,
         .recv_buffers = .{ .count = 256, .size = 4096 },
     });
@@ -201,7 +201,7 @@ const Handshake = struct {
 
         const res = self.hs.run(self.buffer[0..self.pos], &self.buffer) catch |err| {
             log.info("tls handsake failed {}", .{err});
-            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
+            // if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
             try self.close();
             return;
         };
@@ -306,10 +306,11 @@ const Connection = struct {
     file: struct {
         fd: fd_t = -1,
         path: ?[:0]const u8 = null,
-        stat: ?linux.Statx = null,
+        stat: linux.Statx = mem.zeroes(linux.Statx),
         header: ?[]u8 = null,
-        offset: u64 = 0,
-        pipe: ?[2]fd_t = null,
+        header_pos: usize = 0,
+        offset: usize = 0,
+        pipe: [2]fd_t = .{ -1, -1 },
     } = .{},
 
     inline fn parent(completion: *Io.Completion) *Connection {
@@ -326,10 +327,10 @@ const Connection = struct {
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-
         const n = Io.result(cqe) catch |err| {
             switch (err) {
                 error.SignalInterrupt, error.NoBufferSpaceAvailable => {
+                    log.info("connection retry on {}", .{err});
                     try self.recv();
                 },
                 else => {
@@ -339,14 +340,14 @@ const Connection = struct {
             }
             return;
         };
-        if (n == 0) {
+        if (n == 0) { // eof
             try self.close();
             return;
         }
-        const recv_buf = try self.io.getRecvBuffer(cqe);
-        defer self.io.putRecvBuffer(cqe) catch {};
 
+        const recv_buf = try self.io.getRecvBuffer(cqe);
         try self.parseHeader(recv_buf);
+        self.io.putRecvBuffer(cqe);
     }
 
     fn parseHeader(self: *Connection, recv_buf: []const u8) !void {
@@ -355,8 +356,7 @@ const Connection = struct {
         const head_tail = hp.feed(input_buf);
         if (hp.state != .finished) {
             try self.unused_recv.set(self.gpa, input_buf);
-            //log.debug("short header {s}", .{input_buf});
-            // Short read, read more
+            // short read, read more
             try self.recv();
             return;
         }
@@ -367,93 +367,106 @@ const Connection = struct {
             return;
         };
         if (head.method == .GET and head.target.len > 0) {
-            //log.debug("target: {s}", .{head.target});
+            // open target file
             const path = try self.gpa.dupeZ(u8, head.target[1..]);
             self.file.path = path;
             try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
-
-            self.file.stat = mem.zeroes(linux.Statx);
-            try self.io.statx(self.completion.with(onStat), server.root.fd, path, &self.file.stat.?);
+            try self.io.openRead(self.completion.with(onOpen), server.root.fd, path, &self.file.stat);
             return;
         }
+        // bad reques
         try self.close();
-    }
-
-    fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self = parent(completion);
-        const path = self.file.path.?;
-
-        _ = Io.result(cqe) catch |err| {
-            switch (err) {
-                error.NoSuchFileOrDirectory => try self.notFound(),
-                else => {
-                    log.info("stat '{s}' failed {}", .{ path, err });
-                    try self.close();
-                },
-            }
-            return;
-        };
-        // TODO ovdje je prilika da provjerim etag na osnovu mtime i odlucim da mogu odgovorti s not modified
-        try self.io.openRead(self.completion.with(onOpen), server.root.fd, path);
     }
 
     fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        const path = self.file.path.?;
-        const stat = self.file.stat.?;
-
+        const file = &self.file;
         const fd = Io.result(cqe) catch |err| {
             switch (err) {
                 error.NoSuchFileOrDirectory => try self.notFound(),
                 else => {
-                    log.info("open '{s}' failed {}", .{ path, err });
+                    log.info("open '{s}' failed {}", .{ file.path.?, err });
                     try self.close();
                 },
             }
             return;
         };
-        self.file.fd = fd;
-
-        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{stat.size});
+        file.fd = fd;
+        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{file.stat.size});
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
     }
 
     fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        _ = try Io.result(cqe);
-        self.gpa.free(self.file.header.?);
-        self.file.header = null;
-        self.file.pipe = try server.getPipe();
-        try self.sendBody();
-    }
-
-    fn sendBody(self: *Connection) !void {
-        const stat = self.file.stat.?;
-        const pipe = self.file.pipe.?;
-        try self.io.sendfile(self.completion.with(onBody), self.fd, self.file.fd, pipe, self.file.offset, @intCast(stat.size));
+        const file = &self.file;
+        file.header_pos += @intCast(Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.SignalInterrupt => break :brk 0,
+                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
+                else => log.info("connection header send failed {}", .{err}),
+            }
+            try self.close();
+            return;
+        });
+        if (file.header_pos < file.header.?.len) {
+            // short send send more
+            try self.io.send(completion.with(onHeader), self.fd, file.header.?[file.header_pos..], .{ .more = true });
+            return;
+        }
+        // release header
+        self.gpa.free(file.header.?);
+        file.header = null;
+        file.header_pos = 0;
+        // send body
+        const pipe = try server.getPipe();
+        file.pipe = pipe;
+        try self.io.sendfile(completion.with(onBody), self.fd, self.file.fd, pipe, 0, @intCast(file.stat.size));
     }
 
     fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        const stat = self.file.stat.?;
-        const pipe = self.file.pipe.?;
-
-        self.file.offset += @intCast(try Io.result(cqe));
-        if (self.file.offset == stat.size) {
-            try server.putPipe(pipe);
-            self.file.pipe = null;
-            try self.io.close(self.completion.with(onFileClose), self.file.fd);
+        const file = &self.file;
+        // handle result
+        file.offset += @intCast(Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.SignalInterrupt => break :brk 0,
+                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
+                else => log.info("connection body send failed {}", .{err}),
+            }
+            try self.close();
+            return;
+        });
+        if (file.offset < file.stat.size) {
+            // short send, send the rest of the file
+            const len = file.stat.size - file.offset;
+            try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe, @intCast(file.offset), @intCast(len));
             return;
         }
-        try self.sendBody();
+        // cleanup, close file
+        try server.putPipe(file.pipe);
+        try self.io.close(completion.with(onFileClose), file.fd);
     }
 
     fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        _ = try Io.result(cqe);
-        self.file.fd = -1;
-        self.file.stat = null;
+        const file = &self.file;
+        // handle result
+        _ = Io.result(cqe) catch |err| switch (err) {
+            error.SignalInterrupt => {
+                try self.io.close(completion.with(onFileClose), file.fd);
+                return;
+            },
+            else => log.info("file close failed {}", .{err}),
+        };
+        // clenaup, close connection
+        self.gpa.free(file.path.?);
+        file.path = null;
+        file.fd = -1;
         try self.close();
+    }
+
+    fn notFound(self: *Connection) !void {
+        try self.io.send(self.completion.with(onSend), self.fd, not_found, .{});
     }
 
     fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -462,23 +475,24 @@ const Connection = struct {
         try self.close();
     }
 
-    fn notFound(self: *Connection) !void {
-        try self.io.send(self.completion.with(onSend), self.fd, not_found, .{});
-    }
-
     fn close(self: *Connection) !void {
-        const c = self.completion.with(onClose);
+        const completion = self.completion.with(onClose);
         if (self.protocol == .https) {
-            try self.io.closeTls(c, self.fd);
+            try self.io.closeTls(completion, self.fd);
             return;
         }
-        try self.io.close(c, self.fd);
+        try self.io.close(completion, self.fd);
     }
 
     fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
-        _ = try Io.result(cqe);
-        log.debug("connection closed", .{});
+        _ = Io.result(cqe) catch |err| switch (err) {
+            error.SignalInterrupt => {
+                try self.close();
+                return;
+            },
+            else => log.info("connection close failed {}", .{err}),
+        };
         self.deinit();
     }
 
@@ -501,6 +515,7 @@ pub const UnusedDataBuffer = struct {
         if (data.len == 0) {
             return self.buffer;
         }
+        // log.warn("unused append {} {}", .{ self.buffer.len, data.len });
         const old_len = self.buffer.len;
         self.buffer = try allocator.realloc(self.buffer, old_len + data.len);
         @memcpy(self.buffer[old_len..], data);

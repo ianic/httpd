@@ -172,3 +172,29 @@ Percentage of the requests served within a certain time (ms)
   98%    466
   99%    466
  100%    468 (longest request)
+
+
+vegeta
+
+$ echo "GET https://localhost:8443/zig-out/bin/httpd" | vegeta attack -duration=30s -rate=0 -max-workers=100 -root-certs ~/Code/tls.zig/example/cert/minica.pem |  vegeta report
+Requests      [total, rate, throughput]         7135, 237.81, 237.66
+Duration      [total, attack, wait]             30.009s, 30.003s, 5.883ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  111.67µs, 9.706ms, 5.142ms, 9.61ms, 11.838ms, 185.979ms, 368.652ms
+Bytes In      [total, mean]                     40692339200, 5703201.01
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           99.96%
+Status Codes  [code:count]                      0:3  200:7132
+Error Set:
+Get "https://localhost:8443/zig-out/bin/httpd": dial tcp 0.0.0.0:0->[::1]:8443: connect: connection refused
+
+$ echo "GET https://localhost:8443/zig-out/bin/httpd" | vegeta attack -duration=30s -rate=0 -max-workers=100 -root-certs ~/Code/tls.zig/example/cert/minica.pem |  vegeta report
+Requests      [total, rate, throughput]         6607, 220.22, 219.17
+Duration      [total, attack, wait]             30.008s, 30.002s, 6.372ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  968.501µs, 15.811ms, 11.033ms, 17.661ms, 21.774ms, 273.34ms, 315.358ms
+Bytes In      [total, mean]                     37525731200, 5679692.93
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           99.55%
+Status Codes  [code:count]                      0:30  200:6577
+Error Set:
+Get "https://localhost:8443/zig-out/bin/httpd": dial tcp 0.0.0.0:0->[::1]:8443: connect: connection refused
+Get "https://localhost:8443/zig-out/bin/httpd": tls: invalid signature by the server certificate: ECDSA verification failure

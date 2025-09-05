@@ -45,6 +45,10 @@ pub fn tick(io: *Io) !void {
             completion.callback = Completion.noopCallback;
             io.metric.active -= 1;
             try callback(completion, cqe);
+        } else {
+            _ = result(cqe) catch |err| {
+                log.debug("noop completion failed {}", .{err});
+            };
         }
         io.cqes = io.cqes[1..];
     }
@@ -113,8 +117,8 @@ pub fn getRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) ![]const u8 {
     return try io.recv_buffer_group.get(cqe);
 }
 
-pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) !void {
-    try io.recv_buffer_group.put(cqe);
+pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) void {
+    io.recv_buffer_group.put(cqe) catch unreachable;
 }
 
 pub fn recvInto(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
@@ -143,19 +147,15 @@ pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32
 
 pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.sendmsg(0, fd, &close_notify.msg, 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK + linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     try io.close(c, fd);
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
+pub fn close(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.close_direct(0, @intCast(fd));
-    if (c) |ptr| {
-        sqe.user_data = @intFromPtr(ptr);
-        io.metric.sumbitted();
-    } else {
-        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-    }
+    sqe.user_data = @intFromPtr(c);
+    io.metric.sumbitted();
 }
 
 /// Cancel any fd operations
@@ -204,7 +204,11 @@ pub fn openAt(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8, flags: li
     io.metric.sumbitted();
 }
 
-pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8) !void {
+pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
+    if (stat) |s| {
+        var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_SIZE, s);
+        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
     return io.openAt(c, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
@@ -318,6 +322,8 @@ pub fn isTimeoutError(err: anyerror) bool {
 
 var close_notify: CloseNotify = undefined;
 
+// linux.msghdr with 2 bytes close notify alert in iov and alert record type in control
+// reference: https://docs.kernel.org/networking/tls.html#send-tls-control-messages
 const CloseNotify = struct {
     const body = [2]u8{ 1, 0 }; // alert body: warning, close notify
     const cmsghdr = extern struct {
@@ -328,9 +334,9 @@ const CloseNotify = struct {
         record_type: u8,
     };
 
-    cmsg: cmsghdr = mem.zeroes(cmsghdr),
-    msg: linux.msghdr_const = undefined,
-    iov: [1]posix.iovec_const = undefined,
+    cmsg: cmsghdr,
+    iov: [1]posix.iovec_const,
+    msg: linux.msghdr_const,
 
     fn init(self: *CloseNotify) void {
         const TLS_SET_RECORD_TYPE = 1;
