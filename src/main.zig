@@ -377,7 +377,12 @@ const Connection = struct {
         };
         if (head.method == .GET and head.target.len > 0) {
             // open target file
-            const path = try self.gpa.dupeZ(u8, head.target[1..]);
+            const path = if (head.target.len <= 1)
+                try self.gpa.dupeZ(u8, "index.html")
+            else if (head.target[head.target.len - 1] == '/')
+                try std.fmt.allocPrintSentinel(self.gpa, "{s}index.html", .{head.target[1..]}, 0)
+            else
+                try self.gpa.dupeZ(u8, head.target[1..]);
             self.file.path = path;
             try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
             try self.io.openRead(self.completion.with(onOpen), server.root.fd, path, &self.file.stat);
