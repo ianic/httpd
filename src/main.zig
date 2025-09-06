@@ -399,7 +399,8 @@ const Connection = struct {
             switch (err) {
                 error.NoSuchFileOrDirectory => {
                     log.info("not found '{s}'", .{file.path.?});
-                    try self.notFound();
+                    self.file.header = try std.fmt.allocPrint(self.gpa, not_found, .{});
+                    try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
                 },
                 else => {
                     log.info("open '{s}' failed {}", .{ file.path.?, err });
@@ -442,6 +443,11 @@ const Connection = struct {
         self.gpa.free(file.header.?);
         file.header = null;
         file.header_pos = 0;
+        if (file.fd == -1) {
+            // just header
+            try self.close();
+            return;
+        }
         // send body
         const pipe = try server.getPipe();
         file.pipe = pipe;
@@ -487,16 +493,6 @@ const Connection = struct {
         self.gpa.free(file.path.?);
         file.path = null;
         file.fd = -1;
-        try self.close();
-    }
-
-    fn notFound(self: *Connection) !void {
-        try self.io.send(self.completion.with(onSend), self.fd, not_found, .{});
-    }
-
-    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self = parent(completion);
-        _ = try Io.result(cqe);
         try self.close();
     }
 
