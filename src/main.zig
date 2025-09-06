@@ -397,7 +397,10 @@ const Connection = struct {
         const file = &self.file;
         const fd = Io.result(cqe) catch |err| {
             switch (err) {
-                error.NoSuchFileOrDirectory => try self.notFound(),
+                error.NoSuchFileOrDirectory => {
+                    log.info("not found '{s}'", .{file.path.?});
+                    try self.notFound();
+                },
                 else => {
                     log.info("open '{s}' failed {}", .{ file.path.?, err });
                     try self.close();
@@ -406,7 +409,15 @@ const Connection = struct {
             return;
         };
         file.fd = fd;
-        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{file.stat.size});
+
+        const stat = std.fs.File.Stat.fromLinux(file.stat);
+        if (stat.kind != .file) {
+            log.err("not a file '{s}'", .{file.path.?});
+            try self.io.close(completion.with(onFileClose), file.fd);
+            return;
+        }
+        log.info("ok '{s}' size: {d}", .{ file.path.?, file.stat.size });
+        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{ contentType(file.path.?), file.stat.size });
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
     }
 
@@ -513,6 +524,7 @@ const Connection = struct {
     fn deinit(self: *Connection) void {
         if (self.file.path) |path| self.gpa.free(path);
         if (self.file.header) |header| self.gpa.free(header);
+        self.unused_recv.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 };
@@ -591,9 +603,13 @@ const Server = struct {
     }
 };
 
+// Limits sendfile chunk. default is 64K.
+// 1M is Linux max: cat /proc/sys/fs/pipe-max-size
+const set_pipe_size = 1048576;
+
 const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 const header_fmt = "HTTP/1.1 200 OK\r\n" ++
-    "Content-Type: application/octet-stream\r\n" ++
+    "Content-Type: {s}\r\n" ++
     "Content-Length: {d}\r\n" ++
     "Connection: close\r\n\r\n";
 
@@ -683,4 +699,36 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt, args);
     std.debug.print("\n", .{});
     std.process.exit(1);
+}
+
+fn contentType(file_name: []const u8) []const u8 {
+    const mime_types = [_][2][]const u8{
+        .{ ".html", "text/html; charset=utf-8" },
+        .{ ".htm", "text/html; charset=utf-8" },
+        .{ ".css", "text/css; charset=utf-8" },
+        .{ ".js", "application/javascript" },
+        .{ ".json", "application/json" },
+        .{ ".png", "image/png" },
+        .{ ".jpg", "image/jpeg" },
+        .{ ".jpeg", "image/jpeg" },
+        .{ ".gif", "image/gif" },
+        .{ ".svg", "image/svg+xml" },
+        .{ ".txt", "text/plain" },
+        .{ ".xml", "text/xml; charset=utf-8" },
+        .{ ".csv", "text/csv; charset=utf-8" },
+        .{ "gz", "application/gzip" },
+        .{ ".ico", "image/vnd.microsoft.icon" },
+        .{ ".otf", "font/otf" },
+        .{ ".pdf", "application/pdf" },
+        .{ ".tar", "application/x-tar" },
+        .{ ".ttf", "font/ttf" },
+        .{ ".wasm", "application/wasm" },
+        .{ ".webp", "image/webp" },
+        .{ ".woff", "font/woff" },
+        .{ ".woff2", "font/woff2" },
+    };
+    for (mime_types) |pair| {
+        if (std.mem.endsWith(u8, file_name, pair[0])) return pair[1];
+    }
+    return "application/octet-stream"; // Default MIME type
 }
