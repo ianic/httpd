@@ -575,6 +575,14 @@ const Server = struct {
             return p;
         }
         const p = try posix.pipe();
+        { // raise pipe size
+            const F_SETPIPE_SZ = 1031;
+            const rc = linux.fcntl(p[1], F_SETPIPE_SZ, set_pipe_size);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => {},
+                else => |errno| log.info("set pipe failed {}", .{@import("errno.zig").toError(errno)}),
+            }
+        }
         return p;
     }
 
