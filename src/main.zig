@@ -101,7 +101,7 @@ const Listener = struct {
     fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self = parent(completion);
         self.fd = try Io.result(cqe);
-        try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{});
+        try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{ .kernel_backlog = 1024 });
     }
 
     fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -417,7 +417,7 @@ const Connection = struct {
             try self.io.close(completion.with(onFileClose), file.fd);
             return;
         }
-        log.info("ok '{s}' size: {d}", .{ file.path.?, file.stat.size });
+        //log.info("ok '{s}' size: {d}", .{ file.path.?, file.stat.size });
         self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{ contentType(file.path.?), file.stat.size });
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
     }
