@@ -221,6 +221,29 @@ pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2
     io.metric.sumbitted();
 }
 
+/// send direct file descriptor to the target_ring
+pub fn msgRingFd(io: *Io, c: ?*Completion, target_c: *Completion, target_ring: fd_t, source_fd: fd_t) !void {
+    const IORING_MSG_SEND_FD = 1;
+
+    var sqe = try io.ring.get_sqe();
+    sqe.prep_rw(.MSG_RING, target_ring, IORING_MSG_SEND_FD, 0, @intFromPtr(target_c));
+    sqe.addr3 = @intCast(source_fd);
+    // sqe.file_index, ref: https://github.com/axboe/liburing/blob/005d5299f404adb16e75f7d6f0827614a0411bed/src/include/liburing/io_uring.h#L90
+    // -1 == linux.IORING_FILE_INDEX_ALLOC
+    sqe.splice_fd_in = -1;
+    sqe.user_data = 0;
+    sqe.flags |= linux.IOSQE_IO_LINK;
+    if (c) |ptr| {
+        sqe.user_data = @intFromPtr(ptr);
+        io.metric.sumbitted();
+    } else {
+        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
+
+    // fd is moved to the target ring close it in this ring
+    _ = try io.ring.close_direct(0, @intCast(source_fd));
+}
+
 // from musl/include/fcnt.h
 const SPLICE_F_NONBLOCK = 0x02;
 const splice_no_offset = std.math.maxInt(u64);
@@ -248,7 +271,7 @@ pub const Options = struct {
     /// Number of submission queue entries
     entries: u16,
     /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER, //| linux.IORING_SETUP_SQPOLL,
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
 
