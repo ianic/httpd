@@ -8,26 +8,37 @@ targets() {
     cd - >>/dev/null
 }
 
+nginx -c ~/Code/httpz/nginx.conf # -g 'daemon off;'
+zig build -Doptimize=ReleaseFast
+zig-out/bin/httpd --root ../www.ziglang.org/zig-out &
+
+clear
+
+workers=16
+
 cd ~/Code/www.ziglang.org/zig-out
 echo files count: $(find . -type f | wc -l)
 cd - >>/dev/null
 
 echo https httpz
 targets https 8443
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
+vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers | vegeta report
 
 echo https nginx
 targets https 8444
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
+vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=false -http2=false -session-tickets=false | vegeta report
 
-echo
-echo http httpz
-targets http 8080
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
+# echo
+# echo http httpz
+# targets http 8080
+# vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
 
-echo http nginx
-targets http 8081
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
+# echo http nginx
+# targets http 8081
+# vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=1024 | vegeta report
+
+killall nginx
+killall httpd
 
 exit
 
