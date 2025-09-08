@@ -1,2 +1,5 @@
 /.zig-cache/
 /zig-out/
+/targets
+/tmp/
+/callgrind.out.3452915
