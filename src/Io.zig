@@ -153,8 +153,7 @@ pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
 
 /// Close file descriptor
 pub fn close(io: *Io, c: *Completion, fd: fd_t) !void {
-    var sqe = try io.ring.close_direct(0, @intCast(fd));
-    sqe.user_data = @intFromPtr(c);
+    _ = try io.ring.close_direct(@intFromPtr(c), @intCast(fd));
     io.metric.sumbitted();
 }
 
