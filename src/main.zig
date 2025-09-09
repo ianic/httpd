@@ -121,7 +121,12 @@ const Listener = struct {
         const self = parent(completion);
 
         const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
-            error.SignalInterrupt, error.FileTableOverflow => {
+            error.SignalInterrupt => {
+                try self.accept();
+                return;
+            },
+            error.FileTableOverflow => {
+                log.warn("listener accept {}", .{err});
                 try self.accept();
                 return;
             },
@@ -320,6 +325,7 @@ const Connection = struct {
     completion: Io.Completion = .{},
     unused_recv: UnusedDataBuffer = .{},
     protocol: Protocol = .http,
+    keep_alive: bool = true,
 
     file: struct {
         fd: fd_t = -1,
@@ -348,7 +354,7 @@ const Connection = struct {
         const n = Io.result(cqe) catch |err| {
             switch (err) {
                 error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                    log.info("connection retry on {}", .{err});
+                    log.info("connection recv retry on {}", .{err});
                     try self.recv();
                 },
                 else => {
@@ -384,7 +390,9 @@ const Connection = struct {
             try self.close();
             return;
         };
-        if (head.method == .GET and head.target.len > 0) {
+        const content_length: u64 = head.content_length orelse 0;
+        self.keep_alive = head.keep_alive;
+        if (head.method == .GET and content_length == 0) {
             // open target file
             const path = if (head.target.len <= 1)
                 try self.gpa.dupeZ(u8, "index.html")
@@ -397,7 +405,7 @@ const Connection = struct {
             try self.io.openRead(self.completion.with(onOpen), server.root.fd, path, &self.file.stat);
             return;
         }
-        // bad reques
+        // bad request
         try self.close();
     }
 
@@ -408,7 +416,7 @@ const Connection = struct {
             switch (err) {
                 error.NoSuchFileOrDirectory => {
                     log.info("not found '{s}'", .{file.path.?});
-                    self.file.header = try std.fmt.allocPrint(self.gpa, not_found, .{});
+                    self.file.header = try Header.notFound(self.gpa, self.keep_alive);
                     try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
                 },
                 else => {
@@ -423,11 +431,11 @@ const Connection = struct {
         const stat = std.fs.File.Stat.fromLinux(file.stat);
         if (stat.kind != .file) {
             log.err("not a file '{s}'", .{file.path.?});
-            try self.io.close(completion.with(onFileClose), file.fd);
+            try self.fileClose();
             return;
         }
-        //log.info("ok '{s}' size: {d}", .{ file.path.?, file.stat.size });
-        self.file.header = try std.fmt.allocPrint(self.gpa, header_fmt, .{ contentType(file.path.?), file.stat.size });
+        //log.info("ok {d} '{s}' size: {d} keep-alive: {}", .{ self.fd, file.path.?, file.stat.size, self.keep_alive });
+        self.file.header = try Header.ok(self.gpa, file.path.?, file.stat.size, self.keep_alive);
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
     }
 
@@ -473,7 +481,7 @@ const Connection = struct {
                 error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
                 else => log.info("connection body send failed {}", .{err}),
             }
-            try self.close();
+            try self.fileClose();
             return;
         });
         if (file.offset < file.stat.size) {
@@ -482,9 +490,21 @@ const Connection = struct {
             try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe, @intCast(file.offset), @intCast(len));
             return;
         }
-        // cleanup, close file
-        try server.putPipe(file.pipe);
-        try self.io.close(completion.with(onFileClose), file.fd);
+        // cleanup
+        try self.fileClose();
+    }
+
+    fn fileClose(self: *Connection) !void {
+        const file = &self.file;
+        if (file.path) |path| {
+            self.gpa.free(path);
+            file.path = null;
+            try server.putPipe(file.pipe);
+            file.pipe = .{ -1, -1 };
+            file.offset = 0;
+            file.stat = mem.zeroes(linux.Statx);
+        }
+        try self.io.close(self.completion.with(onFileClose), file.fd);
     }
 
     fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -493,15 +513,24 @@ const Connection = struct {
         // handle result
         _ = Io.result(cqe) catch |err| switch (err) {
             error.SignalInterrupt => {
-                try self.io.close(completion.with(onFileClose), file.fd);
+                try self.fileClose();
                 return;
             },
             else => log.info("file close failed {}", .{err}),
         };
-        // clenaup, close connection
-        self.gpa.free(file.path.?);
-        file.path = null;
+        // cleanup
         file.fd = -1;
+        if (self.keep_alive) {
+            // next request
+            if (self.unused_recv.buffer.len > 0) {
+                log.info("keep_alive unused_recv: {}", .{self.unused_recv.buffer.len});
+                try self.parseHeader(&.{});
+            } else {
+                try self.recv();
+            }
+            return;
+        }
+        // close connection
         try self.close();
     }
 
@@ -523,6 +552,7 @@ const Connection = struct {
             },
             else => log.info("connection close failed {}", .{err}),
         };
+        //log.info("{} close", .{self.fd});
         self.deinit();
     }
 
@@ -612,11 +642,65 @@ const Server = struct {
 // 1M is Linux max: cat /proc/sys/fs/pipe-max-size
 const set_pipe_size = 1048576;
 
-const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-const header_fmt = "HTTP/1.1 200 OK\r\n" ++
-    "Content-Type: {s}\r\n" ++
-    "Content-Length: {d}\r\n" ++
-    "Connection: close\r\n\r\n";
+const Header = struct {
+    const connection_keep_alive = "Connection: keep-alive";
+    const connection_close = "Connection: close";
+
+    fn ok(gpa: Allocator, file: [:0]const u8, size: usize, keep_alive: bool) ![]u8 {
+        const fmt = "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "{s}\r\n\r\n";
+
+        return try std.fmt.allocPrint(gpa, fmt, .{
+            contentType(file),
+            size,
+            if (keep_alive) connection_keep_alive else connection_close,
+        });
+    }
+
+    fn notFound(gpa: Allocator, keep_alive: bool) ![]u8 {
+        const fmt = "HTTP/1.1 404 Not Found\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "{s}\r\n\r\n";
+
+        return try std.fmt.allocPrint(gpa, fmt, .{
+            if (keep_alive) connection_keep_alive else connection_close,
+        });
+    }
+
+    fn contentType(file_name: []const u8) []const u8 {
+        const mime_types = [_][2][]const u8{
+            .{ ".html", "text/html; charset=utf-8" },
+            .{ ".htm", "text/html; charset=utf-8" },
+            .{ ".css", "text/css; charset=utf-8" },
+            .{ ".js", "application/javascript" },
+            .{ ".json", "application/json" },
+            .{ ".png", "image/png" },
+            .{ ".jpg", "image/jpeg" },
+            .{ ".jpeg", "image/jpeg" },
+            .{ ".gif", "image/gif" },
+            .{ ".svg", "image/svg+xml" },
+            .{ ".txt", "text/plain" },
+            .{ ".xml", "text/xml; charset=utf-8" },
+            .{ ".csv", "text/csv; charset=utf-8" },
+            .{ "gz", "application/gzip" },
+            .{ ".ico", "image/vnd.microsoft.icon" },
+            .{ ".otf", "font/otf" },
+            .{ ".pdf", "application/pdf" },
+            .{ ".tar", "application/x-tar" },
+            .{ ".ttf", "font/ttf" },
+            .{ ".wasm", "application/wasm" },
+            .{ ".webp", "image/webp" },
+            .{ ".woff", "font/woff" },
+            .{ ".woff2", "font/woff2" },
+        };
+        for (mime_types) |pair| {
+            if (std.mem.endsWith(u8, file_name, pair[0])) return pair[1];
+        }
+        return "application/octet-stream"; // Default MIME type
+    }
+};
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -704,36 +788,4 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt, args);
     std.debug.print("\n", .{});
     std.process.exit(1);
-}
-
-fn contentType(file_name: []const u8) []const u8 {
-    const mime_types = [_][2][]const u8{
-        .{ ".html", "text/html; charset=utf-8" },
-        .{ ".htm", "text/html; charset=utf-8" },
-        .{ ".css", "text/css; charset=utf-8" },
-        .{ ".js", "application/javascript" },
-        .{ ".json", "application/json" },
-        .{ ".png", "image/png" },
-        .{ ".jpg", "image/jpeg" },
-        .{ ".jpeg", "image/jpeg" },
-        .{ ".gif", "image/gif" },
-        .{ ".svg", "image/svg+xml" },
-        .{ ".txt", "text/plain" },
-        .{ ".xml", "text/xml; charset=utf-8" },
-        .{ ".csv", "text/csv; charset=utf-8" },
-        .{ "gz", "application/gzip" },
-        .{ ".ico", "image/vnd.microsoft.icon" },
-        .{ ".otf", "font/otf" },
-        .{ ".pdf", "application/pdf" },
-        .{ ".tar", "application/x-tar" },
-        .{ ".ttf", "font/ttf" },
-        .{ ".wasm", "application/wasm" },
-        .{ ".webp", "image/webp" },
-        .{ ".woff", "font/woff" },
-        .{ ".woff2", "font/woff2" },
-    };
-    for (mime_types) |pair| {
-        if (std.mem.endsWith(u8, file_name, pair[0])) return pair[1];
-    }
-    return "application/octet-stream"; // Default MIME type
 }
