@@ -268,3 +268,43 @@ Bytes In      [total, mean]                     6727748288, 126380.66
 Bytes Out     [total, mean]                     0, 0.00
 Success       [ratio]                           100.00%
 Status Codes  [code:count]                      200:53234
+
+
+### with keep alive
+https httpz
+Requests      [total, rate, throughput]         34001, 3400.01, 3386.13
+Duration      [total, attack, wait]             10.041s, 10s, 40.99ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  70.191µs, 35.408ms, 40.934ms, 42.228ms, 46.208ms, 55.273ms, 291.98ms
+Bytes In      [total, mean]                     4290104477, 126175.83
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:34001
+
+https nginx
+Requests      [total, rate, throughput]         23707, 2370.70, 2357.43
+Duration      [total, attack, wait]             10.056s, 10s, 56.256ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  21.825ms, 53.543ms, 54.702ms, 61.461ms, 65.557ms, 73.535ms, 83.978ms
+Bytes In      [total, mean]                     2991860567, 126201.57
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:23707
+
+http httpz
+Requests      [total, rate, throughput]         70580, 7056.10, 7025.86
+Duration      [total, attack, wait]             10.046s, 10.003s, 43.056ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  30.892µs, 11.869ms, 1.271ms, 41.315ms, 42.268ms, 44.7ms, 51.954ms
+Bytes In      [total, mean]                     8920709041, 126391.46
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:70580
+
+http nginx
+Requests      [total, rate, throughput]         66949, 6694.78, 6694.71
+Duration      [total, attack, wait]             10s, 10s, 95.055µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  28.699µs, 1.652ms, 577.668µs, 4.728ms, 6.583ms, 9.927ms, 21.224ms
+Bytes In      [total, mean]                     8452946512, 126259.49
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:66949
+
+info(main): time spend in tls handshake: 977535934ns 977ms
