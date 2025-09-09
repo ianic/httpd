@@ -198,3 +198,73 @@ Status Codes  [code:count]                      0:30  200:6577
 Error Set:
 Get "https://localhost:8443/zig-out/bin/httpd": dial tcp 0.0.0.0:0->[::1]:8443: connect: connection refused
 Get "https://localhost:8443/zig-out/bin/httpd": tls: invalid signature by the server certificate: ECDSA verification failure
+
+
+
+
+### https with rsa certificate
+ ./ab.sh
+files count: 197
+https httpz
+Requests      [total, rate, throughput]         1573, 157.13, 55.24
+Duration      [total, attack, wait]             28.473s, 10.011s, 18.462s
+Latencies     [min, mean, 50, 90, 95, 99, max]  455.789ms, 12.467s, 14.115s, 18.541s, 18.584s, 18.618s, 18.644s
+Bytes In      [total, mean]                     196680867, 125035.52
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:1573
+Error Set:
+https nginx
+Requests      [total, rate, throughput]         14631, 1462.96, 963.40
+Duration      [total, attack, wait]             15.187s, 10.001s, 5.186s
+Latencies     [min, mean, 50, 90, 95, 99, max]  72.989ms, 747.424ms, 376.722ms, 410.271ms, 1.779s, 11.288s, 15.118s
+Bytes In      [total, mean]                     1845214245, 126116.76
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:14631
+Error Set:
+info(main): time spend in tls handshake: 28394726234ns 28394ms
+
+### https with ec certificate 
+./ab.sh
+files count: 197
+https httpz
+Requests      [total, rate, throughput]         5967, 596.62, 493.82
+Duration      [total, attack, wait]             12.083s, 10.001s, 2.082s
+Latencies     [min, mean, 50, 90, 95, 99, max]  79.036ms, 1.887s, 2.066s, 2.11s, 2.117s, 2.126s, 2.134s
+Bytes In      [total, mean]                     749094277, 125539.51
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:5967
+Error Set:
+https nginx
+Requests      [total, rate, throughput]         24315, 2431.51, 1713.25
+Duration      [total, attack, wait]             14.192s, 10s, 4.192s
+Latencies     [min, mean, 50, 90, 95, 99, max]  51.825ms, 444.278ms, 218.863ms, 249.482ms, 842.448ms, 11.242s, 14.138s
+Bytes In      [total, mean]                     3067603203, 126160.94
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:24315
+Error Set:
+info(main): time spend in tls handshake: 11910666255ns 11910ms
+
+### http 
+ ./ab.sh
+files count: 197
+http httpz
+Requests      [total, rate, throughput]         77626, 7762.36, 7761.49
+Duration      [total, attack, wait]             10.001s, 10s, 1.114ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  63.435µs, 1.113ms, 291.855µs, 3.439ms, 5.268ms, 8.871ms, 14.408ms
+Bytes In      [total, mean]                     9816084846, 126453.57
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:77626
+Error Set:
+http nginx
+Requests      [total, rate, throughput]         53234, 5322.65, 5321.20
+Duration      [total, attack, wait]             10.004s, 10.001s, 2.721ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  63.518µs, 1.203ms, 539.859µs, 2.893ms, 5.278ms, 9.083ms, 15.427ms
+Bytes In      [total, mean]                     6727748288, 126380.66
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:53234

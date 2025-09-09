@@ -75,7 +75,10 @@ pub fn main() !void {
     try http_listener.close();
     try https_listener.close();
     try io.drain();
+    log.info("time spend in tls handshake: {}ns {}ms", .{ tls_handshake_ns, tls_handshake_ns / std.time.ns_per_ms });
 }
+
+var tls_handshake_ns: u64 = 0;
 
 const Listener = struct {
     const Protocol = union(enum) {
@@ -163,6 +166,8 @@ const Handshake = struct {
     completion: Io.Completion = .{},
     /// pointer to the part of the buffer used in send, needed in the case of short send
     send_buf: []const u8 = &.{},
+    /// ns spend in handshake algorithm
+    ns: u64 = 0,
 
     inline fn parent(completion: *Io.Completion) *Handshake {
         return @alignCast(@fieldParentPtr("completion", completion));
@@ -208,12 +213,15 @@ const Handshake = struct {
         }
         self.pos += @intCast(n);
 
+        var t = try std.time.Timer.start();
         const res = self.hs.run(self.buffer[0..self.pos], &self.buffer) catch |err| {
             log.info("tls handsake failed {}", .{err});
             // if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
             try self.close();
             return;
         };
+        self.ns += t.read();
+
         if (res.send_pos > 0) {
             // server flight
             self.send_buf = res.send;
@@ -297,6 +305,7 @@ const Handshake = struct {
     }
 
     fn deinit(self: *Handshake) void {
+        tls_handshake_ns += self.ns;
         if (self.pipe) |pipe| server.putPipe(pipe) catch {};
         self.gpa.destroy(self);
     }
