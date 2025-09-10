@@ -13,15 +13,11 @@ pub fn main() !void {
 
     const args = try Args.parse(gpa);
     defer args.deinit(gpa);
-    site_root = if (args.root.len > 0)
-        std.fs.cwd().openDir(args.root, .{}) catch |err| {
-            Args.fatal("cant't open root dir '{s}' {}", .{ args.root, err });
-        }
-    else
-        std.fs.cwd();
+    site_root = if (args.root) |dir| dir else std.fs.cwd();
 
     pipe_pool = .{ .gpa = gpa };
     try pipe_pool.initPreheated(16);
+    defer pipe_pool.deinit();
 
     var io: Io = .{};
     try io.init(gpa, .{
@@ -31,25 +27,28 @@ pub fn main() !void {
     });
     defer io.deinit(gpa);
 
-    const cert_dir = try std.fs.cwd().openDir("../tls.zig/example/cert/localhost_ec", .{});
-    var auth = try tls.config.CertKeyPair.fromFilePath(gpa, cert_dir, "cert.pem", "key.pem");
-    defer auth.deinit(gpa);
-    const tls_config: tls.config.Server = .{
-        .auth = &auth,
-        // only ciphers supported by both handshake library and kernel
-        .cipher_suites = &[_]tls.config.CipherSuite{
-            .AES_128_GCM_SHA256,
-            .AES_256_GCM_SHA384,
-            .CHACHA20_POLY1305_SHA256,
-        },
-    };
-
-    const http_addr = try std.net.Address.resolveIp("127.0.0.1", 8080);
-    const https_addr = try std.net.Address.resolveIp("127.0.0.1", 8443);
+    const http_addr = try std.net.Address.resolveIp("127.0.0.1", args.http_port);
     var http_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = http_addr };
     try http_listener.init();
-    var https_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = https_addr, .protocol = .{ .https = tls_config } };
-    try https_listener.init();
+
+    const https_listener: ?*Listener = if (args.cert) |cert_dir| brk: {
+        var auth = try tls.config.CertKeyPair.fromFilePath(gpa, cert_dir, "cert.pem", "key.pem");
+        //defer auth.deinit(gpa);
+        const tls_config: tls.config.Server = .{
+            .auth = &auth,
+            // only ciphers supported by both handshake library and kernel
+            .cipher_suites = &[_]tls.config.CipherSuite{
+                .AES_128_GCM_SHA256,
+                .AES_256_GCM_SHA384,
+                .CHACHA20_POLY1305_SHA256,
+            },
+        };
+        const https_addr = try std.net.Address.resolveIp("127.0.0.1", args.https_port);
+        var https_listener: Listener = .{ .gpa = gpa, .io = &io, .addr = https_addr, .protocol = .{ .https = tls_config } };
+        try https_listener.init();
+        break :brk &https_listener;
+    } else null;
+    defer if (https_listener) |l| l.protocol.https.auth.?.deinit(gpa);
 
     while (true) {
         io.tick() catch |err| switch (err) {
@@ -65,7 +64,7 @@ pub fn main() !void {
     }
 
     try http_listener.close();
-    try https_listener.close();
+    if (https_listener) |l| try l.close();
     try io.drain();
     log.info("time spend in tls handshake: {}ns {}ms", .{ tls_handshake_ns, tls_handshake_ns / std.time.ns_per_ms });
 }
@@ -98,12 +97,12 @@ const PipePool = struct {
 
     pub fn deinit(self: *PipePool) void {
         for (self.large.items) |p| {
-            posix.close(p.fd[0]);
-            posix.close(p.fd[1]);
+            posix.close(p.fds[0]);
+            posix.close(p.fds[1]);
         }
         for (self.small.items) |p| {
-            posix.close(p.fd[0]);
-            posix.close(p.fd[1]);
+            posix.close(p.fds[0]);
+            posix.close(p.fds[1]);
         }
         self.large.deinit(self.gpa);
         self.small.deinit(self.gpa);
@@ -279,6 +278,7 @@ const Handshake = struct {
             switch (err) {
                 error.SignalInterrupt => try self.recv(),
                 error.OperationCanceled => try self.close(), // recv timeout
+                error.IOError => try self.close(), // connection closed
                 else => {
                     log.info("handshake recv failed {}", .{err});
                     try self.close();
@@ -429,11 +429,11 @@ const Connection = struct {
         const n = Io.result(cqe) catch |err| {
             switch (err) {
                 error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                    log.info("connection recv retry on {}", .{err});
+                    log.info("connection recv retry on {}", .{err}); // TODO remove logging
                     try self.recv();
                 },
-                // recv timeout
-                error.OperationCanceled => try self.close(),
+                error.OperationCanceled => try self.close(), // recv timeout
+                error.IOError => try self.close(), // connection closed
                 else => {
                     log.info("connection recv failed {}", .{err});
                     try self.close();
@@ -746,15 +746,18 @@ const Header = struct {
 };
 
 const Args = struct {
-    root: []const u8 = &.{},
+    root: ?fs.Dir = null,
+    cert: ?fs.Dir = null,
     http_port: u16 = 8080,
     https_port: u16 = 8443,
 
     fn deinit(self: Args, gpa: Allocator) void {
-        gpa.free(self.root);
+        _ = self;
+        _ = gpa;
     }
 
     pub fn parse(gpa: Allocator) !Args {
+        _ = gpa;
         var iter = std.process.args();
         _ = iter.next();
         var args: Args = .{};
@@ -762,9 +765,19 @@ const Args = struct {
         while (iter.next()) |arg| {
             if (parseInt("http-port", arg, &iter)) |v| args.http_port = v;
             if (parseInt("https-port", arg, &iter)) |v| args.https_port = v;
-            if (parseString("root", arg, &iter)) |v| args.root = try gpa.dupe(u8, v);
+            if (parseDir("root", arg, &iter)) |v| args.root = v;
+            if (parseDir("cert", arg, &iter)) |v| args.cert = v;
         }
         return args;
+    }
+
+    fn parseDir(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?fs.Dir {
+        if (parseString(name, arg, iter)) |v| {
+            return std.fs.cwd().openDir(v, .{}) catch |err| {
+                fatal("cant't open root dir '{s}' {}", .{ v, err });
+            };
+        }
+        return null;
     }
 
     fn parseInt(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?u16 {
@@ -821,6 +834,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const net = std.net;
 const http = std.http;
+const fs = std.fs;
 const assert = std.debug.assert;
 const fd_t = posix.fd_t;
 const testing = std.testing;

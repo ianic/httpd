@@ -1,5 +1,7 @@
 #!/bin/bash -e
 
+set -e
+
 targets() {
     protocol=$1
     port=$2
@@ -11,7 +13,7 @@ targets() {
 export SSLKEYLOGFILE=/tmp/ssl_key.log
 nginx -c ~/Code/httpz/nginx.conf -g 'daemon off;' &
 zig build -Doptimize=ReleaseFast
-zig-out/bin/httpd --root ../www.ziglang.org/zig-out &
+zig-out/bin/httpd --root ../www.ziglang.org/zig-out --cert ../tls.zig/example/cert/localhost_ec &
 
 #clear
 
