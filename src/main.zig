@@ -23,7 +23,7 @@ pub fn main() !void {
     try io.init(gpa, .{
         .entries = 1024,
         .fd_nr = 1024,
-        .recv_buffers = .{ .count = 1, .size = 4096 * 256 },
+        .recv_buffers = .{ .count = 2, .size = 4096 * 128 },
     });
     defer io.deinit(gpa);
 
@@ -57,6 +57,9 @@ pub fn main() !void {
         };
         if (signal.get()) |sig| switch (sig) {
             posix.SIG.TERM, posix.SIG.INT => break,
+            posix.SIG.USR1 => {
+                log.info("metric: {}", .{metric});
+            },
             else => {
                 log.info("ignoring signal {}", .{sig});
             },
@@ -65,8 +68,10 @@ pub fn main() !void {
 
     try http_listener.close();
     if (https_listener) |l| try l.close();
+    signal.reset();
     try io.drain();
-    log.info("time spend in tls handshake: {}ns {}ms", .{ tls_handshake_ns, tls_handshake_ns / std.time.ns_per_ms });
+
+    //log.info("metric: {}", .{metric});
 }
 
 const keepalive_timeout = 30;
@@ -74,7 +79,7 @@ const keepalive_timeout = 30;
 // globals
 var site_root: std.fs.Dir = undefined;
 var pipe_pool: PipePool = undefined;
-var tls_handshake_ns: u64 = 0;
+var metric: Metric = .{};
 
 const PipePool = struct {
     const Pipe = struct {
@@ -120,6 +125,7 @@ const PipePool = struct {
                 else => |errno| log.info("set pipe size failed {}", .{@import("errno.zig").toError(errno)}),
             }
         }
+        if (p.large) metric.pipe.large +%= 1 else metric.pipe.small +%= 1;
         return p;
     }
 
@@ -244,9 +250,6 @@ const Handshake = struct {
     /// pointer to the part of the buffer used in send, needed in the case of short send
     send_buf: []const u8 = &.{},
 
-    /// metric: ns spend in handshake algorithm, TODO: move to global metrics
-    ns: u64 = 0,
-
     inline fn parent(completion: *Io.Completion) *Handshake {
         return @alignCast(@fieldParentPtr("completion", completion));
     }
@@ -299,7 +302,7 @@ const Handshake = struct {
             try self.close();
             return;
         };
-        self.ns += t.read();
+        metric.handshake.duration +%= t.read();
 
         if (res.send_pos > 0) {
             // server flight
@@ -384,7 +387,6 @@ const Handshake = struct {
     }
 
     fn deinit(self: *Handshake) void {
-        tls_handshake_ns += self.ns;
         if (self.pipe) |p| pipe_pool.put(p) catch {};
         self.gpa.destroy(self);
     }
@@ -417,6 +419,7 @@ const Connection = struct {
     }
 
     fn init(self: *Connection) !void {
+        metric.conn.inc(self.protocol);
         try self.recv();
     }
 
@@ -493,6 +496,7 @@ const Connection = struct {
             switch (err) {
                 error.NoSuchFileOrDirectory => {
                     log.info("not found '{s}'", .{file.path.?});
+                    metric.files.not_found +%= 1;
                     self.file.header = try Header.notFound(self.gpa, self.keep_alive);
                     try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
                 },
@@ -511,6 +515,8 @@ const Connection = struct {
             try self.fileClose();
             return;
         }
+        metric.files.count +%= 1;
+        metric.files.bytes +%= stat.size;
         //log.info("ok {d} '{s}' size: {d} keep-alive: {}", .{ self.fd, file.path.?, file.stat.size, self.keep_alive });
         self.file.header = try Header.ok(self.gpa, file.path.?, file.stat.size, self.keep_alive);
         try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
@@ -565,6 +571,7 @@ const Connection = struct {
             // short send, send the rest of the file
             const len = file.stat.size - file.offset;
             try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe.?.fds, @intCast(file.offset), @intCast(len));
+            metric.files.sendfile_more +%= 1;
             return;
         }
         // cleanup
@@ -631,11 +638,11 @@ const Connection = struct {
             },
             else => log.info("connection close failed {}", .{err}),
         };
-        //log.info("{} close", .{self.fd});
         self.deinit();
     }
 
     fn deinit(self: *Connection) void {
+        metric.conn.dec(self.protocol);
         if (self.file.path) |path| self.gpa.free(path);
         if (self.file.header) |header| self.gpa.free(header);
         self.unused_recv.deinit(self.gpa);
@@ -827,6 +834,54 @@ const Args = struct {
         std.debug.print("\n", .{});
         std.process.exit(1);
     }
+};
+
+const Metric = struct {
+    conn: struct {
+        http: Gauge = .{},
+        https: Gauge = .{},
+
+        fn inc(self: *@This(), protocol: Connection.Protocol) void {
+            switch (protocol) {
+                .http => self.http.inc(),
+                .https => self.https.inc(),
+            }
+        }
+
+        fn dec(self: *@This(), protocol: Connection.Protocol) void {
+            switch (protocol) {
+                .http => self.http.dec(),
+                .https => self.https.dec(),
+            }
+        }
+    } = .{},
+    handshake: struct {
+        duration: usize = 0,
+    } = .{},
+    files: struct {
+        not_found: usize = 0,
+        count: usize = 0,
+        sendfile_more: usize = 0,
+        bytes: usize = 0,
+    } = .{},
+    pipe: struct {
+        large: usize = 0,
+        small: usize = 0,
+    } = .{},
+
+    const Gauge = struct {
+        value: usize = 0,
+        max: usize = 0,
+
+        fn inc(g: *Gauge) void {
+            g.value += 1;
+            g.max = @max(g.max, g.value);
+        }
+
+        fn dec(g: *Gauge) void {
+            g.value -= 1;
+        }
+    };
 };
 
 const std = @import("std");

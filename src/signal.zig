@@ -31,3 +31,16 @@ pub fn watch() void {
     posix.sigaction(posix.SIG.USR2, &act, null);
     posix.sigaction(posix.SIG.PIPE, &act, null);
 }
+
+pub fn reset() void {
+    var act = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.INT, &act, null);
+    posix.sigaction(posix.SIG.USR1, &act, null);
+    posix.sigaction(posix.SIG.USR2, &act, null);
+    posix.sigaction(posix.SIG.PIPE, &act, null);
+}

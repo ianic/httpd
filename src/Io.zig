@@ -43,7 +43,7 @@ pub fn tick(io: *Io) !void {
             const callback = completion.callback;
             // Reset completion.callback so that completion can be reused during callback.
             completion.callback = Completion.noopCallback;
-            io.metric.active -= 1;
+            io.metric.completed();
             try callback(completion, cqe);
         } else {
             _ = result(cqe) catch |err| {
@@ -280,10 +280,16 @@ pub fn result(cqe: linux.io_uring_cqe) SyscallError!i32 {
 }
 
 const Metric = struct {
+    total: usize = 0,
     active: usize = 0,
 
     fn sumbitted(self: *Metric) void {
         self.active += 1;
+        self.total +%= 1;
+    }
+
+    fn completed(self: *Metric) void {
+        self.active -= 1;
     }
 };
 

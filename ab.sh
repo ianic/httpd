@@ -12,8 +12,10 @@ targets() {
 
 export SSLKEYLOGFILE=/tmp/ssl_key.log
 nginx -c ~/Code/httpz/nginx.conf -g 'daemon off;' &
+nginx_pid=$!
 zig build -Doptimize=ReleaseFast
 zig-out/bin/httpd --root ../www.ziglang.org/zig-out --cert ../tls.zig/example/cert/localhost_ec &
+pid=$!
 
 #clear
 
@@ -27,7 +29,10 @@ cd - >>/dev/null
 echo https httpz
 targets https 8443
 vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -http2=false -session-tickets=false | vegeta report
+kill -USR1 $pid
+sleep 0.1
 
+echo
 echo https nginx
 targets https 8444
 vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -http2=false -session-tickets=false | vegeta report
@@ -36,7 +41,10 @@ echo
 echo http httpz
 targets http 8080
 vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
+kill -USR1 $pid
+sleep 0.1
 
+echo
 echo http nginx
 targets http 8081
 vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
