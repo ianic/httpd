@@ -47,7 +47,11 @@ pub fn tick(io: *Io) !void {
             try callback(completion, cqe);
         } else {
             _ = result(cqe) catch |err| {
-                log.debug("noop completion failed {}", .{err});
+                switch (err) {
+                    error.TimerExpired => {}, // timer triggers cancel of linked operation (recv)
+                    error.OperationCanceled => {}, // timer is canceled by linked operation
+                    else => log.debug("noop completion failed {}", .{err}),
+                }
             };
         }
         io.cqes = io.cqes[1..];
@@ -107,24 +111,40 @@ pub fn accept(io: *Io, c: *Completion, fd: fd_t) !void {
     io.metric.sumbitted();
 }
 
-pub fn recv(io: *Io, c: *Completion, fd: fd_t) !void {
-    var sqe = try io.recv_buffer_group.recv(@intFromPtr(c), fd, 0);
+pub const RecvBuffer = union(enum) {
+    /// recv directly into this buffer
+    buffer: []u8,
+    /// select buffer the provided buffer group
+    provided: void,
+};
+
+pub fn recv(io: *Io, c: *Completion, fd: fd_t, buffer: RecvBuffer, timeout: ?*const linux.kernel_timespec) !void {
+    var sqe = switch (buffer) {
+        .buffer => |b| try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = b }, 0),
+        .provided => try io.recv_buffer_group.recv(@intFromPtr(c), fd, 0),
+    };
     sqe.flags |= linux.IOSQE_FIXED_FILE;
+    if (timeout) |ts| {
+        sqe.flags |= linux.IOSQE_IO_LINK;
+        _ = try io.ring.link_timeout(0, ts, 0);
+    }
     io.metric.sumbitted();
 }
 
-pub fn getRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) ![]const u8 {
+pub fn recvProvided(io: *Io, c: *Completion, fd: fd_t, timeout: ?*const linux.kernel_timespec) !void {
+    return io.recv(c, fd, .{ .provided = {} }, timeout);
+}
+
+pub fn recvDirect(io: *Io, c: *Completion, fd: fd_t, buffer: []u8, timeout: ?*const linux.kernel_timespec) !void {
+    return io.recv(c, fd, .{ .buffer = buffer }, timeout);
+}
+
+pub fn getProvidedBuffer(io: *Io, cqe: linux.io_uring_cqe) ![]const u8 {
     return try io.recv_buffer_group.get(cqe);
 }
 
-pub fn putRecvBuffer(io: *Io, cqe: linux.io_uring_cqe) void {
+pub fn putProvidedBuffer(io: *Io, cqe: linux.io_uring_cqe) void {
     io.recv_buffer_group.put(cqe) catch unreachable;
-}
-
-pub fn recvInto(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
-    var sqe = try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = buffer }, 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
-    io.metric.sumbitted();
 }
 
 pub fn peek(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {

@@ -15,7 +15,7 @@ pub fn main() !void {
     defer args.deinit(gpa);
     const root = if (args.root.len > 0)
         std.fs.cwd().openDir(args.root, .{}) catch |err| {
-            fatal("cant't open root dir '{s}' {}", .{ args.root, err });
+            Args.fatal("cant't open root dir '{s}' {}", .{ args.root, err });
         }
     else
         std.fs.cwd();
@@ -26,16 +26,12 @@ pub fn main() !void {
         .pipes = .empty,
     };
     defer server.deinit();
-    // // Get real/absolute path string for cwd
-    // const path = try server.root.realpathAlloc(gpa, ".");
-    // std.debug.print("Current working directory: {s}\n", .{path});
-    // defer gpa.free(path);
 
     var io: Io = .{};
     try io.init(gpa, .{
         .entries = 1024,
         .fd_nr = 1024,
-        .recv_buffers = .{ .count = 256, .size = 4096 },
+        .recv_buffers = .{ .count = 1, .size = 4096 * 256 },
     });
     defer io.deinit(gpa);
 
@@ -77,6 +73,8 @@ pub fn main() !void {
     try io.drain();
     log.info("time spend in tls handshake: {}ns {}ms", .{ tls_handshake_ns, tls_handshake_ns / std.time.ns_per_ms });
 }
+
+const keepalive_timeout = 30;
 
 var tls_handshake_ns: u64 = 0;
 
@@ -155,23 +153,30 @@ const Listener = struct {
 
 const Handshake = struct {
     gpa: Allocator,
+
     io: *Io,
+    /// retrun point of the io operation
+    completion: Io.Completion = .{},
+    /// pipe used in discard
+    pipe: ?[2]fd_t = null,
     /// tcp connection fd
     fd: fd_t,
+    /// timeout for the receive operation
+    recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
+
     /// tls handsake algorithm
     hs: tls.nonblock.Server = undefined,
+    /// tls keys in kernel format
+    ktls: Ktls = undefined,
+
     /// buffer used for both read client messages and write server flight messages
     buffer: [tls.output_buffer_len]u8 = undefined,
     /// 0..pos part of the buffer read, written
     pos: usize = 0,
-    /// pipe used in discard
-    pipe: ?[2]fd_t = null,
-    /// tls keys in kernel format
-    ktls: Ktls = undefined,
-    completion: Io.Completion = .{},
     /// pointer to the part of the buffer used in send, needed in the case of short send
     send_buf: []const u8 = &.{},
-    /// ns spend in handshake algorithm
+
+    /// metric: ns spend in handshake algorithm, TODO: move to global metrics
     ns: u64 = 0,
 
     inline fn parent(completion: *Io.Completion) *Handshake {
@@ -186,7 +191,7 @@ const Handshake = struct {
     fn recv(self: *Handshake) !void {
         if (self.hs.state == .init) {
             // Read client hello message in the buffer
-            try self.io.recvInto(self.completion.with(onRecv), self.fd, self.buffer[self.pos..]);
+            try self.io.recvDirect(self.completion.with(onRecv), self.fd, self.buffer[self.pos..], &self.recv_timeout);
             return;
         }
         // Peek client flight into buffer. We will later discard bytes consumed
@@ -326,6 +331,7 @@ const Connection = struct {
     unused_recv: UnusedDataBuffer = .{},
     protocol: Protocol = .http,
     keep_alive: bool = true,
+    recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
 
     file: struct {
         fd: fd_t = -1,
@@ -346,7 +352,7 @@ const Connection = struct {
     }
 
     fn recv(self: *Connection) !void {
-        try self.io.recv(self.completion.with(onRecv), self.fd);
+        try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
     }
 
     fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -357,6 +363,8 @@ const Connection = struct {
                     log.info("connection recv retry on {}", .{err});
                     try self.recv();
                 },
+                // recv timeout
+                error.OperationCanceled => try self.close(),
                 else => {
                     log.info("connection recv failed {}", .{err});
                     try self.close();
@@ -369,9 +377,9 @@ const Connection = struct {
             return;
         }
 
-        const recv_buf = try self.io.getRecvBuffer(cqe);
+        const recv_buf = try self.io.getProvidedBuffer(cqe);
         try self.parseHeader(recv_buf);
-        self.io.putRecvBuffer(cqe);
+        self.io.putProvidedBuffer(cqe);
     }
 
     fn parseHeader(self: *Connection, recv_buf: []const u8) !void {
@@ -613,6 +621,9 @@ const Server = struct {
     root: std.fs.Dir,
     pipes: std.ArrayList([2]fd_t) = .empty,
 
+    pipe_count: usize = 0,
+    pipe_large_count: usize = 0,
+
     fn deinit(self: *Server) void {
         self.pipes.deinit(self.gpa);
     }
@@ -622,13 +633,17 @@ const Server = struct {
             return p;
         }
         const p = try posix.pipe();
+        self.pipe_count += 1;
         { // raise pipe size
             const F_SETPIPE_SZ = 1031;
             const rc = linux.fcntl(p[1], F_SETPIPE_SZ, set_pipe_size);
             switch (linux.E.init(rc)) {
-                .SUCCESS => {},
+                .SUCCESS => {
+                    self.pipe_large_count += 1;
+                },
                 else => |errno| log.info("set pipe failed {}", .{@import("errno.zig").toError(errno)}),
             }
+            log.info("pipes: {}, large: {}", .{ self.pipe_count, self.pipe_large_count });
         }
         return p;
     }
@@ -636,11 +651,11 @@ const Server = struct {
     fn putPipe(self: *Server, p: [2]fd_t) !void {
         try self.pipes.append(self.gpa, p);
     }
-};
 
-// Limits sendfile chunk. default is 64K.
-// 1M is Linux max: cat /proc/sys/fs/pipe-max-size
-const set_pipe_size = 1048576;
+    // Limits sendfile chunk. default is 64K.
+    // 1M is Linux max: cat /proc/sys/fs/pipe-max-size
+    const set_pipe_size = 1048576;
+};
 
 const Header = struct {
     const connection_keep_alive = "Connection: keep-alive";
@@ -701,23 +716,6 @@ const Header = struct {
         return "application/octet-stream"; // Default MIME type
     }
 };
-
-const std = @import("std");
-const linux = std.os.linux;
-const posix = std.posix;
-const net = std.net;
-const http = std.http;
-const assert = std.debug.assert;
-const fd_t = posix.fd_t;
-const testing = std.testing;
-const Allocator = std.mem.Allocator;
-const Io = @import("Io.zig");
-const log = std.log.scoped(.main);
-const tls = @import("tls");
-const mem = std.mem;
-const signal = @import("signal.zig");
-const Ktls = @import("Ktls.zig");
-const builtin = @import("builtin");
 
 const Args = struct {
     root: []const u8 = &.{},
@@ -782,10 +780,27 @@ const Args = struct {
         }
         return null;
     }
+
+    fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+        std.debug.print(fmt, args);
+        std.debug.print("\n", .{});
+        std.process.exit(1);
+    }
 };
 
-pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print(fmt, args);
-    std.debug.print("\n", .{});
-    std.process.exit(1);
-}
+const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
+const net = std.net;
+const http = std.http;
+const assert = std.debug.assert;
+const fd_t = posix.fd_t;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
+const Io = @import("Io.zig");
+const log = std.log.scoped(.main);
+const tls = @import("tls");
+const mem = std.mem;
+const signal = @import("signal.zig");
+const Ktls = @import("Ktls.zig");
+const builtin = @import("builtin");
