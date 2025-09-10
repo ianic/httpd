@@ -13,19 +13,15 @@ pub fn main() !void {
 
     const args = try Args.parse(gpa);
     defer args.deinit(gpa);
-    const root = if (args.root.len > 0)
+    site_root = if (args.root.len > 0)
         std.fs.cwd().openDir(args.root, .{}) catch |err| {
             Args.fatal("cant't open root dir '{s}' {}", .{ args.root, err });
         }
     else
         std.fs.cwd();
 
-    server = .{
-        .root = root,
-        .gpa = gpa,
-        .pipes = .empty,
-    };
-    defer server.deinit();
+    pipe_pool = .{ .gpa = gpa };
+    try pipe_pool.initPreheated(16);
 
     var io: Io = .{};
     try io.init(gpa, .{
@@ -76,7 +72,80 @@ pub fn main() !void {
 
 const keepalive_timeout = 30;
 
+// globals
+var site_root: std.fs.Dir = undefined;
+var pipe_pool: PipePool = undefined;
 var tls_handshake_ns: u64 = 0;
+
+const PipePool = struct {
+    const Pipe = struct {
+        fds: [2]fd_t = .{ -1, -1 },
+        large: bool = false,
+    };
+    gpa: Allocator,
+    large: std.ArrayList(Pipe) = .empty,
+    small: std.ArrayList(Pipe) = .empty,
+
+    fn initPreheated(self: *PipePool, count: usize) !void {
+        for (0..count) |i| {
+            const p = try create(i % 2 == 0);
+            if (p.large)
+                try self.large.append(self.gpa, p)
+            else
+                try self.small.append(self.gpa, p);
+        }
+    }
+
+    pub fn deinit(self: *PipePool) void {
+        for (self.large.items) |p| {
+            posix.close(p.fd[0]);
+            posix.close(p.fd[1]);
+        }
+        for (self.small.items) |p| {
+            posix.close(p.fd[0]);
+            posix.close(p.fd[1]);
+        }
+        self.large.deinit(self.gpa);
+        self.small.deinit(self.gpa);
+    }
+
+    fn create(large: bool) !Pipe {
+        const fds = try posix.pipe();
+        var p: Pipe = .{ .fds = fds, .large = false };
+        if (large) {
+            // try to increase pipe size
+            const F_SETPIPE_SZ = 1031;
+            const rc = linux.fcntl(p.fds[1], F_SETPIPE_SZ, max_pipe_size);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => p.large = true,
+                else => |errno| log.info("set pipe size failed {}", .{@import("errno.zig").toError(errno)}),
+            }
+        }
+        return p;
+    }
+
+    fn get(self: *PipePool, size: usize) !Pipe {
+        const large = size > default_pipe_size;
+        if (large) {
+            if (self.large.pop()) |p| return p;
+            if (self.small.pop()) |p| return p;
+        } else {
+            if (self.small.pop()) |p| return p;
+            if (self.large.pop()) |p| return p;
+        }
+        return try create(large);
+    }
+
+    fn put(self: *PipePool, p: Pipe) !void {
+        if (p.large)
+            try self.large.append(self.gpa, p)
+        else
+            try self.small.append(self.gpa, p);
+    }
+
+    const default_pipe_size = 64 * 1024;
+    const max_pipe_size = 1024 * 1024;
+};
 
 const Listener = struct {
     const Protocol = union(enum) {
@@ -158,7 +227,7 @@ const Handshake = struct {
     /// retrun point of the io operation
     completion: Io.Completion = .{},
     /// pipe used in discard
-    pipe: ?[2]fd_t = null,
+    pipe: ?PipePool.Pipe = null,
     /// tcp connection fd
     fd: fd_t,
     /// timeout for the receive operation
@@ -242,9 +311,9 @@ const Handshake = struct {
             // Hanshake done. Discard peeked bytes consumed in handshake leave
             // the rest in the tcp buffer to be decompressed by kernel and
             // consumed in connection.
-            self.pipe = try server.getPipe();
+            self.pipe = try pipe_pool.get(self.pos);
             self.pos = res.recv_pos;
-            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?, @intCast(self.pos));
+            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?.fds, @intCast(self.pos));
             return;
         }
         // short read, get more
@@ -283,12 +352,12 @@ const Handshake = struct {
         self.pos -= @intCast(n);
         if (self.pos > 0) {
             // short discard
-            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?, @intCast(self.pos));
+            try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?.fds, @intCast(self.pos));
             return;
         }
         // discard done
         // upgrade connection, push cipher to the kernel
-        try server.putPipe(self.pipe.?);
+        try pipe_pool.put(self.pipe.?);
         self.pipe = null;
         self.ktls = Ktls.init(self.hs.cipher().?);
         try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
@@ -316,7 +385,7 @@ const Handshake = struct {
 
     fn deinit(self: *Handshake) void {
         tls_handshake_ns += self.ns;
-        if (self.pipe) |pipe| server.putPipe(pipe) catch {};
+        if (self.pipe) |p| pipe_pool.put(p) catch {};
         self.gpa.destroy(self);
     }
 };
@@ -340,7 +409,7 @@ const Connection = struct {
         header: ?[]u8 = null,
         header_pos: usize = 0,
         offset: usize = 0,
-        pipe: [2]fd_t = .{ -1, -1 },
+        pipe: ?PipePool.Pipe = null,
     } = .{},
 
     inline fn parent(completion: *Io.Completion) *Connection {
@@ -410,7 +479,7 @@ const Connection = struct {
                 try self.gpa.dupeZ(u8, head.target[1..]);
             self.file.path = path;
             try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
-            try self.io.openRead(self.completion.with(onOpen), server.root.fd, path, &self.file.stat);
+            try self.io.openRead(self.completion.with(onOpen), site_root.fd, path, &self.file.stat);
             return;
         }
         // bad request
@@ -474,9 +543,9 @@ const Connection = struct {
             return;
         }
         // send body
-        const pipe = try server.getPipe();
+        const pipe = try pipe_pool.get(file.stat.size);
         file.pipe = pipe;
-        try self.io.sendfile(completion.with(onBody), self.fd, self.file.fd, pipe, 0, @intCast(file.stat.size));
+        try self.io.sendfile(completion.with(onBody), self.fd, file.fd, pipe.fds, 0, @intCast(file.stat.size));
     }
 
     fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -495,7 +564,7 @@ const Connection = struct {
         if (file.offset < file.stat.size) {
             // short send, send the rest of the file
             const len = file.stat.size - file.offset;
-            try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe, @intCast(file.offset), @intCast(len));
+            try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe.?.fds, @intCast(file.offset), @intCast(len));
             return;
         }
         // cleanup
@@ -507,8 +576,10 @@ const Connection = struct {
         if (file.path) |path| {
             self.gpa.free(path);
             file.path = null;
-            try server.putPipe(file.pipe);
-            file.pipe = .{ -1, -1 };
+            if (file.pipe) |p| {
+                try pipe_pool.put(p);
+                file.pipe = null;
+            }
             file.offset = 0;
             file.stat = mem.zeroes(linux.Statx);
         }
@@ -612,49 +683,6 @@ pub const UnusedDataBuffer = struct {
         allocator.free(self.buffer);
         self.buffer = &.{};
     }
-};
-
-var server: Server = undefined;
-
-const Server = struct {
-    gpa: Allocator,
-    root: std.fs.Dir,
-    pipes: std.ArrayList([2]fd_t) = .empty,
-
-    pipe_count: usize = 0,
-    pipe_large_count: usize = 0,
-
-    fn deinit(self: *Server) void {
-        self.pipes.deinit(self.gpa);
-    }
-
-    fn getPipe(self: *Server) ![2]fd_t {
-        if (self.pipes.pop()) |p| {
-            return p;
-        }
-        const p = try posix.pipe();
-        self.pipe_count += 1;
-        { // raise pipe size
-            const F_SETPIPE_SZ = 1031;
-            const rc = linux.fcntl(p[1], F_SETPIPE_SZ, set_pipe_size);
-            switch (linux.E.init(rc)) {
-                .SUCCESS => {
-                    self.pipe_large_count += 1;
-                },
-                else => |errno| log.info("set pipe failed {}", .{@import("errno.zig").toError(errno)}),
-            }
-            log.info("pipes: {}, large: {}", .{ self.pipe_count, self.pipe_large_count });
-        }
-        return p;
-    }
-
-    fn putPipe(self: *Server, p: [2]fd_t) !void {
-        try self.pipes.append(self.gpa, p);
-    }
-
-    // Limits sendfile chunk. default is 64K.
-    // 1M is Linux max: cat /proc/sys/fs/pipe-max-size
-    const set_pipe_size = 1048576;
 };
 
 const Header = struct {
