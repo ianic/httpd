@@ -30,7 +30,7 @@ zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
 pid=$!
 
 workers=128
-keepalive=true
+keepalive=false
 
 # number of files in static site
 cd site/www.ziglang.org/zig-out

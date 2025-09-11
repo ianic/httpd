@@ -1,16 +1,85 @@
 # HTTP/HTTPS static file server in Zig with io_uring, kernel TLS
 
-# Known issues
+- radi samo na Linux i to mora imati neki noviji kernel, incremental buffer consumption
+- ktls mora biti enabled
 
-- handling of overshot read when switching to ktsl
-test with curl build with wolfssl and buffer size of 4096 with incremental buffer consumption, you will not wait long for having partial tls record in overshot data
-
-- curl (and other clients) with openssl sometimes fail with wrong signature problem [ref](https://github.com/curl/curl/issues/11434), curl with wolfssl (and probably other tls libraries) works fine  
-signature is created with code from Zig std library 
-
-- forcibly closing tls connection, not sending close notify tls message
+## Benchmark
 
 
+```sh
+$./bench.sh
+files count: 200
+
+http
+Requests      [total, rate, throughput]         82971, 8296.91, 8296.84
+Duration      [total, attack, wait]             10s, 10s, 86.89µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  31.18µs, 1.384ms, 217.66µs, 4.349ms, 5.801ms, 8.612ms, 54.175ms
+Bytes In      [total, mean]                     10407271762, 125432.64
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:82971
+
+http nginx
+Requests      [total, rate, throughput]         69832, 6982.93, 6982.84
+Duration      [total, attack, wait]             10.001s, 10s, 120.823µs
+Latencies     [min, mean, 50, 90, 95, 99, max]  25.011µs, 1.623ms, 465.962µs, 4.865ms, 6.692ms, 9.804ms, 15.423ms
+Bytes In      [total, mean]                     8759933222, 125442.97
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:69832
+
+https
+Requests      [total, rate, throughput]         34654, 3465.36, 3451.31
+Duration      [total, attack, wait]             10.041s, 10s, 40.707ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  95.164µs, 34.708ms, 40.94ms, 42.022ms, 42.652ms, 46.775ms, 123.769ms
+Bytes In      [total, mean]                     4360726993, 125836.18
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:34654
+
+https nginx
+Requests      [total, rate, throughput]         70988, 7098.46, 7097.50
+Duration      [total, attack, wait]             10.002s, 10s, 1.351ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  30.677µs, 8.616ms, 9.312ms, 16.19ms, 18.554ms, 22.424ms, 36.973ms
+Bytes In      [total, mean]                     8907774230, 125482.82
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:70988
+```
+
+
+With disabled keep alive.
+tls certificate signature is most cpu demanding task (verify is much cheaper).
+
+```sh
+https
+Requests      [total, rate, throughput]         8844, 884.41, 872.22
+Duration      [total, attack, wait]             10.14s, 10s, 139.764ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  13.877ms, 145.725ms, 146.601ms, 153.254ms, 154.967ms, 157.065ms, 160.995ms
+Bytes In      [total, mean]                     1117975427, 126410.61
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:8844
+Error Set:
+info(main): metric: .{ .conn = .{ .http = .{ .value = 0, .max = 43 }, .https = .{ .value = 0, .max = 8 } }, .handshake = .{ .duration = 10031012200 }, .files = .{ .not_found = 0, .count = 90976, .sendfile_more = 2527, .bytes = 11423382929 }, .pipe = .{ .large = 17, .small = 18 } }
+
+https nginx
+Requests      [total, rate, throughput]         34162, 3415.88, 3404.84
+Duration      [total, attack, wait]             10.033s, 10.001s, 32.429ms
+Latencies     [min, mean, 50, 90, 95, 99, max]  8.968ms, 35.991ms, 38.076ms, 42.657ms, 46.515ms, 53.193ms, 61.021ms
+Bytes In      [total, mean]                     4290031828, 125579.06
+Bytes Out     [total, mean]                     0, 0.00
+Success       [ratio]                           100.00%
+Status Codes  [code:count]                      200:34162
+Error Set:
+```
+
+Note 10 seconds in hansahake.
+Profiles show that the all of the time is in the: 
+[crypto.pcurves.p384.P384.mul](https://github.com/ziglang/zig/blob/6b8cef81076dd4577d7b053b555432ea1805d5e5/lib/std/crypto/pcurves/p384/p384_64.zig#L116)
+[crypto.pcurves.p256.P256.mul](https://github.com/ziglang/zig/blob/6b8cef81076dd4577d7b053b555432ea1805d5e5/lib/std/crypto/pcurves/p256/p256_64.zig#L147)
+
+ 
 # Notes 
 
 [ktls](https://docs.kernel.org/networking/tls.html)  

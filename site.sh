@@ -122,3 +122,12 @@ while curl https://localhost:8443/favicon.svg -i --cacert site/ca/cert.pem --tls
 
 # site files by size
 cd site/www.ziglang.org/zig-out && find . -type f -exec ls -lSh {} + && cd -
+
+# enable kernel tls module
+# check if module is enabled
+lsmod | grep tls
+# enable moduel
+sudo modprobe tls
+# enable permanently
+cat /etc/modules-load.d/gnutls.conf
+echo tls | sudo tee /etc/modules-load.d/gnutls.conf
