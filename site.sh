@@ -99,10 +99,26 @@ zig build
 zig-out/bin/httpd --root=./site/www.ziglang.org/zig-out/ --cert=./site/localhost_ec/
 
 exit
-# curl --cacert ./site/ca/cert.pem https://localhost:8443
-# curl http://localhost:8080
 
+# Notes
+
+# curl usage:
+curl --cacert ./site/ca/cert.pem https://localhost:8443
+curl http://localhost:8080
+
+# supported ciphers
+curl https://localhost:8443/favicon.svg -v --cacert site/ca/cert.pem --tls13-ciphers TLS_CHACHA20_POLY1305_SHA256
+curl https://localhost:8443/favicon.svg -v --cacert site/ca/cert.pem --tls13-ciphers TLS_AES_256_GCM_SHA384
+curl https://localhost:8443/favicon.svg -v --cacert site/ca/cert.pem --tls13-ciphers TLS_AES_128_GCM_SHA256
+
+# add ca to the trusted, browser will not complain after that
 sudo cp site/ca/cert.pem /etc/ca-certificates/trust-source/anchors/localhost-ca.pem
 cd /etc/ca-certificates/trust-source/anchors
 sudo trust anchor localhost-ca.pem
 sudo update-ca-trust extract
+
+# curl loop
+while curl https://localhost:8443/favicon.svg -i --cacert site/ca/cert.pem --tlsv1.3; do true; done
+
+# site files by size
+cd site/www.ziglang.org/zig-out && find . -type f -exec ls -lSh {} + && cd -
