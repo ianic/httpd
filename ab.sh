@@ -1,73 +1,66 @@
 #!/bin/bash -e
-
 set -e
 
+if ! command -v vegeta >/dev/null 2>&1; then
+    echo "vegeta not found in PATH"
+    exit 1
+fi
+
+cwd="$(pwd)"
+
+# create vegeta targets file with all files from the site
 targets() {
     protocol=$1
     port=$2
-    cd ~/Code/www.ziglang.org/zig-out
-    find . -type f -exec echo -e "GET $protocol://localhost:$port/{}\n" \; >~/Code/httpz/targets
-    cd - >>/dev/null
+    cd site/www.ziglang.org/zig-out
+    # Skip huge mp4 file because it dominates in benchmark
+    # $ find . -type f -exec ls -lS {} + | head
+    find . -type f ! -path "*/facebook_bot.mp4" -exec echo -e "GET $protocol://localhost:$port/{}\n" \; >"$cwd/site/targets"
+    cd "$cwd"
 }
 
-export SSLKEYLOGFILE=/tmp/ssl_key.log
-nginx -c ~/Code/httpz/nginx.conf -g 'daemon off;' &
+# start nginx listening on 8081 http and 8444 https
+mkdir -p tmp
+nginx -p "$cwd" -c nginx.conf -g 'daemon off;' &
 nginx_pid=$!
-zig build -Doptimize=ReleaseFast
-zig-out/bin/httpd --root ../www.ziglang.org/zig-out --cert ../tls.zig/example/cert/localhost_ec &
-pid=$!
 
-#clear
+# start httpz listening on 8080 http and 8443 https
+zig build -Doptimize=ReleaseFast
+zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
+pid=$!
 
 workers=128
 keepalive=true
 
-cd ~/Code/www.ziglang.org/zig-out
-echo files count: $(find . -type f | wc -l)
+# number of files in static site
+cd site/www.ziglang.org/zig-out
+echo files count: "$(find . -type f | wc -l)"
 cd - >>/dev/null
 
-echo https httpz
-targets https 8443
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -http2=false -session-tickets=false | vegeta report
-kill -USR1 $pid
-sleep 0.1
-
 echo
-echo https nginx
-targets https 8444
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -http2=false -session-tickets=false | vegeta report
-
-echo
-echo http httpz
+echo http
 targets http 8080
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
+vegeta attack -targets=site/targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
 kill -USR1 $pid
 sleep 0.1
 
 echo
 echo http nginx
 targets http 8081
-vegeta attack -targets=targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
+vegeta attack -targets=site/targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive | vegeta report
 
-killall nginx httpd
+echo
+echo https
+targets https 8443
+vegeta attack -targets=site/targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -session-tickets=false -root-certs site/ca/cert.pem | vegeta report
+kill -USR1 $pid
+sleep 0.1
 
-exit
+echo
+echo https nginx
+targets https 8444
+vegeta attack -targets=site/targets -duration=10s -rate=0 -max-workers=$workers -keepalive=$keepalive -session-tickets=false -root-certs site/ca/cert.pem | vegeta report
 
-# notes
-ab -n 100 -c 1 https://localhost:8443/index.html 2>&1 | grep "Requests per second:"
-ab -n 100 -c 1 http://localhost:8081/index.html 2>&1 | grep "Requests per second:"
-
-exit
-
-1131479 Sep 5 16:26 ./documentation/0.10.1/index.html
-216058 Sep 5 16:26 ./download/index.html
-20074 Sep 5 16:26 ./index.html
-13880 Sep 5 16:26 ./learn/index.html
-298 Sep 5 16:13 ./favicon.png
-
-# find all index.html file sizes
-cd ~/Code/www.ziglang.org/zig-out
-find . -type f -exec ls -lS {} + | grep index.html
-cd -
-
-find . -type f echo "GET http://localhost:8080/" $\{{}:2\} "\n\n" \;
+kill $nginx_pid
+kill $pid
+# killall nginx httpd
