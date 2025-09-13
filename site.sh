@@ -131,3 +131,7 @@ sudo modprobe tls
 # enable permanently
 cat /etc/modules-load.d/gnutls.conf
 echo tls | sudo tee /etc/modules-load.d/gnutls.conf
+
+zig build -Dtarget=x86_64-linux -Doptimize=ReleaseFast
+zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec
+valgrind --tool=callgrind zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec
