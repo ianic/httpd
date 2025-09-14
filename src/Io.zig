@@ -172,9 +172,9 @@ pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: *Completion, fd: fd_t) !void {
-    _ = try io.ring.close_direct(@intFromPtr(c), @intCast(fd));
-    io.metric.sumbitted();
+pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
+    _ = try io.ring.close_direct(if (c) |ptr| @intFromPtr(ptr) else 0, @intCast(fd));
+    if (c != null) io.metric.sumbitted();
 }
 
 /// Cancel any fd operations
