@@ -40,8 +40,10 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
                 log.info("connection recv retry on {}", .{err}); // TODO remove logging
                 try self.recv();
             },
-            error.OperationCanceled => try self.close(), // recv timeout
-            error.IOError => try self.close(), // connection closed
+            // recv timeout
+            error.OperationCanceled => try self.close(),
+            // connection closed
+            error.IOError, error.ConnectionResetByPeer => try self.close(),
             else => {
                 log.info("connection recv failed {}", .{err});
                 try self.close();
@@ -103,7 +105,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
                 log.info("not found '{s}'", .{file.path.?});
                 self.server.metric.files.not_found +%= 1;
                 self.file.header = try Header.notFound(self.gpa, self.keep_alive);
-                try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
+                try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{});
             },
             else => {
                 log.info("open '{s}' failed {}", .{ file.path.?, err });
