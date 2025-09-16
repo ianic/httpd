@@ -105,6 +105,11 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, fd: fd_t, tx_opt: []const u8, rx_opt:
     io.metric.sumbitted();
 }
 
+pub fn tcpNodelay(io: *Io, fd: fd_t) !void {
+    var sqe = try io.ring.setsockopt(0, fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, yes_socket_option);
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+}
+
 pub fn accept(io: *Io, c: *Completion, fd: fd_t) !void {
     var sqe = try io.ring.accept_direct(@intFromPtr(c), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;

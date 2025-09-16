@@ -3,6 +3,10 @@
 - radi samo na Linux i to mora imati neki noviji kernel, incremental buffer consumption
 - ktls mora biti enabled
 
+
+https://atlarge-research.com/pdfs/2024-bingimarsson-msc_thesis.pdf  
+https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/  
+
 ## Benchmark
 
 
@@ -379,3 +383,97 @@ Success       [ratio]                           100.00%
 Status Codes  [code:count]                      200:70439
 Error Set:
 info(main): time spend in tls handshake: 937317880ns 937ms
+
+
+opaaa u svemu smo bolji od Nginx
+
+single worker Nginx
+``` 
+$ ./bench.sh
+files count: 200
+
+http
+oha 1 connection disable-keepalive
+  Requests/sec: 18890.8964
+oha 1 connection
+  Requests/sec: 31773.3474
+oha 100 connections
+  Requests/sec: 178741.4580
+oha 500 connections
+  Requests/sec: 108078.8384
+
+http nginx
+oha 1 connection disable-keepalive
+  Requests/sec: 18730.3127
+oha 1 connection
+  Requests/sec: 31019.0993
+oha 100 connections
+  Requests/sec: 60635.1472
+oha 500 connections
+  Requests/sec: 54297.1093
+
+https
+oha 1 connection disable-keepalive
+  Requests/sec: 1936.8326
+oha 1 connection
+  Requests/sec: 13522.9130
+oha 100 connections
+  Requests/sec: 81778.4128
+oha 500 connections
+  Requests/sec: 68314.4871
+
+https nginx
+oha 1 connection disable-keepalive
+  Requests/sec: 1865.0978
+oha 1 connection
+  Requests/sec: 13651.3448
+oha 100 connections
+  Requests/sec: 16999.5218
+oha 500 connections
+  Requests/sec: 16056.2798
+```
+
+Nginx with 32 workers 
+```./bench.sh
+files count: 200
+
+http
+oha 1 connection disable-keepalive
+  Requests/sec: 19230.7716
+oha 1 connection
+  Requests/sec: 31281.9817
+oha 100 connections
+  Requests/sec: 173402.6651
+oha 500 connections
+  Requests/sec: 110651.7340
+
+http nginx
+oha 1 connection disable-keepalive
+  Requests/sec: 17658.0585
+oha 1 connection
+  Requests/sec: 31281.2028
+oha 100 connections
+  Requests/sec: 208512.0083
+oha 500 connections
+  Requests/sec: 192884.7485
+
+https
+oha 1 connection disable-keepalive
+  Requests/sec: 1897.9718
+oha 1 connection
+  Requests/sec: 13389.2853
+oha 100 connections
+  Requests/sec: 80784.4761
+oha 500 connections
+  Requests/sec: 69744.1714
+
+https nginx
+oha 1 connection disable-keepalive
+  Requests/sec: 1710.0533
+oha 1 connection
+  Requests/sec: 13427.9028
+oha 100 connections
+  Requests/sec: 101443.8174
+oha 500 connections
+  Requests/sec: 98516.5475
+  ```

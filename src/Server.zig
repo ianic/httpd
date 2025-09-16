@@ -51,6 +51,7 @@ pub fn deinit(self: *Server) void {
 
 /// Listener has establish new connection
 pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
+    try self.io.tcpNodelay(fd);
     switch (protocol) {
         .http, .https => {
             const conn = try self.gpa.create(Connection);
@@ -126,7 +127,7 @@ const PipePool = struct {
             const rc = linux.fcntl(p.fds[1], F_SETPIPE_SZ, max_pipe_size);
             switch (linux.E.init(rc)) {
                 .SUCCESS => p.large = true,
-                else => |errno| log.info("set pipe size failed {}", .{@import("errno.zig").toError(errno)}),
+                else => |errno| log.debug("set pipe size failed {}", .{@import("errno.zig").toError(errno)}),
             }
         }
         if (p.large) {

@@ -122,8 +122,6 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         try self.fileClose();
         return;
     }
-    self.server.metric.files.count +%= 1;
-    self.server.metric.files.bytes +%= stat.size;
     //log.info("ok {d} '{s}' size: {d} keep-alive: {}", .{ self.fd, file.path.?, file.stat.size, self.keep_alive });
     self.file.header = try Header.ok(self.gpa, file.path.?, file.stat.size, self.keep_alive);
     try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
@@ -181,6 +179,9 @@ fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         self.server.metric.files.sendfile_more +%= 1;
         return;
     }
+
+    self.server.metric.files.count +%= 1;
+    self.server.metric.files.bytes +%= file.stat.size;
     // cleanup
     try self.fileClose();
 }
