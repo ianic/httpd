@@ -12,7 +12,7 @@ recv_timeout: linux.kernel_timespec = .{ .sec = 30, .nsec = 0 },
 /// tls handsake algorithm
 hs: tls.nonblock.Server = undefined,
 /// tls keys in kernel format
-ktls: Ktls = undefined,
+ktls: tls.Ktls = undefined,
 
 /// buffer used for both read client messages and write server flight messages
 buffer: [tls.output_buffer_len]u8 = undefined,
@@ -141,7 +141,7 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     // upgrade connection, push cipher to the kernel
     try self.server.pipes.put(self.pipe.?);
     self.pipe = null;
-    self.ktls = Ktls.init(self.hs.cipher().?);
+    self.ktls = tls.Ktls.init(self.hs.cipher().?);
     try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
 }
 
@@ -174,8 +174,6 @@ const net = std.net;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
 
-// TODO move this to the tls.zig
-const Ktls = @import("Ktls.zig");
 const tls = @import("tls");
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");

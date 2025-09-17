@@ -46,8 +46,8 @@ script/targets.sh http 8080
 # oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem | grep Requests
 # oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
 script/targets.sh https 8443
-oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem | grep Requests
-# oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
+# oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem | grep Requests
+oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
 
 echo thcount
 ps -o thcount $pid
