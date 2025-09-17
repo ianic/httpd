@@ -13,7 +13,7 @@ pub fn main() !void {
 
     var io: Io = .{};
     try io.init(gpa, .{
-        .entries = 1024,
+        .entries = 1024 * 4,
         .fd_nr = 1024,
         .recv_buffers = .{ .count = 2, .size = 4096 * 128 },
     });
