@@ -1,0 +1,79 @@
+#!/bin/bash
+set -e
+
+cd $(git rev-parse --show-toplevel)
+
+zig build -Doptimize=ReleaseFast
+
+# sudo ls >>/dev/null
+
+#sudo sysctl kernel.perf_event_paranoid=-1
+#find /sys/kernel/tracing/events/io_uring -type f -exec sudo chmod a+r {} \;
+
+# ulimit -n 65535
+# echo ulimit: $(ulimit -n)
+
+{
+    perf stat \
+        -e io_uring:io_uring_complete \
+        -e io_uring:io_uring_cqe_overflow \
+        -e io_uring:io_uring_cqring_wait \
+        -e io_uring:io_uring_create \
+        -e io_uring:io_uring_defer \
+        -e io_uring:io_uring_fail_link \
+        -e io_uring:io_uring_file_get \
+        -e io_uring:io_uring_link \
+        -e io_uring:io_uring_local_work_run \
+        -e io_uring:io_uring_poll_arm \
+        -e io_uring:io_uring_queue_async_work \
+        -e io_uring:io_uring_register \
+        -e io_uring:io_uring_req_failed \
+        -e io_uring:io_uring_short_write \
+        -e io_uring:io_uring_submit_req \
+        -e io_uring:io_uring_task_add \
+        -e io_uring:io_uring_task_work_run \
+        -- zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec
+} &
+perf_pid=$!
+sleep 0.2
+pid=$(pidof httpd)
+
+#unshare -U prlimit --nproc=1280
+# sudo -u root zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
+# zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
+
+echo running oha
+
+script/targets.sh http 8080
+# oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem | grep Requests
+# oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
+script/targets.sh https 8443
+# oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem | grep Requests
+oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
+
+# echo thcount
+ps -o thcount $pid
+
+# pstree -pt $pid
+# echo prlimit
+# sudo prlimit -p $pid
+
+# ps aux | grep httpd
+# echo $(jobs -p)
+# echo pid = $pid
+# ps aux | grep $(jobs -p)
+
+echo httpd metric
+kill -USR1 $pid
+sleep 0.5
+kill $pid
+#sleep 0.2
+#kill $(jobs -p)
+
+#wait $pid
+wait $perf_pid
+
+#sleep 1
+# exit 0
+
+#sudo bpftrace -e "tracepoint:syscalls:sys_enter_io_uring_enter {@c[tid] = count();}"
