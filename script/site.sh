@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+cd $(git rev-parse --show-toplevel)
 
 zig0151=~/.build/zig/zig-x86_64-linux-0.15.1/zig
 

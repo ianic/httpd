@@ -2,12 +2,6 @@
 set -e
 cd $(git rev-parse --show-toplevel)
 
-# if ! command -v vegeta >/dev/null 2>&1; then
-#     echo "vegeta not found in PATH"
-#     exit 1
-# fi
-
-cwd="$(pwd)"
 results=()
 
 oha-tests() {
@@ -50,7 +44,7 @@ vegeta-tests() {
 
 # start nginx listening on 8081 http and 8444 https
 mkdir -p tmp
-nginx -p "$(pwd)" -c nginx.conf -g 'daemon off;' &
+nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
 
 # start httpd listening on 8080 http and 8443 https
