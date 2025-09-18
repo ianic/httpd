@@ -40,8 +40,10 @@ pub fn main() !void {
     }
     signal.reset();
 
-    try server.stop();
-    while (server.metric.conn.count() > 0) {
+    // Stop listening for new connections.
+    try server.close();
+    // Wait for existing connections to finish.
+    while (!server.closed()) {
         try io.tick();
     }
 }

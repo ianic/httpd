@@ -8,13 +8,18 @@ metric: Metric = .{},
 
 gpa: Allocator,
 io: *Io,
-http_listener: Listener = undefined,
-https_listener: Listener = undefined,
+listeners: std.AutoArrayHashMapUnmanaged(*Listener, void) = .empty,
+connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
 /// Tls certificate and private key pair. Null if cert argument is not provided.
 /// If null https listener is not started.
 tls_auth: ?tls.config.CertKeyPair = null,
+state: State = .active,
+const State = enum {
+    active,
+    closing,
+};
 
-// Ciphers supported by both tls handshake library and kernel
+/// Ciphers supported by both tls handshake library and kernel
 const cipher_suites = &[_]tls.config.CipherSuite{
     .AES_128_GCM_SHA256,
     .AES_256_GCM_SHA384,
@@ -32,31 +37,54 @@ pub fn init(self: *Server) !void {
     self.pipes = .{ .gpa = self.gpa, .metric = &self.metric };
     try self.pipes.initPreheated(16);
 
-    { // http
+    try self.listeners.ensureUnusedCapacity(self.gpa, 2);
+    // http
+    {
         const addr = try std.net.Address.resolveIp("127.0.0.1", args.http_port);
-        self.http_listener = .{ .server = self, .io = self.io, .addr = addr };
-        try self.http_listener.init();
+        const listener = try self.gpa.create(Listener);
+        listener.* = .{ .server = self, .io = self.io, .addr = addr };
+        try listener.init();
+        self.listeners.putAssumeCapacity(listener, {});
     }
-    if (self.tls_auth) |_| { // https
+    // https
+    if (self.tls_auth) |_| {
         const addr = try std.net.Address.resolveIp("127.0.0.1", args.https_port);
-        self.https_listener = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
-        try self.https_listener.init();
+        const listener = try self.gpa.create(Listener);
+        listener.* = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
+        try listener.init();
+        self.listeners.putAssumeCapacity(listener, {});
     }
 }
 
 pub fn deinit(self: *Server) void {
-    self.pipes.deinit();
     if (self.tls_auth) |*a| a.deinit(self.gpa);
+    for (self.listeners.keys()) |listener| {
+        self.gpa.destroy(listener);
+    }
+    self.listeners.deinit(self.gpa);
+    for (self.connections.keys()) |conn| {
+        self.gpa.destroy(conn);
+    }
+    self.connections.deinit(self.gpa);
+    self.pipes.deinit();
 }
 
-/// Listener has establish new connection
+/// Listener has accepted new connection
 pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
-    try self.io.tcpNodelay(fd);
+    if (self.state != .active) {
+        try self.io.close(null, fd);
+        return;
+    }
+    if (protocol != .https) { // already set
+        try self.io.tcpNodelay(fd);
+    }
     switch (protocol) {
         .http, .https => {
+            try self.connections.ensureUnusedCapacity(self.gpa, 1);
             const conn = try self.gpa.create(Connection);
             conn.* = .{ .server = self, .gpa = self.gpa, .io = self.io, .fd = fd, .protocol = protocol };
             try conn.init();
+            self.connections.putAssumeCapacity(conn, {});
             self.metric.conn.inc(protocol);
         },
         .tls => {
@@ -71,17 +99,33 @@ pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
     }
 }
 
-/// Destroy Connection or Handshake created in connect.
+/// Destroy Connection, Handshake or Listener
 pub fn destroy(self: *Server, ptr: anytype) void {
     if (@TypeOf(ptr) == *Connection) {
         self.metric.conn.dec(ptr.protocol);
+        assert(self.connections.fetchSwapRemove(@ptrCast(ptr)) != null);
+    }
+    if (@TypeOf(ptr) == *Listener) {
+        assert(self.listeners.fetchSwapRemove(@ptrCast(ptr)) != null);
     }
     self.gpa.destroy(ptr);
 }
 
-pub fn stop(self: *Server) !void {
-    try self.http_listener.close();
-    if (self.tls_auth) |_| try self.https_listener.close();
+/// Close listeners switch state. Pending connections will be closed after
+/// sending file. Keep-alive connections waiting for request will be closed on
+/// read timeout.
+pub fn close(self: *Server) !void {
+    self.state = .closing;
+    for (self.listeners.keys()) |listener| {
+        try listener.close();
+    }
+    for (self.connections.keys()) |conn| {
+        try conn.close();
+    }
+}
+
+pub fn closed(self: *Server) bool {
+    return self.listeners.count() == 0 and self.connections.count() == 0;
 }
 
 pub const Pipe = struct {
@@ -89,6 +133,11 @@ pub const Pipe = struct {
     large: bool = false,
 };
 
+/// Pool of linux pipes (pair of file descirptors) used in sendfile. Cached to
+/// skip pipe system calls. Default pipe size is 64K, can be increased to up to
+/// 1M (if kernel allows). Here we have two pools one for default size and
+/// another for large size. If file in sendfile is big it will be given large
+/// pipe so it will be sent in less short send cycles.
 const PipePool = struct {
     gpa: Allocator,
     large: std.ArrayList(Pipe) = .empty,

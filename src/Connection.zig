@@ -29,7 +29,11 @@ pub fn init(self: *Connection) !void {
 }
 
 fn recv(self: *Connection) !void {
-    try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
+    if (self.server.state == .active) {
+        try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
+    } else {
+        try self.close();
+    }
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -228,7 +232,15 @@ fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     try self.close();
 }
 
-fn close(self: *Connection) !void {
+pub fn close(self: *Connection) !void {
+    if (self.completion.active()) {
+        // If called from server.
+        // Cancel if receiving, else send file and than close.
+        if (self.completion.callback == onRecv) {
+            try self.io.cancel(null, self.fd);
+        }
+        return;
+    }
     const completion = self.completion.with(onClose);
     if (self.protocol == .https) {
         try self.io.closeTls(completion, self.fd);
@@ -371,4 +383,4 @@ const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const log = std.log.scoped(.connection);
 const Connection = @This();
-const keepalive_timeout = 30;
+const keepalive_timeout = 10;

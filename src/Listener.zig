@@ -16,7 +16,7 @@ pub fn init(self: *Listener) !void {
 fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const self = parent(completion);
     self.fd = try Io.result(cqe);
-    try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{ .kernel_backlog = 1024 });
+    try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
 }
 
 fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -41,15 +41,23 @@ fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             try self.accept();
             return;
         },
-        error.OperationCanceled => return,
+        error.OperationCanceled => {
+            self.server.destroy(self);
+            return;
+        },
         else => return err,
     };
-    try self.accept();
-    try self.server.connect(self.protocol, fd);
+    if (self.server.state == .active) {
+        try self.accept();
+        try self.server.connect(self.protocol, fd);
+    } else {
+        try self.io.close(null, fd);
+    }
 }
 
 pub fn close(self: *Listener) !void {
     try self.io.cancel(null, self.fd);
+    try self.io.close(null, self.fd);
 }
 
 const std = @import("std");
