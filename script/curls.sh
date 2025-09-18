@@ -8,8 +8,11 @@ curl https://localhost:8443/favicon.svg -v --cacert site/ca/cert.pem --tls13-cip
 
 exit 0
 
+# curl usage
+curl --cacert ./site/ca/cert.pem https://localhost:8443
+curl http://localhost:8080
+
 export SSLKEYLOGFILE=/tmp/ssl_key_log
 
-# using curl build with mbedtls
-# ./configure --with-mbedtls
+# curl loop
 while curl https://localhost:8443/favicon.svg -i --cacert site/ca/cert.pem --tlsv1.3; do true; done

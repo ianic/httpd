@@ -7,6 +7,20 @@
 https://atlarge-research.com/pdfs/2024-bingimarsson-msc_thesis.pdf  
 https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/  
 
+## Kernel TLS
+
+```sh
+# check if module is enabled
+lsmod | grep tls
+
+# enable module
+sudo modprobe tls
+
+# enable permanently
+# cat /etc/modules-load.d/gnutls.conf
+echo tls | sudo tee /etc/modules-load.d/gnutls.conf
+```
+
 ## Benchmark
 
 
