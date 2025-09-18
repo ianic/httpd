@@ -1,3 +1,5 @@
+const Listener = @This();
+
 server: *Server,
 io: *Io,
 addr: net.Address,
@@ -69,4 +71,3 @@ const fd_t = linux.fd_t;
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const log = std.log.scoped(.listener);
-const Listener = @This();

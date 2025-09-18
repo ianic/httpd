@@ -1,3 +1,5 @@
+const Server = @This();
+
 /// Static site root.
 root: fs.Dir = undefined,
 /// Linux pipes used in sendfile and discard io operations. Pool allows reusing
@@ -377,4 +379,3 @@ const Listener = @import("Listener.zig");
 const Connection = @import("Connection.zig");
 const Handshake = @import("Handshake.zig");
 const log = std.log.scoped(.server);
-const Server = @This();

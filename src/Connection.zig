@@ -1,9 +1,12 @@
+const Connection = @This();
+const keepalive_timeout = 30;
+
 server: *Server,
 gpa: Allocator,
 io: *Io,
 fd: fd_t,
 completion: Io.Completion = .{},
-unused_recv: UnusedDataBuffer = .{},
+short_recv: ShortRecvBuffer = .{},
 protocol: Server.Protocol = .http,
 keep_alive: bool = true,
 recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
@@ -41,10 +44,10 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const n = Io.result(cqe) catch |err| {
         switch (err) {
             error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                log.info("connection recv retry on {}", .{err}); // TODO remove logging
+                log.info("connection recv retry on {}", .{err});
                 try self.recv();
             },
-            // recv timeout
+            // recv timeout or server close
             error.OperationCanceled => try self.close(),
             // connection closed
             error.IOError, error.ConnectionResetByPeer => try self.close(),
@@ -60,26 +63,29 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         return;
     }
 
-    const recv_buf = try self.io.getProvidedBuffer(cqe);
-    try self.parseHeader(recv_buf);
+    const recv_buf = try self.short_recv.append(self.gpa, try self.io.getProvidedBuffer(cqe));
+    const m = self.parseHeader(recv_buf) catch |err| {
+        try self.short_recv.reset(self.gpa);
+        return err;
+    };
+    try self.short_recv.set(self.gpa, recv_buf[m..]);
     self.io.putProvidedBuffer(cqe);
 }
 
-fn parseHeader(self: *Connection, recv_buf: []const u8) !void {
-    const input_buf = try self.unused_recv.append(self.gpa, recv_buf);
+// returns number of bytes consumed from recv_buf
+fn parseHeader(self: *Connection, recv_buf: []const u8) !usize {
     var hp: http.HeadParser = .{};
-    const head_tail = hp.feed(input_buf);
+    const head_tail = hp.feed(recv_buf);
     if (hp.state != .finished) {
-        try self.unused_recv.set(self.gpa, input_buf);
         // short read, read more
         try self.recv();
-        return;
+        return 0;
     }
-    const head_buf = input_buf[0..head_tail];
+    const head_buf = recv_buf[0..head_tail];
     const head = http.Server.Request.Head.parse(head_buf) catch |err| {
         log.info("connection head parse {}", .{err});
         try self.close();
-        return;
+        return recv_buf.len;
     };
     const content_length: u64 = head.content_length orelse 0;
     self.keep_alive = head.keep_alive;
@@ -92,12 +98,12 @@ fn parseHeader(self: *Connection, recv_buf: []const u8) !void {
         else
             try self.gpa.dupeZ(u8, head.target[1..]);
         self.file.path = path;
-        try self.unused_recv.set(self.gpa, input_buf[head_tail..]);
         try self.io.openRead(self.completion.with(onOpen), self.server.root.fd, path, &self.file.stat);
-        return;
+        return head_tail;
     }
     // bad request
     try self.close();
+    return recv_buf.len;
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -220,12 +226,7 @@ fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     file.fd = -1;
     if (self.keep_alive) {
         // next request
-        if (self.unused_recv.buffer.len > 0) {
-            log.info("keep_alive unused_recv: {}", .{self.unused_recv.buffer.len});
-            try self.parseHeader(&.{});
-        } else {
-            try self.recv();
-        }
+        try self.recv();
         return;
     }
     // close connection
@@ -264,30 +265,36 @@ fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 fn deinit(self: *Connection) void {
     if (self.file.path) |path| self.gpa.free(path);
     if (self.file.header) |header| self.gpa.free(header);
-    self.unused_recv.deinit(self.gpa);
+    self.short_recv.deinit(self.gpa);
     self.server.destroy(self);
 }
 
-pub const UnusedDataBuffer = struct {
-    const Self = @This();
+const ShortRecvBuffer = struct {
     buffer: []u8 = &.{},
+    reset_len: usize = 0,
 
-    pub fn append(self: *Self, allocator: Allocator, data: []const u8) ![]const u8 {
+    fn append(self: *ShortRecvBuffer, allocator: Allocator, recv_buf: []const u8) ![]const u8 {
+        self.reset_len = self.buffer.len;
         if (self.buffer.len == 0) {
             // nothing to append to
-            return data;
+            return recv_buf;
         }
-        if (data.len == 0) {
+        if (recv_buf.len == 0) {
             return self.buffer;
         }
-        // log.warn("unused append {} {}", .{ self.buffer.len, data.len });
         const old_len = self.buffer.len;
-        self.buffer = try allocator.realloc(self.buffer, old_len + data.len);
-        @memcpy(self.buffer[old_len..], data);
+        self.buffer = try allocator.realloc(self.buffer, old_len + recv_buf.len);
+        @memcpy(self.buffer[old_len..], recv_buf);
         return self.buffer;
     }
 
-    pub fn set(self: *Self, allocator: Allocator, unused: []const u8) !void {
+    fn reset(self: *ShortRecvBuffer, allocator: Allocator) !void {
+        if (self.reset_len == 0) return;
+        self.buffer = try allocator.realloc(self.buffer, self.reset_len);
+        self.reset_len = 0;
+    }
+
+    fn set(self: *ShortRecvBuffer, allocator: Allocator, unused: []const u8) !void {
         if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
             // nothing changed
             return;
@@ -304,7 +311,7 @@ pub const UnusedDataBuffer = struct {
         }
     }
 
-    pub fn deinit(self: *Self, allocator: Allocator) void {
+    fn deinit(self: *ShortRecvBuffer, allocator: Allocator) void {
         allocator.free(self.buffer);
         self.buffer = &.{};
     }
@@ -382,5 +389,3 @@ const http = std.http;
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const log = std.log.scoped(.connection);
-const Connection = @This();
-const keepalive_timeout = 10;
