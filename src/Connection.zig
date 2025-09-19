@@ -65,7 +65,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 
     const recv_buf = try self.short_recv.append(self.gpa, try self.io.getProvidedBuffer(cqe));
     const m = self.parseHeader(recv_buf) catch |err| {
-        try self.short_recv.reset(self.gpa);
+        self.short_recv.reset(self.gpa);
         return err;
     };
     try self.short_recv.set(self.gpa, recv_buf[m..]);
@@ -271,10 +271,10 @@ fn deinit(self: *Connection) void {
 
 const ShortRecvBuffer = struct {
     buffer: []u8 = &.{},
-    reset_len: usize = 0,
+    reset_buffer: []u8 = &.{},
 
     fn append(self: *ShortRecvBuffer, allocator: Allocator, recv_buf: []const u8) ![]const u8 {
-        self.reset_len = self.buffer.len;
+        self.reset_buffer = self.buffer;
         if (self.buffer.len == 0) {
             // nothing to append to
             return recv_buf;
@@ -282,38 +282,46 @@ const ShortRecvBuffer = struct {
         if (recv_buf.len == 0) {
             return self.buffer;
         }
-        const old_len = self.buffer.len;
-        self.buffer = try allocator.realloc(self.buffer, old_len + recv_buf.len);
-        @memcpy(self.buffer[old_len..], recv_buf);
+        self.reset_buffer = self.buffer;
+        self.buffer = try allocator.alloc(u8, self.reset_buffer.len + recv_buf.len);
+        @memcpy(self.buffer[0..self.reset_buffer.len], self.reset_buffer);
+        @memcpy(self.buffer[self.reset_buffer.len..], recv_buf);
         return self.buffer;
     }
 
-    fn reset(self: *ShortRecvBuffer, allocator: Allocator) !void {
-        if (self.reset_len == 0) return;
-        self.buffer = try allocator.realloc(self.buffer, self.reset_len);
-        self.reset_len = 0;
+    fn reset(self: *ShortRecvBuffer, allocator: Allocator) void {
+        allocator.free(self.buffer);
+        self.buffer = self.reset_buffer;
+        self.reset_buffer = &.{};
     }
 
     fn set(self: *ShortRecvBuffer, allocator: Allocator, unused: []const u8) !void {
-        if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
-            // nothing changed
+        if (self.reset_buffer.len > 0) {
+            @branchHint(.unlikely);
+            allocator.free(self.reset_buffer);
+            self.reset_buffer = &.{};
+        }
+        if (unused.len == 0) {
+            @branchHint(.likely);
+            if (self.buffer.len > 0) {
+                @branchHint(.unlikely);
+                allocator.free(self.buffer);
+                self.buffer = &.{};
+            }
             return;
         }
-        // unused is part of the self.buffer so free after dupe
-        const old_buffer = self.buffer;
-        if (unused.len > 0) {
-            self.buffer = try allocator.dupe(u8, unused);
-        } else {
-            self.buffer = &.{};
+        if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
+            return;
         }
-        if (old_buffer.len > 0) {
-            allocator.free(old_buffer);
-        }
+        // unused is part of the self.buffer make copy before free
+        const copy = try allocator.dupe(u8, unused);
+        allocator.free(self.buffer);
+        self.buffer = copy;
     }
 
     fn deinit(self: *ShortRecvBuffer, allocator: Allocator) void {
         allocator.free(self.buffer);
-        self.buffer = &.{};
+        allocator.free(self.reset_buffer);
     }
 };
 

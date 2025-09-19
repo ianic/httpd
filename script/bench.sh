@@ -42,17 +42,16 @@ vegeta-tests() {
     vegeta attack -targets=site/targets -duration=5s -rate=0 -max-workers=500 -root-certs site/ca/cert.pem | vegeta report | grep Requests
 }
 
-# start nginx listening on 8081 http and 8444 https
-mkdir -p tmp
-nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
-nginx_pid=$!
-
 # start httpd listening on 8080 http and 8443 https
 zig build -Doptimize=ReleaseFast
 zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
 pid=$!
-sleep 0.2
 
+# start nginx listening on 8081 http and 8444 https
+mkdir -p tmp
+nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
+nginx_pid=$!
+sleep 0.2
 
 # number of files in static site
 cd site/www.ziglang.org/zig-out
