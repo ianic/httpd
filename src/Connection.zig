@@ -41,22 +41,18 @@ fn recv(self: *Connection) !void {
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const self = parent(completion);
-    const n = Io.result(cqe) catch |err| {
+    const n = Io.result(cqe) catch |err| brk: {
         switch (err) {
             error.SignalInterrupt, error.NoBufferSpaceAvailable => {
                 log.info("connection recv retry on {}", .{err});
                 try self.recv();
+                return;
             },
-            // recv timeout or server close
-            error.OperationCanceled => try self.close(),
-            // connection closed
-            error.IOError, error.ConnectionResetByPeer => try self.close(),
-            else => {
-                log.info("connection recv failed {}", .{err});
-                try self.close();
-            },
+            error.OperationCanceled => {}, // timeout or server close
+            error.IOError, error.ConnectionResetByPeer => {}, // connection closed
+            else => log.info("connection recv failed {}", .{err}), // unexpected
         }
-        return;
+        break :brk 0;
     };
     if (n == 0) { // eof
         try self.close();
@@ -128,7 +124,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 
     const stat = std.fs.File.Stat.fromLinux(file.stat);
     if (stat.kind != .file) {
-        log.err("not a file '{s}'", .{file.path.?});
+        log.info("not a file '{s}'", .{file.path.?});
         try self.fileClose();
         return;
     }
@@ -146,7 +142,11 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.info("connection header send failed {}", .{err}),
         }
-        try self.close();
+        if (file.fd == -1) {
+            try self.close();
+        } else {
+            try self.fileClose();
+        }
         return;
     });
     if (file.header_pos < file.header.?.len) {
@@ -159,8 +159,8 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     file.header = null;
     file.header_pos = 0;
     if (file.fd == -1) {
-        // just header
-        try self.close();
+        // no body
+        try self.nextRequest();
         return;
     }
     // send body
@@ -224,12 +224,14 @@ fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     };
     // cleanup
     file.fd = -1;
+    try self.nextRequest();
+}
+
+fn nextRequest(self: *Connection) !void {
     if (self.keep_alive) {
-        // next request
         try self.recv();
         return;
     }
-    // close connection
     try self.close();
 }
 

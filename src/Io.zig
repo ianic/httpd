@@ -36,6 +36,7 @@ pub fn tick(io: *Io) !void {
         const n = try io.ring.copy_cqes(&io.cqes_buf, 1);
         io.cqes = io.cqes_buf[0..n];
     }
+    var t = try std.time.Timer.start();
     while (io.cqes.len > 0) {
         const cqe = io.cqes[0];
         if (cqe.user_data != 0) {
@@ -56,6 +57,7 @@ pub fn tick(io: *Io) !void {
         }
         io.cqes = io.cqes[1..];
     }
+    io.metric.tick_duration +%= t.read();
 }
 
 pub fn drain(io: *Io) !void {
@@ -285,6 +287,7 @@ pub fn result(cqe: linux.io_uring_cqe) SyscallError!i32 {
 }
 
 const Metric = struct {
+    tick_duration: usize = 0,
     total: usize = 0,
     active: usize = 0,
 

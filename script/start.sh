@@ -3,13 +3,13 @@ set -e
 cd $(git rev-parse --show-toplevel)
 
 # start httpd listening on 8080 http and 8443 https
-zig build #-Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
 pid=$!
 
-# # start nginx listening on 8081 http and 8444 https
-# mkdir -p tmp
-# nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
+# start nginx listening on 8081 http and 8444 https
+mkdir -p tmp
+nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 
 trap ctrl_c_handler INT
 

@@ -32,6 +32,7 @@ pub fn main() !void {
             posix.SIG.TERM, posix.SIG.INT => break,
             posix.SIG.USR1 => {
                 log.info("metric: {}", .{server.metric});
+                log.info("io metric: {}", .{server.io.metric});
             },
             else => {
                 log.info("ignoring signal {}", .{sig});

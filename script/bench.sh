@@ -7,22 +7,22 @@ results=()
 oha-tests() {
     rs=()
 
-    oha -z 2s  --no-tui  --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive > tmp/oha-out
+    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 1 connection disable-keepalive $r
 
-    oha -z 2s  --no-tui  --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem > tmp/oha-out
+    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 1 connection $r
 
-    oha -z 5s  --no-tui  --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem > tmp/oha-out
+    oha -z 5s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 100 connections $r
 
-    oha -z 5s  --no-tui  --urls-from-file site/targets-oha -c 500 -w --cacert site/ca/cert.pem  > tmp/oha-out
+    oha -z 5s --no-tui --urls-from-file site/targets-oha -c 500 -w --cacert site/ca/cert.pem  > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 500 connections $r
