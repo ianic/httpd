@@ -11,8 +11,8 @@ protocol: Server.Protocol = .http,
 keep_alive: bool = true,
 recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
 
-/// Fs file which is we are currently sending to the client. fd = -1 if there is
-/// no file in processing.
+/// File system file which we are currently sending to the client.
+/// fd = -1 if there is no current file.
 file: struct {
     fd: fd_t = -1,
     path: ?[:0]const u8 = null,
@@ -32,11 +32,11 @@ pub fn init(self: *Connection) !void {
 }
 
 fn recv(self: *Connection) !void {
-    if (self.server.state == .active) {
-        try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
-    } else {
+    if (self.server.closing()) {
         try self.close();
+        return;
     }
+    try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -214,7 +214,6 @@ fn fileClose(self: *Connection) !void {
 fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const self = parent(completion);
     const file = &self.file;
-    // handle result
     _ = Io.result(cqe) catch |err| switch (err) {
         error.SignalInterrupt => {
             try self.fileClose();
@@ -222,7 +221,6 @@ fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         },
         else => log.info("file close failed {}", .{err}),
     };
-    // cleanup
     file.fd = -1;
     try self.nextRequest();
 }

@@ -126,6 +126,10 @@ pub fn close(self: *Server) !void {
     }
 }
 
+pub fn closing(self: *Server) bool {
+    return self.state == .closing;
+}
+
 pub fn closed(self: *Server) bool {
     return self.listeners.count() == 0 and self.connections.count() == 0;
 }
@@ -297,10 +301,20 @@ const Args = struct {
         var args: Args = .{};
 
         while (iter.next()) |arg| {
-            if (parseInt("http-port", arg, &iter)) |v| args.http_port = v;
-            if (parseInt("https-port", arg, &iter)) |v| args.https_port = v;
-            if (parseDir("root", arg, &iter)) |v| args.root = v;
-            if (parseDir("cert", arg, &iter)) |v| args.cert = v;
+            if (parseInt("http-port", arg, &iter)) |v| {
+                args.http_port = v;
+            } else if (parseInt("https-port", arg, &iter)) |v| {
+                args.https_port = v;
+            } else if (parseDir("root", arg, &iter)) |v| {
+                args.root = v;
+            } else if (parseDir("cert", arg, &iter)) |v| {
+                args.cert = v;
+            } else if (std.mem.eql(u8, "-h", arg) or std.mem.eql(u8, "--help", arg)) {
+                help(0);
+            } else {
+                std.debug.print("unknown argument '{s}'\n", .{arg});
+                help(1);
+            }
         }
         return args;
     }
@@ -360,6 +374,23 @@ const Args = struct {
         std.debug.print(fmt, args);
         std.debug.print("\n", .{});
         std.process.exit(1);
+    }
+
+    pub fn help(status: u8) noreturn {
+        std.debug.print(
+            \\Usage: httpd [OPTIONS]
+            \\
+            \\  --root            Root folder of the static site to serve.
+            \\  --cert            Certificate folder. Two files are expected there:
+            \\                    cert.pem - site tls certificate
+            \\                    key.pem  - certificate private key
+            \\  --http-port       Port for http listener  (default 8080)
+            \\  --https-port      Port for https listener (default 8443)
+            \\  --help, -h        Print this help
+            \\
+            \\
+        , .{});
+        std.process.exit(status);
     }
 };
 

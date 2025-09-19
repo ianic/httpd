@@ -1,3 +1,7 @@
+/// TLS server handshake. After successfull upgrade to the https return file
+/// descriptor to the server.
+const Handshake = @This();
+
 server: *Server,
 io: *Io,
 /// retrun point of the io operation
@@ -20,8 +24,9 @@ buffer: [tls.output_buffer_len]u8 = undefined,
 pos: usize = 0,
 /// pointer to the part of the buffer used in send, needed in the case of short send
 send_buf: []const u8 = &.{},
-/// Number of peeks, if the socket is closed but there is something in the
-/// buffer peeek will retrun that bytes over and over. Limit number of peeks.
+/// Number of peeks; if the socket is closed but there is something in the
+/// buffer peeek will retrun that bytes over and over. This limits number of
+/// peeks.
 peek_count: usize = 0,
 
 inline fn parent(completion: *Io.Completion) *Handshake {
@@ -178,4 +183,3 @@ const tls = @import("tls");
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const log = std.log.scoped(.handshake);
-const Handshake = @This();
