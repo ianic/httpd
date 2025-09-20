@@ -13,9 +13,9 @@ pub fn main() !void {
 
     var io: Io = .{};
     try io.init(gpa, .{
-        .entries = 1024 * 4,
+        .entries = 1024,
         .fd_nr = 1024,
-        .recv_buffers = .{ .count = 2, .size = 4096 * 128 },
+        .recv_buffers = .{ .count = 2, .size = 4096 * 16 },
     });
     defer io.deinit(gpa);
 
@@ -24,10 +24,7 @@ pub fn main() !void {
     defer server.deinit();
 
     while (true) {
-        io.tick() catch |err| switch (err) {
-            error.SignalInterrupt => {},
-            else => return err,
-        };
+        try io.tick();
         if (signal.get()) |sig| switch (sig) {
             posix.SIG.TERM, posix.SIG.INT => break,
             posix.SIG.USR1 => {

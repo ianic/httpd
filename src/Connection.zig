@@ -86,20 +86,26 @@ fn parseHeader(self: *Connection, recv_buf: []const u8) !usize {
     const content_length: u64 = head.content_length orelse 0;
     self.keep_alive = head.keep_alive;
     if (head.method == .GET and content_length == 0) {
-        // open target file
-        const path = if (head.target.len <= 1)
-            try self.gpa.dupeZ(u8, "index.html")
-        else if (head.target[head.target.len - 1] == '/')
-            try std.fmt.allocPrintSentinel(self.gpa, "{s}index.html", .{head.target[1..]}, 0)
-        else
-            try self.gpa.dupeZ(u8, head.target[1..]);
-        self.file.path = path;
-        try self.io.openRead(self.completion.with(onOpen), self.server.root.fd, path, &self.file.stat);
+        try self.setFilePath(head.target);
+        try self.fileOpen();
         return head_tail;
     }
     // bad request
     try self.close();
     return recv_buf.len;
+}
+
+fn setFilePath(self: *Connection, target: []const u8) !void {
+    self.file.path = if (target.len <= 1)
+        try self.gpa.dupeZ(u8, "index.html")
+    else if (target[target.len - 1] == '/')
+        try std.fmt.allocPrintSentinel(self.gpa, "{s}index.html", .{target[1..]}, 0)
+    else
+        try self.gpa.dupeZ(u8, target[1..]);
+}
+
+fn fileOpen(self: *Connection) !void {
+    try self.io.openRead(self.completion.with(onOpen), self.server.root.fd, self.file.path.?, &self.file.stat);
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -112,6 +118,13 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
                 self.server.metric.files.not_found +%= 1;
                 self.file.header = try Header.notFound(self.gpa, self.keep_alive);
                 try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{});
+            },
+            error.SignalInterrupt => {
+                try self.fileOpen();
+            },
+            error.FileTableOverflow => {
+                log.warn("connection file open retry on {}", .{err});
+                try self.fileOpen();
             },
             else => {
                 log.info("open '{s}' failed {}", .{ file.path.?, err });

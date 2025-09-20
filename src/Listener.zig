@@ -33,28 +33,28 @@ fn accept(self: *Listener) !void {
 
 fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const self = parent(completion);
-    const fd: fd_t = Io.result(cqe) catch |err| switch (err) {
-        error.SignalInterrupt => {
-            try self.accept();
-            return;
-        },
-        error.FileTableOverflow => {
-            log.warn("listener accept {}", .{err});
-            try self.accept();
-            return;
-        },
-        error.OperationCanceled => {
-            self.server.destroy(self);
-            return;
-        },
-        else => return err,
+    const fd: fd_t = Io.result(cqe) catch |err| {
+        switch (err) {
+            error.SignalInterrupt => {
+                try self.accept();
+            },
+            error.FileTableOverflow => {
+                log.warn("listener accept {}", .{err});
+                try self.accept();
+            },
+            error.OperationCanceled => {
+                self.server.destroy(self);
+            },
+            else => return err,
+        }
+        return;
     };
-    if (self.server.state == .active) {
-        try self.accept();
-        try self.server.connect(self.protocol, fd);
-    } else {
+    if (self.server.closing()) {
         try self.io.close(null, fd);
+        return;
     }
+    try self.accept();
+    try self.server.connect(self.protocol, fd);
 }
 
 pub fn close(self: *Listener) !void {

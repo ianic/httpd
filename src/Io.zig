@@ -2,13 +2,20 @@ const Io = @This();
 
 ring: linux.IoUring = undefined,
 recv_buffer_group: linux.IoUring.BufferGroup = undefined,
-cqes_buf: [128]linux.io_uring_cqe = undefined,
+cqes_buf: []linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
 dev_null_fd: fd_t = -1,
 
+/// Max number of sqes that can be produced by processing one cqe. Used for
+/// avoiding SubmissionQueueFull errors. It's hard to mitigate that error if
+/// happens deep in processiog cqe.
+const sqes_per_cqe = 4;
+
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
+
+    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / sqes_per_cqe));
 
     io.ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer io.ring.deinit();
@@ -22,21 +29,28 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.count,
     );
     close_notify.init();
+    //if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
+    log.debug("sqes: {}, cqes: {}, cqes_buf: {}", .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len });
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
     io.recv_buffer_group.deinit(allocator);
     posix.close(io.dev_null_fd);
+    allocator.free(io.cqes_buf);
     io.ring.deinit();
 }
 
+/// Sumbit prepared submissions, get and process pending completions.
+/// Completions are processed in chunks of max cqes_buf.len. If there are no
+/// pending compeltions io_uring will wait for at least one completion to appear
+/// in the completion queue.
 pub fn tick(io: *Io) !void {
-    if (io.cqes.len == 0) {
-        _ = try io.ring.submit();
-        const n = try io.ring.copy_cqes(&io.cqes_buf, 1);
-        io.cqes = io.cqes_buf[0..n];
-    }
-    var t = try std.time.Timer.start();
+    io.getCqes() catch |err| switch (err) {
+        error.SignalInterrupt => return,
+        else => return err,
+    };
+
+    var timer = try time.Timer.start();
     while (io.cqes.len > 0) {
         const cqe = io.cqes[0];
         if (cqe.user_data != 0) {
@@ -44,8 +58,8 @@ pub fn tick(io: *Io) !void {
             const callback = completion.callback;
             // Reset completion.callback so that completion can be reused during callback.
             completion.callback = Completion.noopCallback;
-            io.metric.completed();
             try callback(completion, cqe);
+            io.metric.completed(cqe);
         } else {
             _ = result(cqe) catch |err| {
                 switch (err) {
@@ -57,7 +71,38 @@ pub fn tick(io: *Io) !void {
         }
         io.cqes = io.cqes[1..];
     }
-    io.metric.tick_duration +%= t.read();
+    io.metric.tick_duration +%= timer.read();
+}
+
+fn getCqes(io: *Io) !void {
+    if (io.cqes.len > 0) {
+        @branchHint(.unlikely);
+        return;
+    }
+    _ = try io.ring.submit();
+    const n = try io.ring.copy_cqes(io.cqes_buf, 1);
+    io.cqes = io.cqes_buf[0..n];
+    // Ensure that error.SubmissionQueueFull never happens. There is enoughs
+    // space in submission queue for all operations prepared during processing
+    // cqes.
+    try io.ensureSqCapacity(n * sqes_per_cqe);
+}
+
+/// Number of unused submission queue entries
+/// Matches liburing io_uring_sq_space_left
+fn sqSpaceLeft(io: *Io) u32 {
+    return @as(u32, @intCast(io.ring.sq.sqes.len)) - io.ring.sq_ready();
+}
+
+fn ensureSqCapacity(io: *Io, count: u32) !void {
+    assert(count <= io.ring.sq.sqes.len);
+    while (io.sqSpaceLeft() < count) {
+        io.metric.err.ensure_sq_capacity +%= 1;
+        _ = io.ring.submit() catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return err,
+        };
+    }
 }
 
 pub fn drain(io: *Io) !void {
@@ -273,9 +318,9 @@ pub fn msgRingFd(io: *Io, c: ?*Completion, target_c: *Completion, target_ring: f
 
 // from musl/include/fcnt.h
 const SPLICE_F_NONBLOCK = 0x02;
-const splice_no_offset = std.math.maxInt(u64);
+const splice_no_offset = math.maxInt(u64);
 
-const yes_socket_option = std.mem.asBytes(&@as(u32, 1));
+const yes_socket_option = mem.asBytes(&@as(u32, 1));
 
 const SyscallError = @import("errno.zig").Error;
 
@@ -291,13 +336,41 @@ const Metric = struct {
     total: usize = 0,
     active: usize = 0,
 
+    err: struct {
+        no_recv_buffer: usize = 0,
+        file_not_found: usize = 0,
+        interrupt: usize = 0,
+        file_table_overflow: usize = 0,
+        canceled: usize = 0,
+        eof: usize = 0,
+        other: usize = 0,
+
+        ensure_sq_capacity: usize = 0,
+    } = .{},
+
     fn sumbitted(self: *Metric) void {
         self.active += 1;
         self.total +%= 1;
     }
 
-    fn completed(self: *Metric) void {
+    fn completed(self: *Metric, cqe: linux.io_uring_cqe) void {
         self.active -= 1;
+        if (cqe.res >= 0) {
+            @branchHint(.likely);
+            return;
+        }
+        _ = result(cqe) catch |err| switch (err) {
+            error.NoBufferSpaceAvailable => self.err.no_recv_buffer +%= 1,
+            error.NoSuchFileOrDirectory => self.err.file_not_found +%= 1,
+            error.SignalInterrupt => self.err.interrupt +%= 1,
+            error.FileTableOverflow => self.err.file_table_overflow +%= 1,
+            error.OperationCanceled => self.err.canceled +%= 1,
+            error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer, error.IOError => self.err.eof +%= 1,
+            else => {
+                log.info("metric unhandled {}", .{err});
+                self.err.other +%= 1;
+            },
+        };
     }
 };
 
@@ -426,6 +499,8 @@ const linux = std.os.linux;
 const posix = std.posix;
 const net = std.net;
 const mem = std.mem;
+const math = std.math;
+const time = std.time;
 const Allocator = std.mem.Allocator;
 const fd_t = linux.fd_t;
 const log = std.log.scoped(.io);
