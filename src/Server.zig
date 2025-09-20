@@ -1,7 +1,7 @@
 const Server = @This();
 
 /// Static site root.
-root: fs.Dir = undefined,
+root: fs.Dir,
 /// Linux pipes used in sendfile and discard io operations. Pool allows reusing
 /// pipe without create/close for each operation.
 pipes: PipePool = undefined,
@@ -14,7 +14,8 @@ listeners: std.AutoArrayHashMapUnmanaged(*Listener, void) = .empty,
 connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
 /// Tls certificate and private key pair. Null if cert argument is not provided.
 /// If null https listener is not started.
-tls_auth: ?tls.config.CertKeyPair = null,
+tls_auth: ?tls.config.CertKeyPair,
+
 state: State = .active,
 const State = enum {
     active,
@@ -28,21 +29,14 @@ const cipher_suites = &[_]tls.config.CipherSuite{
     .CHACHA20_POLY1305_SHA256,
 };
 
-pub fn init(self: *Server) !void {
-    const args = try Args.parse(self.gpa);
-    defer args.deinit(self.gpa);
-    self.root = if (args.root) |dir| dir else std.fs.cwd();
-    if (args.cert) |cert_dir| {
-        self.tls_auth = try tls.config.CertKeyPair.fromFilePath(self.gpa, cert_dir, "cert.pem", "key.pem");
-    }
-
+pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     self.pipes = .{ .gpa = self.gpa, .metric = &self.metric };
     try self.pipes.initPreheated(16);
 
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
     // http
     {
-        const addr = try std.net.Address.resolveIp("127.0.0.1", args.http_port);
+        const addr = try std.net.Address.resolveIp("127.0.0.1", http_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr };
         try listener.init();
@@ -50,7 +44,7 @@ pub fn init(self: *Server) !void {
     }
     // https
     if (self.tls_auth) |_| {
-        const addr = try std.net.Address.resolveIp("127.0.0.1", args.https_port);
+        const addr = try std.net.Address.resolveIp("127.0.0.1", https_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
         try listener.init();
@@ -281,117 +275,6 @@ pub const Metric = struct {
             g.current -= 1;
         }
     };
-};
-
-const Args = struct {
-    root: ?fs.Dir = null,
-    cert: ?fs.Dir = null,
-    http_port: u16 = 8080,
-    https_port: u16 = 8443,
-
-    fn deinit(self: Args, gpa: Allocator) void {
-        _ = self;
-        _ = gpa;
-    }
-
-    pub fn parse(gpa: Allocator) !Args {
-        _ = gpa;
-        var iter = std.process.args();
-        _ = iter.next();
-        var args: Args = .{};
-
-        while (iter.next()) |arg| {
-            if (parseInt("http-port", arg, &iter)) |v| {
-                args.http_port = v;
-            } else if (parseInt("https-port", arg, &iter)) |v| {
-                args.https_port = v;
-            } else if (parseDir("root", arg, &iter)) |v| {
-                args.root = v;
-            } else if (parseDir("cert", arg, &iter)) |v| {
-                args.cert = v;
-            } else if (std.mem.eql(u8, "-h", arg) or std.mem.eql(u8, "--help", arg)) {
-                help(0);
-            } else {
-                std.debug.print("unknown argument '{s}'\n", .{arg});
-                help(1);
-            }
-        }
-        return args;
-    }
-
-    fn parseDir(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?fs.Dir {
-        if (parseString(name, arg, iter)) |v| {
-            return std.fs.cwd().openDir(v, .{}) catch |err| {
-                fatal("cant't open root dir '{s}' {}", .{ v, err });
-            };
-        }
-        return null;
-    }
-
-    fn parseInt(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?u16 {
-        const arg_name1 = "--" ++ name ++ "=";
-        const arg_name2 = "--" ++ name;
-
-        if (std.mem.startsWith(u8, arg, arg_name1)) {
-            const suffix = arg[arg_name1.len..];
-            return std.fmt.parseInt(u16, suffix, 10) catch |err| fatal(
-                "bad {s} value '{s}': {s}",
-                .{ arg_name1, arg, @errorName(err) },
-            );
-        } else if (std.mem.eql(u8, arg, arg_name2)) {
-            if (iter.next()) |val| {
-                return std.fmt.parseInt(u16, val, 10) catch |err| fatal(
-                    "bad {s} value '{s}': {s}",
-                    .{ arg_name2, arg, @errorName(err) },
-                );
-            } else fatal(
-                "missing argument to '{s}'",
-                .{arg_name2},
-            );
-        }
-        return null;
-    }
-
-    fn parseString(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?[]const u8 {
-        const arg_name1 = "--" ++ name ++ "=";
-        const arg_name2 = "--" ++ name;
-
-        if (std.mem.startsWith(u8, arg, arg_name1)) {
-            const suffix = arg[arg_name1.len..];
-            return suffix;
-        } else if (std.mem.eql(u8, arg, arg_name2)) {
-            if (iter.next()) |val| {
-                return val;
-            } else fatal(
-                "missing argument to '{s}'",
-                .{arg_name2},
-            );
-        }
-        return null;
-    }
-
-    fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-        std.debug.print(fmt, args);
-        std.debug.print("\n", .{});
-        std.process.exit(1);
-    }
-
-    pub fn help(status: u8) noreturn {
-        std.debug.print(
-            \\Usage: httpd [OPTIONS]
-            \\
-            \\  --root            Root folder of the static site to serve.
-            \\  --cert            Certificate folder. Two files are expected there:
-            \\                    cert.pem - site tls certificate
-            \\                    key.pem  - certificate private key
-            \\  --http-port       Port for http listener  (default 8080)
-            \\  --https-port      Port for https listener (default 8443)
-            \\  --help, -h        Print this help
-            \\
-            \\
-        , .{});
-        std.process.exit(status);
-    }
 };
 
 const std = @import("std");

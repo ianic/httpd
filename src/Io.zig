@@ -15,11 +15,13 @@ const sqes_per_cqe = 4;
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
 
-    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / sqes_per_cqe));
-
     io.ring = try linux.IoUring.init(opt.entries, opt.flags);
     errdefer io.ring.deinit();
     try io.ring.register_files_sparse(opt.fd_nr);
+
+    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / sqes_per_cqe));
+    errdefer allocator.free(io.cqes_buf);
+
     io.dev_null_fd = try posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     io.recv_buffer_group = try linux.IoUring.BufferGroup.init(
         &io.ring,
@@ -29,8 +31,11 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.count,
     );
     close_notify.init();
-    //if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
-    log.debug("sqes: {}, cqes: {}, cqes_buf: {}", .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len });
+    if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
+        log.debug(
+            "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
+            .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
+        );
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
