@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "httpd",
         .root_module = b.createModule(.{
+            .error_tracing = true,
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
             // this package, which is why in this case we don't have to give it a name.

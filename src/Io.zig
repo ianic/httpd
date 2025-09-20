@@ -7,11 +7,6 @@ cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
 dev_null_fd: fd_t = -1,
 
-/// Max number of sqes that can be produced by processing one cqe. Used for
-/// avoiding SubmissionQueueFull errors. It's hard to mitigate that error if
-/// happens deep in processiog cqe.
-const sqes_per_cqe = 4;
-
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
 
@@ -19,7 +14,7 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     errdefer io.ring.deinit();
     try io.ring.register_files_sparse(opt.fd_nr);
 
-    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / sqes_per_cqe));
+    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / 2));
     errdefer allocator.free(io.cqes_buf);
 
     io.dev_null_fd = try posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
@@ -31,11 +26,11 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.count,
     );
     close_notify.init();
-    if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
-        log.debug(
-            "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
-            .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
-        );
+    //if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
+    log.debug(
+        "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
+        .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
+    );
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
@@ -87,10 +82,7 @@ fn getCqes(io: *Io) !void {
     _ = try io.ring.submit();
     const n = try io.ring.copy_cqes(io.cqes_buf, 1);
     io.cqes = io.cqes_buf[0..n];
-    // Ensure that error.SubmissionQueueFull never happens. There is enoughs
-    // space in submission queue for all operations prepared during processing
-    // cqes.
-    try io.ensureSqCapacity(n * sqes_per_cqe);
+    try io.ensureSqCapacity(n);
 }
 
 /// Number of unused submission queue entries
@@ -99,6 +91,8 @@ fn sqSpaceLeft(io: *Io) u32 {
     return @as(u32, @intCast(io.ring.sq.sqes.len)) - io.ring.sq_ready();
 }
 
+/// Ensure that error.SubmissionQueueFull never happens that There is enough
+/// space in submission queue for count operations.
 fn ensureSqCapacity(io: *Io, count: u32) !void {
     assert(count <= io.ring.sq.sqes.len);
     while (io.sqSpaceLeft() < count) {
@@ -120,6 +114,7 @@ pub fn drain(io: *Io) !void {
 }
 
 pub fn socket(io: *Io, c: *Completion, addr: *const net.Address) !void {
+    try io.ensureSqCapacity(1);
     _ = try io.ring.socket_direct_alloc(@intFromPtr(c), addr.any.family, linux.SOCK.STREAM, 0, 0);
     io.metric.sumbitted();
 }
@@ -130,6 +125,7 @@ pub const ListenOption = struct {
 };
 
 pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: fd_t, opt: ListenOption) !void {
+    try io.ensureSqCapacity(4);
     var sqe: *linux.io_uring_sqe = undefined;
     if (opt.reuse_address) {
         sqe = try io.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, yes_socket_option);
@@ -145,6 +141,7 @@ pub fn listen(io: *Io, c: *Completion, addr: *const net.Address, fd: fd_t, opt: 
 }
 
 pub fn ktlsUgrade(io: *Io, c: *Completion, fd: fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
+    try io.ensureSqCapacity(3);
     const TX = @as(c_int, 1);
     const RX = @as(c_int, 2);
 
@@ -158,11 +155,13 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, fd: fd_t, tx_opt: []const u8, rx_opt:
 }
 
 pub fn tcpNodelay(io: *Io, fd: fd_t) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.setsockopt(0, fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, yes_socket_option);
     sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 pub fn accept(io: *Io, c: *Completion, fd: fd_t) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.accept_direct(@intFromPtr(c), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
@@ -176,6 +175,7 @@ pub const RecvBuffer = union(enum) {
 };
 
 pub fn recv(io: *Io, c: *Completion, fd: fd_t, buffer: RecvBuffer, timeout: ?*const linux.kernel_timespec) !void {
+    try io.ensureSqCapacity(2);
     var sqe = switch (buffer) {
         .buffer => |b| try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = b }, 0),
         .provided => try io.recv_buffer_group.recv(@intFromPtr(c), fd, 0),
@@ -205,6 +205,7 @@ pub fn putProvidedBuffer(io: *Io, cqe: linux.io_uring_cqe) void {
 }
 
 pub fn peek(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
+    try io.ensureSqCapacity(1);
     const flags: MsgFlags = .{ .peek = true };
     var sqe = try io.ring.recv(@intFromPtr(c), fd, .{ .buffer = buffer }, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -213,6 +214,7 @@ pub fn peek(io: *Io, c: *Completion, fd: fd_t, buffer: []u8) !void {
 
 /// Discard len bytes from fd to the /dev/null, without copying them to the userspace.
 pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
+    try io.ensureSqCapacity(2);
     const fd_out = io.dev_null_fd;
     var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
@@ -223,6 +225,7 @@ pub fn discard(io: *Io, c: *Completion, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32
 }
 
 pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
+    try io.ensureSqCapacity(2);
     var sqe = try io.ring.sendmsg(0, fd, &close_notify.msg, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     try io.close(c, fd);
@@ -230,12 +233,14 @@ pub fn closeTls(io: *Io, c: *Completion, fd: fd_t) !void {
 
 /// Close file descriptor
 pub fn close(io: *Io, c: ?*Completion, fd: fd_t) !void {
+    try io.ensureSqCapacity(1);
     _ = try io.ring.close_direct(if (c) |ptr| @intFromPtr(ptr) else 0, @intCast(fd));
     if (c != null) io.metric.sumbitted();
 }
 
 /// Cancel any fd operations
 pub fn cancel(io: *Io, c: ?*Completion, fd: fd_t) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.get_sqe();
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -259,28 +264,33 @@ pub const MsgFlags = packed struct {
 };
 
 pub fn send(io: *Io, c: *Completion, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.send(@intFromPtr(c), fd, buffer, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
 }
 
 pub fn sendmsg(io: *Io, c: *Completion, fd: fd_t, msg: *const posix.msghdr_const, flags: MsgFlags) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.sendmsg(@intFromPtr(c), fd, msg, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     io.metric.sumbitted();
 }
 
 pub fn statx(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
+    try io.ensureSqCapacity(1);
     _ = try io.ring.statx(@intFromPtr(c), dir, path, 0, linux.STATX_SIZE, stat);
     io.metric.sumbitted();
 }
 
 pub fn openAt(io: *Io, c: *Completion, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
+    try io.ensureSqCapacity(1);
     _ = try io.ring.openat_direct(@intFromPtr(c), dir, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC);
     io.metric.sumbitted();
 }
 
 pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
+    try io.ensureSqCapacity(2);
     if (stat) |s| {
         var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_SIZE, s);
         sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -289,6 +299,7 @@ pub fn openRead(io: *Io, c: *Completion, dir: fd_t, path: [:0]const u8, stat: ?*
 }
 
 pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
+    try io.ensureSqCapacity(2);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -300,6 +311,7 @@ pub fn sendfile(io: *Io, c: *Completion, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2
 
 /// send direct file descriptor to the target_ring
 pub fn msgRingFd(io: *Io, c: ?*Completion, target_c: *Completion, target_ring: fd_t, source_fd: fd_t) !void {
+    try io.ensureSqCapacity(2);
     const IORING_MSG_SEND_FD = 1;
 
     var sqe = try io.ring.get_sqe();
