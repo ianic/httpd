@@ -36,7 +36,7 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
     // http
     {
-        const addr = try std.net.Address.resolveIp("127.0.0.1", http_port);
+        const addr = try std.net.Address.resolveIp("0.0.0.0", http_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr };
         try listener.init();
@@ -44,7 +44,7 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     }
     // https
     if (self.tls_auth) |_| {
-        const addr = try std.net.Address.resolveIp("127.0.0.1", https_port);
+        const addr = try std.net.Address.resolveIp("0.0.0.0", https_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
         try listener.init();
