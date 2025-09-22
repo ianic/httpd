@@ -2,15 +2,23 @@
 set -e
 cd $(git rev-parse --show-toplevel)
 
+host="${1:-localhost}"
+
 results=()
 
 oha-tests() {
+    protocol=$1
+    port=$2
+    host=$3
+
+    script/targets.sh "$protocol" "$port" "$host"
+
     rs=()
 
     oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
-    echo 1 connection disable-keepalive $r
+    echo 1 connection without keepalive $r
 
     oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
@@ -31,20 +39,9 @@ oha-tests() {
     results+=( "" )
 }
 
-vegeta-tests() {
-    echo vegeta 1 connection disable-keepalive
-    vegeta attack -targets=site/targets -duration=2s -rate=0 -max-workers=1 -keepalive=false -root-certs site/ca/cert.pem | vegeta report | grep Requests
-    echo vegeta 1 connection
-    vegeta attack -targets=site/targets -duration=2s -rate=0 -max-workers=1 -root-certs site/ca/cert.pem | vegeta report | grep Requests
-    echo vegeta 100 connections
-    vegeta attack -targets=site/targets -duration=5s -rate=0 -max-workers=100 -root-certs site/ca/cert.pem | vegeta report | grep Requests
-    echo vegeta 500 connections
-    vegeta attack -targets=site/targets -duration=5s -rate=0 -max-workers=500 -root-certs site/ca/cert.pem | vegeta report | grep Requests
-}
-
 # start httpd listening on 8080 http and 8443 https
 zig build -Doptimize=ReleaseFast
-zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec &
+zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/cert_ec&
 pid=$!
 
 # start nginx listening on 8081 http and 8444 https
@@ -59,20 +56,16 @@ echo site files count: "$(find . -type f | wc -l)"
 cd - >>/dev/null
 
 echo -e "\nhttp"
-script/targets.sh http 8080
-oha-tests
+oha-tests http 8080 "$host"
 
 echo -e "\nhttp nginx"
-script/targets.sh http 8081
-oha-tests
+oha-tests http 8081 "$host"
 
 echo -e "\nhttps"
-script/targets.sh https 8443
-oha-tests
+oha-tests https 8443 "$host"
 
 echo -e "\nhttps nginx"
-script/targets.sh https 8444
-oha-tests
+oha-tests https 8444 "$host"
 
 echo
 for r in "${results[@]}"; do
