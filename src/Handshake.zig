@@ -41,18 +41,18 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
 fn recv(self: *Handshake) !void {
     if (self.hs.state == .init) {
         // Read client hello message in the buffer
-        try self.io.recvDirect(self.completion.with(onRecv), self.fd, self.buffer[self.pos..], &self.recv_timeout);
+        try self.io.recvDirect(&self.completion, onRecv, self.fd, self.buffer[self.pos..], &self.recv_timeout);
         return;
     }
     // Peek client flight into buffer. We will later discard bytes consumed
     // in handshake leaving other bytes for connection to consume.
     self.pos = 0;
-    try self.io.peek(self.completion.with(onRecv), self.fd, &self.buffer);
+    try self.io.peek(&self.completion, onRecv, self.fd, &self.buffer);
     self.peek_count += 1;
 }
 
 fn close(self: *Handshake) !void {
-    try self.io.close(self.completion.with(onClose), self.fd);
+    try self.io.close(&self.completion, onClose, self.fd);
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -87,7 +87,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (res.send_pos > 0) {
         // server flight
         self.send_buf = res.send;
-        try self.io.send(completion.with(onSend), self.fd, self.send_buf, .{});
+        try self.io.send(completion, onSend, self.fd, self.send_buf, .{});
         return;
     }
     if (self.hs.done()) {
@@ -96,7 +96,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         // consumed in connection.
         self.pipe = try self.server.pipes.get(self.pos);
         self.pos = res.recv_pos;
-        try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?.fds, @intCast(self.pos));
+        try self.io.discard(completion, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
         return;
     }
     if (self.peek_count > 32) {
@@ -122,7 +122,7 @@ fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (n < self.send_buf.len) {
         // short send, send rest
         self.send_buf = self.send_buf[@intCast(n)..];
-        try self.io.send(completion.with(onSend), self.fd, self.send_buf, .{});
+        try self.io.send(completion, onSend, self.fd, self.send_buf, .{});
         return;
     }
     // server flight sent, get client flight 2
@@ -139,7 +139,7 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     self.pos -= @intCast(n);
     if (self.pos > 0) {
         // short discard
-        try self.io.discard(completion.with(onDiscard), self.fd, self.pipe.?.fds, @intCast(self.pos));
+        try self.io.discard(completion, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
         return;
     }
     // discard done
@@ -147,7 +147,7 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     try self.server.pipes.put(self.pipe.?);
     self.pipe = null;
     self.ktls = tls.Ktls.init(self.hs.cipher().?);
-    try self.io.ktlsUgrade(completion.with(onUpgrade), self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+    try self.io.ktlsUgrade(completion, onUpgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
 }
 
 fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {

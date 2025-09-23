@@ -12,13 +12,13 @@ inline fn parent(completion: *Io.Completion) *Listener {
 }
 
 pub fn init(self: *Listener) !void {
-    try self.io.socket(self.completion.with(onSocket), &self.addr);
+    try self.io.socket(&self.completion, onSocket, &self.addr);
 }
 
 fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     const self = parent(completion);
     self.fd = try Io.result(cqe);
-    try self.io.listen(completion.with(onListen), &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
+    try self.io.listen(completion, onListen, &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
 }
 
 fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -28,7 +28,7 @@ fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn accept(self: *Listener) !void {
-    try self.io.accept(self.completion.with(onAccept), self.fd);
+    try self.io.accept(&self.completion, onAccept, self.fd);
 }
 
 fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -50,7 +50,7 @@ fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         return;
     };
     if (self.server.closing()) {
-        try self.io.close(null, fd);
+        try self.io.closeBg(fd);
         return;
     }
     try self.accept();
@@ -58,8 +58,8 @@ fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 pub fn close(self: *Listener) !void {
-    try self.io.cancel(null, self.fd);
-    try self.io.close(null, self.fd);
+    try self.io.cancelBg(self.fd);
+    try self.io.closeBg(self.fd);
 }
 
 const std = @import("std");

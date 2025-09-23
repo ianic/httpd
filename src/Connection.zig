@@ -36,7 +36,7 @@ fn recv(self: *Connection) !void {
         try self.close();
         return;
     }
-    try self.io.recvProvided(self.completion.with(onRecv), self.fd, &self.recv_timeout);
+    try self.io.recvProvided(&self.completion, onRecv, self.fd, &self.recv_timeout);
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -105,7 +105,7 @@ fn setFilePath(self: *Connection, target: []const u8) !void {
 }
 
 fn fileOpen(self: *Connection) !void {
-    try self.io.openRead(self.completion.with(onOpen), self.server.root.fd, self.file.path.?, &self.file.stat);
+    try self.io.openRead(&self.completion, onOpen, self.server.root.fd, self.file.path.?, &self.file.stat);
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -117,7 +117,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
                 log.info("not found '{s}'", .{file.path.?});
                 self.server.metric.files.not_found +%= 1;
                 self.file.header = try Header.notFound(self.gpa, self.keep_alive);
-                try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{});
+                try self.io.send(&self.completion, onHeader, self.fd, self.file.header.?, .{});
             },
             error.SignalInterrupt => {
                 try self.fileOpen();
@@ -143,7 +143,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     }
     //log.info("ok {d} '{s}' size: {d} keep-alive: {}", .{ self.fd, file.path.?, file.stat.size, self.keep_alive });
     self.file.header = try Header.ok(self.gpa, file.path.?, file.stat.size, self.keep_alive);
-    try self.io.send(self.completion.with(onHeader), self.fd, self.file.header.?, .{ .more = true });
+    try self.io.send(&self.completion, onHeader, self.fd, self.file.header.?, .{ .more = true });
 }
 
 fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -164,7 +164,7 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     });
     if (file.header_pos < file.header.?.len) {
         // short send send more
-        try self.io.send(completion.with(onHeader), self.fd, file.header.?[file.header_pos..], .{ .more = true });
+        try self.io.send(completion, onHeader, self.fd, file.header.?[file.header_pos..], .{ .more = true });
         return;
     }
     // release header
@@ -179,7 +179,7 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     // send body
     const pipe = try self.server.pipes.get(file.stat.size);
     file.pipe = pipe;
-    try self.io.sendfile(completion.with(onBody), self.fd, file.fd, pipe.fds, 0, @intCast(file.stat.size));
+    try self.io.sendfile(completion, onBody, self.fd, file.fd, pipe.fds, 0, @intCast(file.stat.size));
 }
 
 fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -198,7 +198,7 @@ fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (file.offset < file.stat.size) {
         // short send, send the rest of the file
         const len = file.stat.size - file.offset;
-        try self.io.sendfile(completion.with(onBody), self.fd, file.fd, file.pipe.?.fds, @intCast(file.offset), @intCast(len));
+        try self.io.sendfile(completion, onBody, self.fd, file.fd, file.pipe.?.fds, @intCast(file.offset), @intCast(len));
         self.server.metric.files.sendfile_more +%= 1;
         return;
     }
@@ -221,7 +221,7 @@ fn fileClose(self: *Connection) !void {
         file.offset = 0;
         file.stat = mem.zeroes(linux.Statx);
     }
-    try self.io.close(self.completion.with(onFileClose), file.fd);
+    try self.io.close(&self.completion, onFileClose, file.fd);
 }
 
 fn onFileClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -251,16 +251,15 @@ pub fn close(self: *Connection) !void {
         // If called from server.
         // Cancel if receiving, else send file and than close.
         if (self.completion.callback == onRecv) {
-            try self.io.cancel(null, self.fd);
+            try self.io.cancelBg(self.fd);
         }
         return;
     }
-    const completion = self.completion.with(onClose);
     if (self.protocol == .https) {
-        try self.io.closeTls(completion, self.fd);
+        try self.io.closeTls(&self.completion, onClose, self.fd);
         return;
     }
-    try self.io.close(completion, self.fd);
+    try self.io.close(&self.completion, onClose, self.fd);
 }
 
 fn onClose(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {

@@ -68,7 +68,7 @@ pub fn deinit(self: *Server) void {
 /// Listener has accepted new connection
 pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
     if (self.state != .active) {
-        try self.io.close(null, fd);
+        try self.io.closeBg(fd);
         return;
     }
     if (protocol != .https) { // already set
