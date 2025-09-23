@@ -319,3 +319,42 @@ pub inline fn name(errno: posix.E) []const u8 {
 test "errnoError" {
     try testing.expect(Error.OperationNotPermitted == toError(.PERM));
 }
+
+pub fn isConnectionCloseError(err: anyerror) bool {
+    return switch (err) {
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        => true,
+        else => false,
+    };
+}
+
+/// Application can retry on network error
+pub fn isNetworkError(err: anyerror) bool {
+    return switch (err) {
+        error.InterruptedSystemCall,
+        error.OperationCanceled, // Connect timeout
+        // TCP Connection read/write errors
+        error.EndOfFile, // Clean connection close on read
+        error.BrokenPipe,
+        error.ConnectionResetByPeer, // ECONNRESET
+        // Connect Network errors
+        error.ConnectionRefused, // ECONNREFUSED
+        error.NetworkIsUnreachable, // ENETUNREACH
+        error.NoRouteToHost, // EHOSTUNREACH
+        error.ConnectionTimedOut, // ETIMEDOUT
+        => true,
+        else => false,
+    };
+}
+
+pub fn isTimeoutError(err: anyerror) bool {
+    return switch (err) {
+        error.TimerExpired, // ETIME = 62
+        error.ConnectionTimedOut, // ETIMEDOUT = 110
+        => true,
+        else => false,
+    };
+}

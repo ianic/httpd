@@ -57,7 +57,7 @@ pub fn tick(io: *Io) !void {
             const completion: *Completion = @ptrFromInt(cqe.user_data);
             const callback = completion.callback;
             // Reset completion.callback so that completion can be reused during callback.
-            completion.callback = Completion.noopCallback;
+            completion.callback = Completion.noCallback;
             try callback(completion, cqe);
             io.metric.completed(cqe);
         } else {
@@ -211,10 +211,10 @@ pub fn discard(io: *Io, c: *Completion, cb: Callback, fd_in: fd_t, pipe_fds: [2]
     try io.ensureSqCapacity(2);
     const fd_out = io.dev_null_fd;
     var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
-    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.splice(cid(io, c, cb), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
-    sqe.rw_flags = SPLICE_F_NONBLOCK;
+    sqe.rw_flags = splice_f_nonblock;
 }
 
 /// Sends tls close notify alert before closing fd. Clean close of tls connection.
@@ -301,51 +301,57 @@ pub fn openRead(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [:0]cons
 pub fn sendfile(io: *Io, c: *Completion, cb: Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     try io.ensureSqCapacity(2);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
-    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + SPLICE_F_NONBLOCK;
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.splice(cid(io, c, cb), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
-    sqe.rw_flags = SPLICE_F_NONBLOCK;
+    sqe.rw_flags = splice_f_nonblock;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-// /// send direct file descriptor to the target_ring
-// pub fn msgRingFd(io: *Io, c: ?*Completion, target_c: *Completion, cb: Callback, target_ring: fd_t, source_fd: fd_t) !void {
-//     try io.ensureSqCapacity(2);
-//     const IORING_MSG_SEND_FD = 1;
-
-//     var sqe = try io.ring.get_sqe();
-//     sqe.prep_rw(.MSG_RING, target_ring, IORING_MSG_SEND_FD, 0, @intFromPtr(target_c));
-//     sqe.addr3 = @intCast(source_fd);
-//     // sqe.file_index, ref: https://github.com/axboe/liburing/blob/005d5299f404adb16e75f7d6f0827614a0411bed/src/include/liburing/io_uring.h#L90
-//     // -1 == linux.IORING_FILE_INDEX_ALLOC
-//     sqe.splice_fd_in = -1;
-//     sqe.user_data = 0;
-//     sqe.flags |= linux.IOSQE_IO_LINK;
-//     if (c) |ptr| {
-//         sqe.user_data = @intFromPtr(ptr);
-//         io.metric.submitted();
-//     } else {
-//         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-//     }
-
-//     // fd is moved to the target ring close it in this ring
-//     _ = try io.ring.close_direct(0, @intCast(source_fd));
-// }
-
-// from musl/include/fcnt.h
-const SPLICE_F_NONBLOCK = 0x02;
-const splice_no_offset = math.maxInt(u64);
-
-const yes_socket_option = mem.asBytes(&@as(u32, 1));
-
-const SyscallError = @import("errno.zig").Error;
-
-pub fn result(cqe: linux.io_uring_cqe) SyscallError!i32 {
+pub fn result(cqe: linux.io_uring_cqe) errno.Error!i32 {
     switch (cqe.err()) {
         .SUCCESS => return cqe.res,
-        else => |errno| return @import("errno.zig").toError(errno),
+        else => |e| return errno.toError(e),
     }
 }
+
+pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
+pub const Completion = struct {
+    callback: Callback = Completion.noCallback,
+
+    /// True if operation for this completion is still in the subission queue,
+    /// in the kernel or in the completion queeue.
+    /// False if callback is fired and completion can be reused.
+    pub fn active(self: *Completion) bool {
+        return self.callback != noCallback;
+    }
+
+    fn noCallback(_: *Completion, _: linux.io_uring_cqe) !void {
+        unreachable;
+    }
+};
+
+/// Completion identifier for sqe user_data field.
+fn cid(io: *Io, c: *Completion, cb: Callback) u64 {
+    assert(c.callback == Completion.noCallback); // must be unused
+    c.callback = cb;
+    io.metric.submitted();
+    return @intFromPtr(c);
+}
+
+pub const Options = struct {
+    /// Number of submission queue entries
+    entries: u16,
+    /// io_uring init flags
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
+    /// Number of kernel registered file descriptors
+    fd_nr: u16,
+
+    recv_buffers: struct {
+        size: u32 = 0,
+        count: u16 = 0,
+    } = .{},
+};
 
 const Metric = struct {
     tick_duration: usize = 0,
@@ -391,83 +397,6 @@ const Metric = struct {
     }
 };
 
-pub const Options = struct {
-    /// Number of submission queue entries
-    entries: u16,
-    /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
-    /// Number of kernel registered file descriptors
-    fd_nr: u16,
-
-    recv_buffers: struct {
-        size: u32 = 0,
-        count: u16 = 0,
-    } = .{},
-};
-
-pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
-pub const Completion = struct {
-    callback: Callback = Completion.noopCallback,
-
-    /// True if operation for this completion is still in the subission queue,
-    /// in the kernel or in the completion queeue.
-    /// False if callback is fired and completion can be reused.
-    pub fn active(self: *Completion) bool {
-        return self.callback != noopCallback;
-    }
-
-    fn noopCallback(_: *Completion, _: linux.io_uring_cqe) !void {
-        unreachable;
-    }
-};
-
-/// Completion identifier for sqe user_data field.
-fn cid(io: *Io, c: *Completion, cb: Callback) u64 {
-    assert(c.callback == Completion.noopCallback);
-    c.callback = cb;
-    io.metric.submitted();
-    return @intFromPtr(c);
-}
-
-pub fn isConnectionCloseError(err: anyerror) bool {
-    return switch (err) {
-        // TCP Connection read/write errors
-        error.EndOfFile, // Clean connection close on read
-        error.BrokenPipe,
-        error.ConnectionResetByPeer, // ECONNRESET
-        => true,
-        else => false,
-    };
-}
-
-/// Application can retry on network error
-pub fn isNetworkError(err: anyerror) bool {
-    return switch (err) {
-        error.InterruptedSystemCall,
-        error.OperationCanceled, // Connect timeout
-        // TCP Connection read/write errors
-        error.EndOfFile, // Clean connection close on read
-        error.BrokenPipe,
-        error.ConnectionResetByPeer, // ECONNRESET
-        // Connect Network errors
-        error.ConnectionRefused, // ECONNREFUSED
-        error.NetworkIsUnreachable, // ENETUNREACH
-        error.NoRouteToHost, // EHOSTUNREACH
-        error.ConnectionTimedOut, // ETIMEDOUT
-        => true,
-        else => false,
-    };
-}
-
-pub fn isTimeoutError(err: anyerror) bool {
-    return switch (err) {
-        error.TimerExpired, // ETIME = 62
-        error.ConnectionTimedOut, // ETIMEDOUT = 110
-        => true,
-        else => false,
-    };
-}
-
 var close_notify: CloseNotify = undefined;
 
 // linux.msghdr with 2 bytes close notify alert in iov and alert record type in control
@@ -512,6 +441,11 @@ const CloseNotify = struct {
     }
 };
 
+// from musl/include/fcnt.h
+const splice_f_nonblock = 0x02;
+const splice_no_offset = math.maxInt(u64);
+const yes_socket_option = mem.asBytes(&@as(u32, 1));
+
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -522,4 +456,5 @@ const math = std.math;
 const time = std.time;
 const Allocator = std.mem.Allocator;
 const fd_t = linux.fd_t;
+const errno = @import("errno.zig");
 const log = std.log.scoped(.io);
