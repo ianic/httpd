@@ -68,7 +68,7 @@ pub fn deinit(self: *Server) void {
 /// Listener has accepted new connection
 pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
     if (self.state != .active) {
-        try self.io.closeBg(fd);
+        try self.io.close(fd);
         return;
     }
     if (protocol != .https) { // already set
@@ -250,10 +250,9 @@ pub const Metric = struct {
         duration: usize = 0,
     } = .{},
     files: struct {
-        not_found: usize = 0,
         count: usize = 0,
-        sendfile_more: usize = 0,
         bytes: usize = 0,
+        sendfile_more: usize = 0,
     } = .{},
     pipe: struct {
         large: usize = 0,

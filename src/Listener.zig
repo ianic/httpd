@@ -50,7 +50,7 @@ fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         return;
     };
     if (self.server.closing()) {
-        try self.io.closeBg(fd);
+        try self.io.close(fd);
         return;
     }
     try self.accept();
@@ -58,8 +58,8 @@ fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 pub fn close(self: *Listener) !void {
-    try self.io.cancelBg(self.fd);
-    try self.io.closeBg(self.fd);
+    try self.io.cancel(self.fd);
+    try self.io.close(self.fd);
 }
 
 const std = @import("std");

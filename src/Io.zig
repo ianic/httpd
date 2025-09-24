@@ -217,38 +217,22 @@ pub fn discard(io: *Io, c: *Completion, cb: Callback, fd_in: fd_t, pipe_fds: [2]
     sqe.rw_flags = splice_f_nonblock;
 }
 
-/// Sends tls close notify alert before closing fd. Clean close of tls connection.
-pub fn closeTls(io: *Io, c: *Completion, cb: Callback, fd: fd_t) !void {
-    try io.ensureSqCapacity(2);
+/// Sends tls close notify alert
+pub fn tlsCloseNotify(io: *Io, fd: fd_t) !void {
+    try io.ensureSqCapacity(1);
     var sqe = try io.ring.sendmsg(0, fd, &close_notify.msg, 0);
-    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    try io.close(c, cb, fd);
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 /// Close file descriptor
-pub fn close(io: *Io, c: *Completion, cb: Callback, fd: fd_t) !void {
-    try io.ensureSqCapacity(1);
-    _ = try io.ring.close_direct(cid(io, c, cb), @intCast(fd));
-}
-
-/// Background close, fire and forget, without completion notification.
-pub fn closeBg(io: *Io, fd: fd_t) !void {
+pub fn close(io: *Io, fd: fd_t) !void {
     try io.ensureSqCapacity(1);
     var sqe = try io.ring.close_direct(0, @intCast(fd));
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-/// Cancel any fd operations
-pub fn cancel(io: *Io, c: *Completion, cb: Callback, fd: fd_t) !void {
-    try io.ensureSqCapacity(1);
-    var sqe = try io.ring.get_sqe();
-    sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
-    sqe.user_data = cid(io, c, cb);
-}
-
-/// Background version of cancel.
-pub fn cancelBg(io: *Io, fd: fd_t) !void {
+/// Cancel all operations of fd
+pub fn cancel(io: *Io, fd: fd_t) !void {
     try io.ensureSqCapacity(1);
     var sqe = try io.ring.get_sqe();
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);

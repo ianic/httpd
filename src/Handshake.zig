@@ -52,7 +52,8 @@ fn recv(self: *Handshake) !void {
 }
 
 fn close(self: *Handshake) !void {
-    try self.io.close(&self.completion, onClose, self.fd);
+    try self.io.close(self.fd);
+    self.deinit();
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -160,11 +161,6 @@ fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     // cipher keys are int the kernel
     // create connection to handle cleartext stream
     try self.server.connect(.https, self.fd);
-    self.deinit();
-}
-
-fn onClose(completion: *Io.Completion, _: linux.io_uring_cqe) !void {
-    const self = parent(completion);
     self.deinit();
 }
 
