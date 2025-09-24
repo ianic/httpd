@@ -292,7 +292,7 @@ pub fn openAt(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [*:0]const
 pub fn openRead(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
     try io.ensureSqCapacity(2);
     if (stat) |s| {
-        var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_SIZE, s);
+        var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_BASIC_STATS, s);
         sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
     return io.openAt(c, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);

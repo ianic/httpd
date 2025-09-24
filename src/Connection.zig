@@ -21,6 +21,10 @@ file: struct {
     header_pos: usize = 0,
     pipe: ?Server.Pipe = null,
     offset: usize = 0,
+    etag: struct {
+        size: u64 = 0,
+        mtime: i128 = 0,
+    } = .{},
 } = .{},
 
 inline fn parent(completion: *Io.Completion) *Connection {
@@ -78,15 +82,15 @@ fn parseHeader(self: *Connection, recv_buf: []const u8) !usize {
         return 0;
     }
     const head_buf = recv_buf[0..head_tail];
-    const head = http.Server.Request.Head.parse(head_buf) catch |err| {
+    const req = Head.parse(head_buf) catch |err| {
         log.info("connection head parse {}", .{err});
         try self.close();
         return recv_buf.len;
     };
-    const content_length: u64 = head.content_length orelse 0;
-    self.keep_alive = head.keep_alive;
-    if (head.method == .GET and content_length == 0) {
-        try self.setFilePath(head.target);
+    const content_length: u64 = req.content_length orelse 0;
+    self.keep_alive = req.keep_alive;
+    if (req.method == .GET and content_length == 0) {
+        try self.setFilePath(req.target, req.etag);
         try self.fileOpen();
         return head_tail;
     }
@@ -95,7 +99,13 @@ fn parseHeader(self: *Connection, recv_buf: []const u8) !usize {
     return recv_buf.len;
 }
 
-fn setFilePath(self: *Connection, target: []const u8) !void {
+fn setFilePath(self: *Connection, target: []const u8, etag: ?[]const u8) !void {
+    assert(self.file.path == null);
+    if (etag) |et| {
+        var it = mem.splitScalar(u8, et, '-');
+        self.file.etag.mtime = std.fmt.parseInt(i128, it.first(), 16) catch 0;
+        self.file.etag.size = std.fmt.parseInt(u64, it.rest(), 16) catch 0;
+    }
     self.file.path = if (target.len <= 1)
         try self.gpa.dupeZ(u8, "index.html")
     else if (target[target.len - 1] == '/')
@@ -141,8 +151,15 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         try self.fileClose();
         return;
     }
-    //log.info("ok {d} '{s}' size: {d} keep-alive: {}", .{ self.fd, file.path.?, file.stat.size, self.keep_alive });
-    self.file.header = try Header.ok(self.gpa, file.path.?, file.stat.size, self.keep_alive);
+    if (stat.size == file.etag.size and stat.mtime == file.etag.mtime) {
+        self.file.header = try Header.notModified(self.gpa, stat, self.keep_alive);
+        try self.io.closeBg(file.fd);
+        file.fd = -1;
+        try self.io.send(&self.completion, onHeader, self.fd, self.file.header.?, .{});
+        return;
+    }
+    log.info("ok {d} '{s}' size: {d}", .{ self.fd, file.path.?, stat.size });
+    self.file.header = try Header.ok(self.gpa, file.path.?, stat, self.keep_alive);
     try self.io.send(&self.completion, onHeader, self.fd, self.file.header.?, .{ .more = true });
 }
 
@@ -164,15 +181,19 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     });
     if (file.header_pos < file.header.?.len) {
         // short send send more
-        try self.io.send(completion, onHeader, self.fd, file.header.?[file.header_pos..], .{ .more = true });
+        try self.io.send(completion, onHeader, self.fd, file.header.?[file.header_pos..], .{ .more = file.fd > 0 });
         return;
     }
     // release header
     self.gpa.free(file.header.?);
     file.header = null;
     file.header_pos = 0;
-    if (file.fd == -1) {
-        // no body
+    if (file.fd == -1) { // no body
+        if (file.path) |path| {
+            self.gpa.free(path);
+            file.path = null;
+            file.etag = .{};
+        }
         try self.nextRequest();
         return;
     }
@@ -218,6 +239,7 @@ fn fileClose(self: *Connection) !void {
             try self.server.pipes.put(p);
             file.pipe = null;
         }
+        file.etag = .{};
         file.offset = 0;
         file.stat = mem.zeroes(linux.Statx);
     }
@@ -341,15 +363,30 @@ const Header = struct {
     const connection_keep_alive = "Connection: keep-alive";
     const connection_close = "Connection: close";
 
-    fn ok(gpa: Allocator, file: [:0]const u8, size: usize, keep_alive: bool) ![]u8 {
+    fn ok(gpa: Allocator, file: [:0]const u8, stat: fs.File.Stat, keep_alive: bool) ![]u8 {
         const fmt = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
+            "ETag: \"{x}-{x}\"\r\n" ++
             "{s}\r\n\r\n";
 
         return try std.fmt.allocPrint(gpa, fmt, .{
             contentType(file),
-            size,
+            stat.size,
+            stat.mtime,
+            stat.size,
+            if (keep_alive) connection_keep_alive else connection_close,
+        });
+    }
+
+    fn notModified(gpa: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]u8 {
+        const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
+            "ETag: \"{x}-{x}\"\r\n" ++
+            "{s}\r\n\r\n";
+
+        return try std.fmt.allocPrint(gpa, fmt, .{
+            stat.mtime,
+            stat.size,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -379,7 +416,7 @@ const Header = struct {
             .{ ".txt", "text/plain" },
             .{ ".xml", "text/xml; charset=utf-8" },
             .{ ".csv", "text/csv; charset=utf-8" },
-            .{ "gz", "application/gzip" },
+            .{ ".gz", "application/gzip" },
             .{ ".ico", "image/vnd.microsoft.icon" },
             .{ ".otf", "font/otf" },
             .{ ".pdf", "application/pdf" },
@@ -400,6 +437,7 @@ const Header = struct {
 const std = @import("std");
 const assert = std.debug.assert;
 const net = std.net;
+const fs = std.fs;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
 const mem = std.mem;
@@ -408,4 +446,5 @@ const http = std.http;
 
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
+const Head = @import("Head.zig");
 const log = std.log.scoped(.connection);
