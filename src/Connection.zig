@@ -245,7 +245,7 @@ const Request = struct {
 const Response = struct {
     statx: linux.Statx = mem.zeroes(linux.Statx),
     fd: fd_t = -1,
-    status: http.Status = undefined, // TODO can I set this to 0
+    status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
     fn free(rsp: *Response, gpa: Allocator) void {

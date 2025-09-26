@@ -53,7 +53,7 @@ pub fn main() !void {
     }
 }
 
-const Args = struct {
+pub const Args = struct {
     root: ?fs.Dir = null,
     cert: ?fs.Dir = null,
     http_port: u16 = 8080,

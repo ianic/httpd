@@ -1,5 +1,6 @@
 /// Copy of std.http.Server.Request.Head
 /// https://github.com/ziglang/zig/blob/7b92d5f4052be651e9bc5cd4ad78a69ccbee865d/lib/std/http/Server.zig#L70
+/// with added etag and accept encoding
 const Head = @This();
 
 method: http.Method,
@@ -12,6 +13,7 @@ transfer_encoding: http.TransferEncoding,
 transfer_compression: http.ContentEncoding,
 etag: ?[]const u8,
 keep_alive: bool,
+accept_encoding: ?[]const u8,
 
 pub const ParseError = error{
     UnknownHttpMethod,
@@ -65,6 +67,7 @@ pub fn parse(bytes: []const u8) ParseError!Head {
             .@"HTTP/1.0" => false,
             .@"HTTP/1.1" => true,
         },
+        .accept_encoding = null,
     };
 
     while (it.next()) |line| {
@@ -132,9 +135,35 @@ pub fn parse(bytes: []const u8) ParseError!Head {
         } else if (std.ascii.eqlIgnoreCase(header_name, "if-none-match")) {
             const trimmed = mem.trim(u8, header_value, "\"");
             head.etag = trimmed;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "accept-encoding")) {
+            head.accept_encoding = header_value;
         }
     }
     return error.MissingFinalNewline;
+}
+
+const Encodings = struct {
+    gzip: bool = false,
+    bt: bool = false,
+    zstd: bool = false,
+};
+
+pub fn acceptEncoding(head: Head) Encodings {
+    var res: Encodings = .{};
+    if (head.accept_encoding) |ae| {
+        var iter = mem.splitAny(u8, ae, ", ");
+        while (iter.next()) |v| {
+            if (v.len == 0) continue;
+            if (mem.startsWith(u8, v, "gzip")) {
+                res.gzip = true;
+            } else if (mem.startsWith(u8, v, "br")) {
+                res.bt = true;
+            } else if (mem.startsWith(u8, v, "zstd")) {
+                res.zstd = true;
+            }
+        }
+    }
+    return res;
 }
 
 test parse {
@@ -143,6 +172,7 @@ test parse {
         "content-Length:10\r\n" ++
         "expeCt:   100-continue \r\n" ++
         "TRansfer-encoding:\tdeflate, chunked \r\n" ++
+        "Accept-Encoding: gzip, deflate, br, zstd\r\n" ++
         "connectioN:\t keep-alive \r\n\r\n";
 
     const req = try parse(request_bytes);
@@ -158,6 +188,23 @@ test parse {
     try testing.expectEqual(10, req.content_length.?);
     try testing.expectEqual(.chunked, req.transfer_encoding);
     try testing.expectEqual(.deflate, req.transfer_compression);
+
+    const encodings = req.acceptEncoding();
+    try testing.expect(encodings.gzip);
+    try testing.expect(encodings.bt);
+    try testing.expect(encodings.zstd);
+}
+
+test acceptEncoding {
+    const request_bytes = "GET /hi HTTP/1.0\r\n" ++
+        "content-tYpe: text/plain\r\n" ++
+        "Accept-Encoding: br;q=1.0, gzip;q=0.8, *;q=0.1\r\n\r\n";
+
+    const req = try parse(request_bytes);
+    const encodings = req.acceptEncoding();
+    try testing.expect(encodings.gzip);
+    try testing.expect(encodings.bt);
+    try testing.expect(!encodings.zstd);
 }
 
 inline fn int64(array: *const [8]u8) u64 {

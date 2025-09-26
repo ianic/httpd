@@ -240,17 +240,6 @@ pub fn cancel(io: *Io, fd: fd_t) !void {
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub const MsgFlags = packed struct {
-    _reserved1: u1 = 0,
-    peek: bool = false,
-    _reserved2: u3 = 0,
-    trunc: bool = false,
-    _reserved3: u8 = 0,
-    no_signal: bool = true,
-    more: bool = false,
-    _reserved4: u16 = 0,
-};
-
 pub fn send(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
     try io.ensureSqCapacity(1);
     var sqe = try io.ring.send(cid(io, c, cb), fd, buffer, @bitCast(flags));
@@ -298,6 +287,17 @@ pub fn result(cqe: linux.io_uring_cqe) errno.Error!i32 {
         else => |e| return errno.toError(e),
     }
 }
+
+pub const MsgFlags = packed struct {
+    _reserved1: u1 = 0,
+    peek: bool = false,
+    _reserved2: u3 = 0,
+    trunc: bool = false,
+    _reserved3: u8 = 0,
+    no_signal: bool = true,
+    more: bool = false,
+    _reserved4: u16 = 0,
+};
 
 pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
 pub const Completion = struct {
