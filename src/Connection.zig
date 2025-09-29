@@ -411,6 +411,199 @@ const ShortRecvBuffer = struct {
     }
 };
 
+test "file open" {
+    const gpa = testing.allocator;
+
+    var io: Io = .{};
+    try io.init(gpa, .{
+        .entries = 16,
+        .fd_nr = 16,
+        .recv_buffers = .{ .count = 1, .size = 4096 },
+    });
+    defer io.deinit(gpa);
+    const dir = try fs.cwd().openDir("site/www.ziglang.org/zig-out/", .{});
+    const path = "index.html";
+
+    var conn: struct {
+        done: bool = false,
+        fn onFile(ptr: *anyopaque, stat: anyerror!File) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (stat) |s| {
+                std.debug.print("stat: {} {} {s}\n", .{ s.stat.size, s.encoding, s.path });
+            } else |err| {
+                std.debug.print("err: {}\n", .{err});
+            }
+            self.done = true;
+        }
+    } = .{};
+
+    var pool: FileStatPool = .{ .ptr = &conn, .callback = @TypeOf(conn).onFile };
+    try pool.init(gpa, &io, dir, path, ContentEncoding.parse("zstd gzip br pero zdero jozo bozo"));
+    defer pool.deinit(gpa);
+
+    while (!conn.done) {
+        try io.tick();
+    }
+}
+
+const ContentEncoding = enum {
+    plain,
+    gzip,
+    brotli,
+    zstd,
+
+    fn extension(self: ContentEncoding) []const u8 {
+        return switch (self) {
+            .plain => "",
+            .gzip => ".gz",
+            .brotli => ".br",
+            .zstd => ".zst",
+        };
+    }
+
+    /// Parse Accept-Encoding http header into list.
+    /// Plain is always included.
+    inline fn parse(accept_encoding: []const u8) []ContentEncoding {
+        var list: [4]ContentEncoding = undefined;
+        list[0] = .plain;
+        var idx: usize = 1;
+        var iter = mem.splitAny(u8, accept_encoding, ", ");
+        while (iter.next()) |v| {
+            if (v.len == 0) continue;
+            if (mem.startsWith(u8, v, "gzip")) {
+                list[idx] = .gzip;
+                idx += 1;
+            } else if (mem.startsWith(u8, v, "br")) {
+                list[idx] = .brotli;
+                idx += 1;
+            } else if (mem.startsWith(u8, v, "zstd")) {
+                list[idx] = .zstd;
+                idx += 1;
+            }
+        }
+        return list[0..idx];
+    }
+
+    test parse {
+        var ar = parse("gzip, deflate, zstd");
+        try testing.expectEqual(3, ar.len);
+        try testing.expectEqual(.plain, ar[0]);
+        try testing.expectEqual(.gzip, ar[1]);
+        try testing.expectEqual(.zstd, ar[2]);
+
+        ar = parse("br;q=1.0, gzip;q=0.8, *;q=0.1");
+        try testing.expectEqual(3, ar.len);
+        try testing.expectEqual(.plain, ar[0]);
+        try testing.expectEqual(.brotli, ar[1]);
+        try testing.expectEqual(.gzip, ar[2]);
+    }
+};
+
+const testing = std.testing;
+
+const File = struct {
+    path: [:0]const u8 = &.{},
+    stat: fs.File.Stat,
+    encoding: ContentEncoding,
+};
+
+const FileStatPool = struct {
+    files: []FileStat = &.{},
+    join_count: usize = 0,
+    ptr: *anyopaque,
+    callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
+
+    fn init(self: *FileStatPool, gpa: Allocator, io: *Io, dir: fs.Dir, path: []const u8, encodings: []const ContentEncoding) !void {
+        self.files = try gpa.alloc(FileStat, encodings.len);
+
+        for (encodings, 0..) |encoding, i| {
+            self.files[i] = .{ .io = io, .dir = dir, .encoding = encoding, .parent = self };
+            try (&self.files[i]).init(gpa, path);
+        }
+    }
+
+    fn join(self: *FileStatPool) !void {
+        self.join_count += 1;
+        if (self.join_count < self.files.len)
+            return;
+
+        const plain = self.files[0];
+        assert(plain.encoding == .plain);
+        if (plain.err) |e|
+            return e;
+        const plain_mtime = plain.statx.mtime;
+
+        // find best match, shortest one
+        var idx: usize = 0;
+        for (self.files, 0..) |stat, i| {
+            if (stat.err != null) {
+                continue;
+            }
+            // plain and compressed mtime must match
+            const mtime = stat.statx.mtime;
+            if (!(mtime.sec == plain_mtime.sec and mtime.nsec == mtime.nsec)) {
+                continue;
+            }
+            if (stat.statx.size < self.files[idx].statx.size) {
+                idx = i;
+            }
+        }
+        const match = &self.files[idx];
+
+        const res: File = .{
+            .path = match.path,
+            .encoding = match.encoding,
+            .stat = fs.File.Stat.fromLinux(match.statx),
+        };
+        try self.callback(self.ptr, res);
+    }
+
+    fn deinit(self: *FileStatPool, gpa: Allocator) void {
+        for (self.files) |f| {
+            f.deinit(gpa);
+        }
+        gpa.free(self.files);
+    }
+};
+
+const FileStat = struct {
+    io: *Io,
+    dir: fs.Dir,
+    path: [:0]const u8 = &.{},
+    statx: linux.Statx = mem.zeroes(linux.Statx),
+    completion: Io.Completion = .{},
+    err: ?anyerror = null,
+    encoding: ContentEncoding,
+    parent: *FileStatPool,
+
+    fn init(self: *FileStat, gpa: Allocator, path: []const u8) !void {
+        self.path = try std.mem.joinZ(gpa, "", &.{ path, self.encoding.extension() });
+        try self.stat();
+    }
+
+    fn deinit(self: FileStat, gpa: Allocator) void {
+        gpa.free(self.path);
+    }
+
+    fn stat(self: *FileStat) !void {
+        try self.io.statx(&self.completion, onStat, self.dir.fd, self.path, &self.statx);
+    }
+
+    fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *FileStat = @alignCast(@fieldParentPtr("completion", completion));
+        _ = Io.result(cqe) catch |err| switch (err) {
+            error.SignalInterrupt => {
+                try self.stat();
+                return;
+            },
+            else => {
+                self.err = err;
+            },
+        };
+        try self.parent.join();
+    }
+};
+
 const std = @import("std");
 const assert = std.debug.assert;
 const net = std.net;

@@ -189,3 +189,7 @@ const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const signal = @import("signal.zig");
 const log = std.log.scoped(.main);
+
+test {
+    _ = @import("Connection.zig");
+}

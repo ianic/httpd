@@ -254,7 +254,7 @@ pub fn sendmsg(io: *Io, c: *Completion, cb: Callback, fd: fd_t, msg: *const posi
 
 pub fn statx(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.statx(cid(io, c, cb), dir, path, 0, linux.STATX_SIZE, stat);
+    _ = try io.ring.statx(cid(io, c, cb), dir, path, 0, linux.STATX_BASIC_STATS, stat);
 }
 
 pub fn openAt(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
