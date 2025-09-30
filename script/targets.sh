@@ -11,8 +11,8 @@ cd site/www.ziglang.org/zig-out
 # find . -type f -exec echo -e "GET $protocol://localhost:$port/{}\n" \; >"$cwd/site/targets"
 
 # Skip huge mp4 file because it dominates in benchmark
-find . -type f ! -path "*/facebook_bot.mp4" -exec echo -e "GET $protocol://$host:$port/{}\n" \; >"$cwd/site/targets-vegeta"
-find . -type f ! -path "*/facebook_bot.mp4" -exec echo -e "$protocol://$host:$port/{}" \; >"$cwd/site/targets-oha"
+find . -type f ! -path "*/facebook_bot.mp4" ! -name '*.gz' ! -name '*.br' ! -name '*.zst' -exec echo -e "GET $protocol://$host:$port/{}\n" \; >"$cwd/site/targets-vegeta"
+find . -type f ! -path "*/facebook_bot.mp4" ! -name '*.gz' ! -name '*.br' ! -name '*.zst' -exec echo -e "$protocol://$host:$port/{}" \; >"$cwd/site/targets-oha"
 
 # # only x largest(head)/smalles(tail) files
 # rm "$cwd/site/targets"

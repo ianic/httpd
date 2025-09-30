@@ -50,12 +50,9 @@ nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
 sleep 0.2
 
-# number of files in static site
-cd site/www.ziglang.org/zig-out
-echo site files count: "$(find . -type f | wc -l)"
-cd - >>/dev/null
 
-echo -e "\nhttp"
+
+echo -e "http"
 oha-tests http 8080 "$host"
 
 echo -e "\nhttp nginx"
@@ -67,6 +64,11 @@ oha-tests https 8443 "$host"
 echo -e "\nhttps nginx"
 oha-tests https 8444 "$host"
 
+# number of files in static site
+echo
+echo site files count: "$(cat site/targets-oha | wc -l)"
+
+# result table
 echo
 for r in "${results[@]}"; do
     if [ -z "$r" ]; then

@@ -70,20 +70,6 @@ fn compressible(file_name: []const u8) bool {
         ".txt",
         ".xml",
         ".csv",
-        //".png",
-        //".jpg",
-        //".jpeg",
-        //".gif",
-        //".gz",
-        //".ico",
-        //".otf",
-        //".pdf",
-        //".tar",
-        //".ttf",
-        //".wasm",
-        //".webp",
-        //".woff",
-        //".woff2",
     };
     for (extensions) |ex| {
         if (std.mem.endsWith(u8, file_name, ex)) return true;
