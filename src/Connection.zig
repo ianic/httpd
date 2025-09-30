@@ -13,18 +13,20 @@ pipe: ?Server.Pipe = null, // for sendfile
 offset: usize = 0, // header/body send offset
 req: Request = .{},
 rsp: Response = .{},
+fs_pool: FileStatPool = .{},
 
 inline fn parent(completion: *Io.Completion) *Connection {
     return @alignCast(@fieldParentPtr("completion", completion));
 }
 
 pub fn init(self: *Connection) !void {
+    self.fs_pool = .{ .ptr = self, .callback = onFile };
     try self.recv();
 }
 
 fn recv(self: *Connection) !void {
     if (self.server.closing()) {
-        try self.close();
+        try self.deinit();
         return;
     }
     try self.io.recvProvided(&self.completion, onRecv, self.fd, &self.recv_timeout);
@@ -46,28 +48,53 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         break :brk 0;
     };
     if (n == 0) { // eof
-        try self.close();
+        try self.deinit();
         return;
     }
 
     const recv_buf = try self.short_recv.append(self.gpa, try self.io.getProvidedBuffer(cqe));
-    defer self.io.putProvidedBuffer(cqe);
-    const req = Request.parse(self.gpa, recv_buf) catch |err| {
+    const mreq = Request.parse(self.gpa, recv_buf) catch |err| {
         log.debug("connection request parse {}", .{err});
-        try self.close();
+        self.io.putProvidedBuffer(cqe);
+        try self.deinit();
         return;
     };
-    try self.short_recv.set(self.gpa, recv_buf[if (req) |r| r.size else 0..]);
-    if (req) |r| {
-        self.req = r;
-        try self.open();
+    self.io.putProvidedBuffer(cqe);
+    try self.short_recv.set(self.gpa, recv_buf[if (mreq) |r| r.size else 0..]);
+
+    if (mreq) |req| {
+        self.req = req;
+        try self.fs_pool.init(
+            self.gpa,
+            self.io,
+            self.server.root,
+            req.path,
+            req.accept_encoding orelse &[_]ContentEncoding{.plain},
+        );
     } else {
         try self.recv();
     }
 }
 
+fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    const rsp = &self.rsp;
+    rsp.file = res catch |err| switch (err) {
+        error.NoSuchFileOrDirectory => {
+            try rsp.init(self.gpa, self.req, -1);
+            try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
+            return;
+        },
+        else => {
+            try self.deinit();
+            return;
+        },
+    };
+    try self.open();
+}
+
 fn open(self: *Connection) !void {
-    try self.io.openRead(&self.completion, onOpen, self.server.root.fd, self.req.path, &self.rsp.statx);
+    try self.io.openRead(&self.completion, onOpen, self.server.root.fd, self.rsp.file.?.path, null);
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -87,14 +114,24 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             },
             else => {
                 log.warn("connection file open '{s}' failed {}", .{ self.req.path, err });
-                try self.close();
+                try self.deinit();
             },
         }
         return;
     };
     try rsp.init(self.gpa, self.req, fd);
     try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
-    log.debug("{} {s} '{s}' {}", .{ self.fd, @tagName(rsp.status), self.req.path, self.rsp.statx.size });
+    log.debug(
+        "{} {s} '{s}' {}/{} {s}",
+        .{
+            self.fd,
+            @tagName(rsp.status),
+            self.req.path,
+            rsp.header.len,
+            rsp.bodySize(),
+            @tagName(rsp.contentEncoding()),
+        },
+    );
 }
 
 fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -106,22 +143,22 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.info("connection header send failed {}", .{err}),
         }
-        try self.close();
+        try self.deinit();
         return;
     });
     if (self.offset < rsp.header.len) { // short send send more
         try self.io.send(completion, onHeader, self.fd, rsp.header[self.offset..], .{ .more = rsp.hasBody() });
         return;
     }
-    if (rsp.status != .ok) { // no body
+    if (!rsp.hasBody()) {
         try self.done();
         return;
     }
     // send file
     assert(self.pipe == null);
     self.offset = 0;
-    self.pipe = try self.server.pipes.get(rsp.statx.size);
-    try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, 0, @intCast(rsp.statx.size));
+    self.pipe = try self.server.pipes.get(rsp.file.?.stat.size);
+    try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, 0, @intCast(rsp.file.?.stat.size));
 }
 
 fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -133,17 +170,17 @@ fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.info("connection body send failed {}", .{err}),
         }
-        try self.close();
+        try self.deinit();
         return;
     });
-    if (self.offset < rsp.statx.size) { // short send, send the rest of the file
-        const len = self.rsp.statx.size - self.offset;
+    if (self.offset < rsp.file.?.stat.size) { // short send, send the rest of the file
+        const len = self.rsp.file.?.stat.size - self.offset;
         try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, @intCast(self.offset), @intCast(len));
         self.server.metric.files.sendfile_more +%= 1;
         return;
     }
     self.server.metric.files.count +%= 1;
-    self.server.metric.files.bytes +%= rsp.statx.size;
+    self.server.metric.files.bytes +%= rsp.file.?.stat.size;
     try self.done();
 }
 
@@ -154,7 +191,7 @@ fn done(self: *Connection) !void {
         try self.recv();
         return;
     }
-    try self.close();
+    try self.deinit();
 }
 
 fn clear(self: *Connection) !void {
@@ -169,26 +206,24 @@ fn clear(self: *Connection) !void {
     }
     self.req.free(self.gpa);
     self.rsp.free(self.gpa);
+    self.fs_pool.free(self.gpa);
 }
 
 pub fn close(self: *Connection) !void {
-    if (self.completion.active()) {
-        // If called from server.
-        // Cancel if receiving, else send file and than close.
-        if (self.completion.callback == onRecv) {
-            try self.io.cancel(self.fd);
-        }
-        return;
+    // Cancel if receiving, else wait for send to finish
+    if (self.completion.active() and self.completion.callback == onRecv) {
+        try self.io.cancel(self.fd);
     }
+}
+
+fn deinit(self: *Connection) !void {
     try self.clear();
+
     if (self.protocol == .https) {
         try self.io.tlsCloseNotify(self.fd);
     }
     try self.io.close(self.fd);
-    self.deinit();
-}
 
-fn deinit(self: *Connection) void {
     self.short_recv.deinit(self.gpa);
     self.server.destroy(self);
 }
@@ -201,6 +236,7 @@ const Request = struct {
     } = .{},
     keep_alive: bool = false,
     size: usize = 0, // size of the request in bytes, how much of recv_buf is used
+    accept_encoding: ?[]ContentEncoding = null,
 
     /// Returns null if recv_buf doesn't hold full http request
     fn parse(gpa: Allocator, recv_buf: []const u8) !?Request {
@@ -231,6 +267,15 @@ const Request = struct {
         else
             try gpa.dupeZ(u8, head.target[1..]);
 
+        if (compressible(req.path)) {
+            if (head.accept_encoding) |ae| {
+                const encodings = ContentEncoding.parse(ae);
+                if (encodings.len > 1) {
+                    req.accept_encoding = try gpa.dupe(ContentEncoding, encodings);
+                }
+            }
+        }
+
         return req;
     }
 
@@ -238,13 +283,17 @@ const Request = struct {
         if (req.path.len > 0) {
             gpa.free(req.path);
         }
+        if (req.accept_encoding) |ae| {
+            gpa.free(ae);
+        }
         req.* = .{};
     }
 };
 
 const Response = struct {
-    statx: linux.Statx = mem.zeroes(linux.Statx),
+    // statx: linux.Statx = mem.zeroes(linux.Statx),
     fd: fd_t = -1,
+    file: ?File = null,
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
@@ -263,7 +312,7 @@ const Response = struct {
             return;
         }
         rsp.fd = fd;
-        const stat = fs.File.Stat.fromLinux(rsp.statx);
+        const stat = rsp.file.?.stat;
         if (stat.kind != .file) {
             rsp.status = .not_found;
             rsp.header = try notFound(gpa, req.keep_alive);
@@ -272,7 +321,7 @@ const Response = struct {
             rsp.header = try notModified(gpa, stat, req.keep_alive);
         } else {
             rsp.status = .ok;
-            rsp.header = try ok(gpa, stat, req.path, req.keep_alive);
+            rsp.header = try ok(gpa, stat, req.path, rsp.file.?.encoding, req.keep_alive);
         }
     }
 
@@ -284,17 +333,34 @@ const Response = struct {
         return rsp.status == .ok;
     }
 
+    fn bodySize(rsp: Response) usize {
+        if (rsp.file) |f| return f.stat.size;
+        return 0;
+    }
+
+    fn contentEncoding(rsp: Response) ContentEncoding {
+        if (rsp.file) |f| return f.encoding;
+        return .plain;
+    }
+
     const connection_keep_alive = "Connection: keep-alive";
     const connection_close = "Connection: close";
 
-    fn ok(gpa: Allocator, stat: fs.File.Stat, file: [:0]const u8, keep_alive: bool) ![]const u8 {
+    fn ok(
+        gpa: Allocator,
+        stat: fs.File.Stat,
+        file: [:0]const u8,
+        encoding: ContentEncoding,
+        keep_alive: bool,
+    ) ![]const u8 {
         const fmt = "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: {s}\r\n" ++
+            "Content-Type: {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
             "{s}\r\n\r\n";
         return try std.fmt.allocPrint(gpa, fmt, .{
             contentType(file),
+            encoding.header(),
             stat.size,
             stat.mtime,
             stat.size,
@@ -439,7 +505,7 @@ test "file open" {
 
     var pool: FileStatPool = .{ .ptr = &conn, .callback = @TypeOf(conn).onFile };
     try pool.init(gpa, &io, dir, path, ContentEncoding.parse("zstd gzip br pero zdero jozo bozo"));
-    defer pool.deinit(gpa);
+    defer pool.free(gpa);
 
     while (!conn.done) {
         try io.tick();
@@ -467,21 +533,32 @@ const ContentEncoding = enum {
         var list: [4]ContentEncoding = undefined;
         list[0] = .plain;
         var idx: usize = 1;
+
         var iter = mem.splitAny(u8, accept_encoding, ", ");
         while (iter.next()) |v| {
             if (v.len == 0) continue;
-            if (mem.startsWith(u8, v, "gzip")) {
+            const v1 = if (mem.indexOfScalar(u8, v, ';')) |i| v[0..i] else v;
+            if (mem.eql(u8, v1, "gzip")) {
                 list[idx] = .gzip;
                 idx += 1;
-            } else if (mem.startsWith(u8, v, "br")) {
+            } else if (mem.eql(u8, v1, "br")) {
                 list[idx] = .brotli;
                 idx += 1;
-            } else if (mem.startsWith(u8, v, "zstd")) {
+            } else if (mem.eql(u8, v1, "zstd")) {
                 list[idx] = .zstd;
                 idx += 1;
             }
         }
         return list[0..idx];
+    }
+
+    pub fn header(self: ContentEncoding) []const u8 {
+        return switch (self) {
+            .plain => "",
+            .gzip => "Content-Encoding: gzip\r\n",
+            .brotli => "Content-Encoding: br\r\n",
+            .zstd => "Content-Encoding: zstd\r\n",
+        };
     }
 
     test parse {
@@ -508,29 +585,42 @@ const File = struct {
 };
 
 const FileStatPool = struct {
+    const Self = @This();
+
     files: []FileStat = &.{},
     join_count: usize = 0,
-    ptr: *anyopaque,
-    callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
+    ptr: *anyopaque = undefined,
+    callback: *const fn (*anyopaque, anyerror!File) anyerror!void = undefined,
 
-    fn init(self: *FileStatPool, gpa: Allocator, io: *Io, dir: fs.Dir, path: []const u8, encodings: []const ContentEncoding) !void {
+    fn init(self: *Self, gpa: Allocator, io: *Io, dir: fs.Dir, path: []const u8, encodings: []const ContentEncoding) !void {
         self.files = try gpa.alloc(FileStat, encodings.len);
 
         for (encodings, 0..) |encoding, i| {
-            self.files[i] = .{ .io = io, .dir = dir, .encoding = encoding, .parent = self };
-            try (&self.files[i]).init(gpa, path);
+            self.files[i] = .{
+                .io = io,
+                .dir = dir,
+                .encoding = encoding,
+                .ptr = self,
+                .callback = join,
+                .path = try std.mem.joinZ(gpa, "", &.{ path, encoding.extension() }),
+            };
+            try (&self.files[i]).stat();
         }
+        self.join_count = self.files.len;
     }
 
-    fn join(self: *FileStatPool) !void {
-        self.join_count += 1;
-        if (self.join_count < self.files.len)
+    fn join(ptr: *anyopaque) !void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.join_count -= 1;
+        if (self.join_count > 0)
             return;
 
         const plain = self.files[0];
         assert(plain.encoding == .plain);
-        if (plain.err) |e|
-            return e;
+        if (plain.err) |e| {
+            try self.callback(self.ptr, e);
+            return;
+        }
         const plain_mtime = plain.statx.mtime;
 
         // find best match, shortest one
@@ -558,15 +648,19 @@ const FileStatPool = struct {
         try self.callback(self.ptr, res);
     }
 
-    fn deinit(self: *FileStatPool, gpa: Allocator) void {
+    fn free(self: *Self, gpa: Allocator) void {
+        if (self.files.len == 0) return;
         for (self.files) |f| {
-            f.deinit(gpa);
+            gpa.free(f.path);
         }
         gpa.free(self.files);
+        self.files = &.{};
     }
 };
 
 const FileStat = struct {
+    const Self = @This();
+
     io: *Io,
     dir: fs.Dir,
     path: [:0]const u8 = &.{},
@@ -574,23 +668,15 @@ const FileStat = struct {
     completion: Io.Completion = .{},
     err: ?anyerror = null,
     encoding: ContentEncoding,
-    parent: *FileStatPool,
+    ptr: *anyopaque,
+    callback: *const fn (*anyopaque) anyerror!void,
 
-    fn init(self: *FileStat, gpa: Allocator, path: []const u8) !void {
-        self.path = try std.mem.joinZ(gpa, "", &.{ path, self.encoding.extension() });
-        try self.stat();
-    }
-
-    fn deinit(self: FileStat, gpa: Allocator) void {
-        gpa.free(self.path);
-    }
-
-    fn stat(self: *FileStat) !void {
+    fn stat(self: *Self) !void {
         try self.io.statx(&self.completion, onStat, self.dir.fd, self.path, &self.statx);
     }
 
     fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *FileStat = @alignCast(@fieldParentPtr("completion", completion));
+        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
         _ = Io.result(cqe) catch |err| switch (err) {
             error.SignalInterrupt => {
                 try self.stat();
@@ -600,9 +686,27 @@ const FileStat = struct {
                 self.err = err;
             },
         };
-        try self.parent.join();
+        try self.callback(self.ptr);
     }
 };
+
+fn compressible(file_name: []const u8) bool {
+    const extensions = [_][]const u8{
+        ".html",
+        ".htm",
+        ".css",
+        ".js",
+        ".json",
+        ".svg",
+        ".txt",
+        ".xml",
+        ".csv",
+    };
+    for (extensions) |ex| {
+        if (std.mem.endsWith(u8, file_name, ex)) return true;
+    }
+    return false;
+}
 
 const std = @import("std");
 const assert = std.debug.assert;
