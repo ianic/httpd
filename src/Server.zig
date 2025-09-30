@@ -207,6 +207,12 @@ const PipePool = struct {
         try self.small.append(self.gpa, p);
     }
 
+    pub fn broken(self: *PipePool, p: Pipe) void {
+        _ = self;
+        posix.close(p.fds[0]);
+        posix.close(p.fds[1]);
+    }
+
     const default_pipe_size = 64 * 1024;
     const max_pipe_size = 1024 * 1024;
 };

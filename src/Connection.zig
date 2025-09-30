@@ -150,13 +150,13 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         try self.io.send(completion, onHeader, self.fd, rsp.header[self.offset..], .{ .more = rsp.hasBody() });
         return;
     }
+    self.offset = 0;
     if (!rsp.hasBody()) {
         try self.done();
         return;
     }
     // send file
     assert(self.pipe == null);
-    self.offset = 0;
     self.pipe = try self.server.pipes.get(rsp.file.?.stat.size);
     try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, 0, @intCast(rsp.file.?.stat.size));
 }
@@ -169,6 +169,10 @@ fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             error.SignalInterrupt => break :brk 0,
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
             else => log.info("connection body send failed {}", .{err}),
+        }
+        if (self.pipe) |pipe| { // pipe can be unusable after broken pipe
+            self.server.pipes.broken(pipe);
+            self.pipe = null;
         }
         try self.deinit();
         return;
