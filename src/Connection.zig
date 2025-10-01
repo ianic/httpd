@@ -715,7 +715,7 @@ const FileStat = struct {
     }
 };
 
-fn compressible(file_name: []const u8) bool {
+pub fn compressible(file_name: []const u8) bool {
     const extensions = [_][]const u8{
         ".html",
         ".htm",

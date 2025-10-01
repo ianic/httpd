@@ -4,7 +4,8 @@ cd $(git rev-parse --show-toplevel)
 
 ulimit -n 65535
 # start httpd listening on 8080 http and 8443 https with limits raised
-zig build #-Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
+zig-out/bin/httpd compress --root site/www.ziglang.org/zig-out
 zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/cert_ec --fds 65535 --buf-count 16 --sqes 32768 &
 pid=$!
 
