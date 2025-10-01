@@ -13,14 +13,17 @@ pipe: ?Server.Pipe = null, // for sendfile
 offset: usize = 0, // header/body send offset
 req: Request = .{},
 rsp: Response = .{},
-fs_pool: FileStatPool = .{},
+fs_pool: FileStatPool = undefined,
+arena_instance: std.heap.ArenaAllocator = undefined,
+arena: Allocator = undefined,
 
 inline fn parent(completion: *Io.Completion) *Connection {
     return @alignCast(@fieldParentPtr("completion", completion));
 }
 
 pub fn init(self: *Connection) !void {
-    self.fs_pool = .{ .ptr = self, .callback = onFile };
+    self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
+    self.arena = self.arena_instance.allocator();
     try self.recv();
 }
 
@@ -53,7 +56,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     }
 
     const recv_buf = try self.short_recv.append(self.gpa, try self.io.getProvidedBuffer(cqe));
-    const mreq = Request.parse(self.gpa, recv_buf) catch |err| {
+    const mreq = Request.parse(self.arena, recv_buf) catch |err| {
         log.debug("connection request parse {}", .{err});
         self.io.putProvidedBuffer(cqe);
         try self.deinit();
@@ -65,15 +68,18 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (mreq) |req| {
         self.req = req;
         try self.fs_pool.init(
-            self.gpa,
+            self,
+            onFile,
+            self.arena,
             self.io,
             self.server.root,
             req.path,
             req.accept_encoding orelse &[_]ContentEncoding{.plain},
         );
-    } else {
-        try self.recv();
+        return;
     }
+
+    try self.recv();
 }
 
 fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
@@ -81,7 +87,8 @@ fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
     const rsp = &self.rsp;
     rsp.file = res catch |err| switch (err) {
         error.NoSuchFileOrDirectory => {
-            try rsp.init(self.gpa, self.req, -1);
+            //TODO: rethinkg
+            try rsp.init(self.arena, self.req, -1);
             try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
             return;
         },
@@ -119,7 +126,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         }
         return;
     };
-    try rsp.init(self.gpa, self.req, fd);
+    try rsp.init(self.arena, self.req, fd);
     try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
     log.debug(
         "{} {s} '{s}' {}/{} {s}",
@@ -208,9 +215,10 @@ fn clear(self: *Connection) !void {
         try self.io.close(self.rsp.fd);
         self.rsp.fd = -1;
     }
-    self.req.free(self.gpa);
-    self.rsp.free(self.gpa);
-    self.fs_pool.free(self.gpa);
+    _ = self.arena_instance.reset(.free_all);
+    self.req = .{};
+    self.rsp = .{};
+    self.fs_pool = undefined;
 }
 
 pub fn close(self: *Connection) !void {
@@ -227,7 +235,7 @@ fn deinit(self: *Connection) !void {
         try self.io.tlsCloseNotify(self.fd);
     }
     try self.io.close(self.fd);
-
+    self.arena_instance.deinit();
     self.short_recv.deinit(self.gpa);
     self.server.destroy(self);
 }
@@ -243,7 +251,7 @@ const Request = struct {
     accept_encoding: ?[]ContentEncoding = null,
 
     /// Returns null if recv_buf doesn't hold full http request
-    fn parse(gpa: Allocator, recv_buf: []const u8) !?Request {
+    fn parse(allocator: Allocator, recv_buf: []const u8) !?Request {
         var hp: http.HeadParser = .{};
         const size = hp.feed(recv_buf);
         if (hp.state != .finished) {
@@ -265,17 +273,17 @@ const Request = struct {
             req.etag.size = std.fmt.parseInt(u64, it.rest(), 16) catch 0;
         }
         req.path = if (head.target.len <= 1)
-            try gpa.dupeZ(u8, "index.html")
+            try allocator.dupeZ(u8, "index.html")
         else if (head.target[head.target.len - 1] == '/')
-            try std.fmt.allocPrintSentinel(gpa, "{s}index.html", .{head.target[1..]}, 0)
+            try std.fmt.allocPrintSentinel(allocator, "{s}index.html", .{head.target[1..]}, 0)
         else
-            try gpa.dupeZ(u8, head.target[1..]);
+            try allocator.dupeZ(u8, head.target[1..]);
 
         if (compressible(req.path)) {
             if (head.accept_encoding) |ae| {
                 const encodings = ContentEncoding.parse(ae);
                 if (encodings.len > 1) {
-                    req.accept_encoding = try gpa.dupe(ContentEncoding, encodings);
+                    req.accept_encoding = try allocator.dupe(ContentEncoding, encodings);
                 }
             }
         }
@@ -283,12 +291,12 @@ const Request = struct {
         return req;
     }
 
-    fn free(req: *Request, gpa: Allocator) void {
+    fn deinit(req: *Request, allocator: Allocator) void {
         if (req.path.len > 0) {
-            gpa.free(req.path);
+            allocator.free(req.path);
         }
         if (req.accept_encoding) |ae| {
-            gpa.free(ae);
+            allocator.free(ae);
         }
         req.* = .{};
     }
@@ -301,31 +309,31 @@ const Response = struct {
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
-    fn free(rsp: *Response, gpa: Allocator) void {
+    fn deinit(rsp: *Response, allocator: Allocator) void {
         if (rsp.header.len > 0) {
-            gpa.free(rsp.header);
+            allocator.free(rsp.header);
         }
         rsp.* = .{};
     }
 
-    fn init(rsp: *Response, gpa: Allocator, req: Request, fd: fd_t) !void {
+    fn init(rsp: *Response, allocator: Allocator, req: Request, fd: fd_t) !void {
         assert(rsp.fd == -1);
         if (fd == -1) {
             rsp.status = .not_found;
-            rsp.header = try notFound(gpa, req.keep_alive);
+            rsp.header = try notFound(allocator, req.keep_alive);
             return;
         }
         rsp.fd = fd;
         const stat = rsp.file.?.stat;
         if (stat.kind != .file) {
             rsp.status = .not_found;
-            rsp.header = try notFound(gpa, req.keep_alive);
+            rsp.header = try notFound(allocator, req.keep_alive);
         } else if (etagMatch(stat, req)) {
             rsp.status = .not_modified;
-            rsp.header = try notModified(gpa, stat, req.keep_alive);
+            rsp.header = try notModified(allocator, stat, req.keep_alive);
         } else {
             rsp.status = .ok;
-            rsp.header = try ok(gpa, stat, req.path, rsp.file.?.encoding, req.keep_alive);
+            rsp.header = try ok(allocator, stat, req.path, rsp.file.?.encoding, req.keep_alive);
         }
     }
 
@@ -351,7 +359,7 @@ const Response = struct {
     const connection_close = "Connection: close";
 
     fn ok(
-        gpa: Allocator,
+        allocator: Allocator,
         stat: fs.File.Stat,
         file: [:0]const u8,
         encoding: ContentEncoding,
@@ -362,7 +370,7 @@ const Response = struct {
             "Content-Length: {d}\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(gpa, fmt, .{
+        return try std.fmt.allocPrint(allocator, fmt, .{
             contentType(file),
             encoding.header(),
             stat.size,
@@ -372,22 +380,22 @@ const Response = struct {
         });
     }
 
-    fn notModified(gpa: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]const u8 {
+    fn notModified(allocator: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]const u8 {
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(gpa, fmt, .{
+        return try std.fmt.allocPrint(allocator, fmt, .{
             stat.mtime,
             stat.size,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn notFound(gpa: Allocator, keep_alive: bool) ![]const u8 {
+    fn notFound(allocator: Allocator, keep_alive: bool) ![]const u8 {
         const fmt = "HTTP/1.1 404 Not Found\r\n" ++
             "Content-Length: 0\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(gpa, fmt, .{
+        return try std.fmt.allocPrint(allocator, fmt, .{
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -509,7 +517,7 @@ test "file open" {
 
     var pool: FileStatPool = .{ .ptr = &conn, .callback = @TypeOf(conn).onFile };
     try pool.init(gpa, &io, dir, path, ContentEncoding.parse("zstd gzip br pero zdero jozo bozo"));
-    defer pool.free(gpa);
+    defer pool.deinit(gpa);
 
     while (!conn.done) {
         try io.tick();
@@ -593,11 +601,25 @@ const FileStatPool = struct {
 
     files: []FileStat = &.{},
     join_count: usize = 0,
-    ptr: *anyopaque = undefined,
-    callback: *const fn (*anyopaque, anyerror!File) anyerror!void = undefined,
+    ptr: *anyopaque,
+    callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
 
-    fn init(self: *Self, gpa: Allocator, io: *Io, dir: fs.Dir, path: []const u8, encodings: []const ContentEncoding) !void {
-        self.files = try gpa.alloc(FileStat, encodings.len);
+    fn init(
+        self: *Self,
+        ptr: *anyopaque,
+        callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
+        allocator: Allocator,
+        io: *Io,
+        dir: fs.Dir,
+        path: []const u8,
+        encodings: []const ContentEncoding,
+    ) !void {
+        self.* = .{
+            .ptr = ptr,
+            .callback = callback,
+            .files = try allocator.alloc(FileStat, encodings.len),
+            .join_count = encodings.len,
+        };
 
         for (encodings, 0..) |encoding, i| {
             self.files[i] = .{
@@ -606,11 +628,10 @@ const FileStatPool = struct {
                 .encoding = encoding,
                 .ptr = self,
                 .callback = join,
-                .path = try std.mem.joinZ(gpa, "", &.{ path, encoding.extension() }),
+                .path = try std.mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
             };
             try (&self.files[i]).stat();
         }
-        self.join_count = self.files.len;
     }
 
     fn join(ptr: *anyopaque) !void {
@@ -652,12 +673,12 @@ const FileStatPool = struct {
         try self.callback(self.ptr, res);
     }
 
-    fn free(self: *Self, gpa: Allocator) void {
+    fn deinit(self: *Self, allocator: Allocator) void {
         if (self.files.len == 0) return;
         for (self.files) |f| {
-            gpa.free(f.path);
+            allocator.free(f.path);
         }
-        gpa.free(self.files);
+        allocator.free(self.files);
         self.files = &.{};
     }
 };
