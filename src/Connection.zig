@@ -425,6 +425,9 @@ const Response = struct {
             .{ ".webp", "image/webp" },
             .{ ".woff", "font/woff" },
             .{ ".woff2", "font/woff2" },
+            .{ ".md", "text/markdown" },
+            .{ ".rss", "application/rss+xml" },
+            .{ ".atom", "application/rss+xml" },
         };
         for (mime_types) |pair| {
             if (std.mem.endsWith(u8, file_name, pair[0])) return pair[1];
@@ -726,6 +729,9 @@ pub fn compressible(file_name: []const u8) bool {
         ".txt",
         ".xml",
         ".csv",
+        ".md",
+        ".rss",
+        ".atom",
     };
     for (extensions) |ex| {
         if (std.mem.endsWith(u8, file_name, ex)) return true;

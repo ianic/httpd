@@ -12,6 +12,7 @@ pid=$!
 # start nginx listening on 8081 http and 8444 https
 mkdir -p tmp
 nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
+nginx_pid=$!
 
 trap ctrl_c_handler INT
 
@@ -29,6 +30,7 @@ function ctrl_c_handler() {
 read -n 1 -s -r -p "Press any key to stop httpd..."
 echo
 kill $pid
+kill $nginx_pid
 clean_exit
 
 # stress test with

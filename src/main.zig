@@ -252,37 +252,47 @@ fn compress(allocator: Allocator, root: fs.Dir) !void {
 }
 
 fn compressFile(allocator: Allocator, dir: fs.Dir, file_path: []const u8) void {
-    defer allocator.free(file_path);
-
-    const cmds = &[_][3][]const u8{
-        .{ "gzip", "-kfq", ".gz" },
-        .{ "brotli", "-kf", ".br" },
-        .{ "zstd", "-kfq", ".zst" },
+    compressFileFallible(allocator, dir, file_path) catch |err| {
+        log.err("compress '{s}' failed {}", .{ file_path, err });
     };
-    for (cmds) |pair| {
-        const cmd = pair[0];
-        const flags = pair[1];
-        var child = std.process.Child.init(&[_][]const u8{ cmd, flags, file_path }, allocator);
-        child.cwd_dir = dir;
-        const term = child.spawnAndWait() catch |err| {
-            log.err("{s} spawn {} ", .{ cmd, err });
-            continue;
-        };
-        if (term.Exited == 0) {
-            const stat = dir.statFile(file_path) catch return;
-            const compressed_path = std.mem.join(allocator, "", &.{ file_path, pair[2] }) catch return;
-            defer allocator.free(compressed_path);
-            const c_stat = dir.statFile(compressed_path) catch return;
+}
 
+fn compressFileFallible(allocator: Allocator, dir: fs.Dir, file_path: []const u8) !void {
+    defer allocator.free(file_path);
+    const stat = try dir.statFile(file_path);
+
+    const cmds: [3]struct {
+        cmd: []const u8,
+        flags: []const u8,
+        ext: []const u8,
+    } = .{
+        .{ .cmd = "gzip", .flags = "-kfq", .ext = ".gz" },
+        .{ .cmd = "brotli", .flags = "-kf", .ext = ".br" },
+        .{ .cmd = "zstd", .flags = "-kfq", .ext = ".zst" },
+    };
+    for (cmds) |c| {
+        const compressed_path = try std.mem.join(allocator, "", &.{ file_path, c.ext });
+        defer allocator.free(compressed_path);
+        if (dir.statFile(compressed_path)) |c_stat| {
+            if (c_stat.mtime == stat.mtime) {
+                continue;
+            }
+        } else |_| {}
+
+        var child = std.process.Child.init(&[_][]const u8{ c.cmd, c.flags, file_path }, allocator);
+        child.cwd_dir = dir;
+        const term = try child.spawnAndWait();
+        if (term.Exited == 0) {
+            const c_stat = try dir.statFile(compressed_path);
             log.info("{s:<6} {d:5.2}% {}->{} {s}", .{
-                cmd,
+                c.cmd,
                 @as(f64, @floatFromInt(c_stat.size * 100)) / @as(f64, @floatFromInt(stat.size)),
                 stat.size,
                 c_stat.size,
                 file_path,
             });
         } else {
-            log.err("{s} {s} exit: {}", .{ cmd, file_path, term.Exited });
+            log.err("{s} {s} exit: {}", .{ c.cmd, file_path, term.Exited });
         }
     }
 }
