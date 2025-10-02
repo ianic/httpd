@@ -325,20 +325,26 @@ const Response = struct {
         }
         rsp.fd = fd;
         const stat = rsp.file.?.stat;
-        if (stat.kind != .file) {
-            if (stat.kind == .directory) {
+
+        switch (stat.kind) {
+            .file, .sym_link => {
+                if (etagMatch(stat, req)) {
+                    rsp.status = .not_modified;
+                    rsp.header = try notModified(allocator, stat, req.keep_alive);
+                } else {
+                    rsp.status = .ok;
+                    rsp.header = try ok(allocator, stat, req.path, rsp.file.?.encoding, req.keep_alive);
+                }
+            },
+            .directory => {
+                // Target path was without trailing '/' and points to directory; redirect
                 rsp.status = .moved_permanently;
                 rsp.header = try dirRedirect(allocator, req.path, req.keep_alive);
-            } else {
+            },
+            else => {
                 rsp.status = .not_found;
                 rsp.header = try notFound(allocator, req.keep_alive);
-            }
-        } else if (etagMatch(stat, req)) {
-            rsp.status = .not_modified;
-            rsp.header = try notModified(allocator, stat, req.keep_alive);
-        } else {
-            rsp.status = .ok;
-            rsp.header = try ok(allocator, stat, req.path, rsp.file.?.encoding, req.keep_alive);
+            },
         }
     }
 
