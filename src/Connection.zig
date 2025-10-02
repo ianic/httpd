@@ -326,8 +326,13 @@ const Response = struct {
         rsp.fd = fd;
         const stat = rsp.file.?.stat;
         if (stat.kind != .file) {
-            rsp.status = .not_found;
-            rsp.header = try notFound(allocator, req.keep_alive);
+            if (stat.kind == .directory) {
+                rsp.status = .moved_permanently;
+                rsp.header = try dirRedirect(allocator, req.path, req.keep_alive);
+            } else {
+                rsp.status = .not_found;
+                rsp.header = try notFound(allocator, req.keep_alive);
+            }
         } else if (etagMatch(stat, req)) {
             rsp.status = .not_modified;
             rsp.header = try notModified(allocator, stat, req.keep_alive);
@@ -342,7 +347,7 @@ const Response = struct {
     }
 
     fn hasBody(rsp: Response) bool {
-        return rsp.status == .ok;
+        return rsp.status == .ok and rsp.bodySize() > 0;
     }
 
     fn bodySize(rsp: Response) usize {
@@ -396,6 +401,17 @@ const Response = struct {
             "Content-Length: 0\r\n" ++
             "{s}\r\n\r\n";
         return try std.fmt.allocPrint(allocator, fmt, .{
+            if (keep_alive) connection_keep_alive else connection_close,
+        });
+    }
+
+    fn dirRedirect(allocator: Allocator, path: []const u8, keep_alive: bool) ![]const u8 {
+        const fmt = "HTTP/1.1 301 Moved Permanently\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Location: \\{s}\\ \r\n" ++
+            "{s}\r\n\r\n";
+        return try std.fmt.allocPrint(allocator, fmt, .{
+            path,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }

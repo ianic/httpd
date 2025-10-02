@@ -1,4 +1,4 @@
-/// TLS server handshake. After successfull upgrade to the https return file
+/// TLS server handshake. After successfull upgrade to the https returns file
 /// descriptor to the server.
 const Handshake = @This();
 

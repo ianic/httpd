@@ -30,7 +30,7 @@ const cipher_suites = &[_]tls.config.CipherSuite{
 };
 
 pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
-    self.pipes = .{ .gpa = self.gpa, .metric = &self.metric };
+    self.pipes = .{ .allocator = self.gpa, .metric = &self.metric };
     try self.pipes.initPreheated(16);
 
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
@@ -139,7 +139,7 @@ pub const Pipe = struct {
 /// another for large size. If file in sendfile is big it will be given large
 /// pipe so it will be sent in less short send cycles.
 const PipePool = struct {
-    gpa: Allocator,
+    allocator: Allocator,
     large: std.ArrayList(Pipe) = .empty,
     small: std.ArrayList(Pipe) = .empty,
     metric: *Metric,
@@ -148,9 +148,9 @@ const PipePool = struct {
         for (0..count) |i| {
             const p = try self.create(i % 2 == 0);
             if (p.large)
-                try self.large.append(self.gpa, p)
+                try self.large.append(self.allocator, p)
             else
-                try self.small.append(self.gpa, p);
+                try self.small.append(self.allocator, p);
         }
     }
 
@@ -163,8 +163,8 @@ const PipePool = struct {
             posix.close(p.fds[0]);
             posix.close(p.fds[1]);
         }
-        self.large.deinit(self.gpa);
-        self.small.deinit(self.gpa);
+        self.large.deinit(self.allocator);
+        self.small.deinit(self.allocator);
     }
 
     fn create(self: *PipePool, large: bool) !Pipe {
@@ -201,10 +201,10 @@ const PipePool = struct {
 
     pub fn put(self: *PipePool, p: Pipe) !void {
         if (p.large) {
-            try self.large.append(self.gpa, p);
+            try self.large.append(self.allocator, p);
             return;
         }
-        try self.small.append(self.gpa, p);
+        try self.small.append(self.allocator, p);
     }
 
     pub fn broken(self: *PipePool, p: Pipe) void {
