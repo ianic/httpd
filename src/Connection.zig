@@ -380,6 +380,7 @@ const Response = struct {
             "Content-Type: {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
+            "Last-Modified: {s}\r\n" ++
             "{s}\r\n\r\n";
         return try std.fmt.allocPrint(allocator, fmt, .{
             contentType(file),
@@ -387,6 +388,7 @@ const Response = struct {
             stat.size,
             stat.mtime,
             stat.size,
+            toLastModified(@intCast(@divTrunc(stat.mtime, std.time.ns_per_s))) catch "",
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -394,10 +396,12 @@ const Response = struct {
     fn notModified(allocator: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]const u8 {
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
+            "Last-Modified: {s}\r\n" ++
             "{s}\r\n\r\n";
         return try std.fmt.allocPrint(allocator, fmt, .{
             stat.mtime,
             stat.size,
+            toLastModified(@intCast(@divTrunc(stat.mtime, std.time.ns_per_s))) catch "",
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -775,3 +779,4 @@ const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const Head = @import("Head.zig");
 const log = std.log.scoped(.connection);
+const toLastModified = @import("time.zig").toLastModified;
