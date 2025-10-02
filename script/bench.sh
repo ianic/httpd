@@ -39,9 +39,13 @@ oha-tests() {
     results+=( "" )
 }
 
+if [ ! -L site/root ]; then
+    ln -s site/ziglang.org site/root
+fi
+
 # start httpd listening on 8080 http and 8443 https
 zig build -Doptimize=ReleaseFast
-zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/cert_ec&
+zig-out/bin/httpd --root site/root --cert site/cert_ec&
 pid=$!
 
 # start nginx listening on 8081 http and 8444 https
