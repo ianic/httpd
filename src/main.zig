@@ -1,3 +1,18 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const posix = std.posix;
+const fs = std.fs;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const Thread = std.Thread;
+
+const tls = @import("tls");
+const Io = @import("Io.zig");
+const Server = @import("Server.zig");
+const signal = @import("signal.zig");
+const compressible = @import("Connection.zig").compressible;
+const log = std.log.scoped(.main);
+
 pub fn main() !void {
     signal.watch();
 
@@ -294,7 +309,7 @@ fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cac
         .{ .cmd = "zstd", .flags = "-kfq", .ext = ".zst" },
     };
     for (cmds) |c| {
-        const c_path = try std.mem.join(allocator, "", &.{ path, c.ext });
+        const c_path = try mem.join(allocator, "", &.{ path, c.ext });
         defer allocator.free(c_path);
         if (cache_dir.statFile(c_path)) |c_stat| {
             if (c_stat.mtime == stat.mtime) {
@@ -320,21 +335,6 @@ fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cac
         }
     }
 }
-
-const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
-const fs = std.fs;
-const mem = std.mem;
-const Allocator = mem.Allocator;
-const Thread = std.Thread;
-
-const tls = @import("tls");
-const Io = @import("Io.zig");
-const Server = @import("Server.zig");
-const signal = @import("signal.zig");
-const compressible = @import("Connection.zig").compressible;
-const log = std.log.scoped(.main);
 
 test {
     _ = @import("Connection.zig");

@@ -28,7 +28,7 @@ const tm = extern struct {
 
 // For example:
 // Thu, 02 Oct 2025 19:16:36 GMT
-pub inline fn toLastModified(buffer: []u8, sec: i64) []const u8 {
+pub fn toLastModified(buffer: []u8, sec: i64) []const u8 {
     assert(buffer.len >= 29);
     const format = "%a, %d %b %Y %H:%M:%S GMT";
     const tm_ptr = gmtime(&sec);

@@ -1,5 +1,17 @@
 /// TLS server handshake. After successfull upgrade to the https returns file
 /// descriptor to the server.
+const std = @import("std");
+const assert = std.debug.assert;
+const net = std.net;
+const time = std.time;
+const linux = std.os.linux;
+const fd_t = linux.fd_t;
+
+const tls = @import("tls");
+const Io = @import("Io.zig");
+const Server = @import("Server.zig");
+const log = std.log.scoped(.handshake);
+
 const Handshake = @This();
 
 server: *Server,
@@ -76,7 +88,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     }
     self.pos += @intCast(n);
 
-    var t = try std.time.Timer.start();
+    var t = try time.Timer.start();
     const res = self.hs.run(self.buffer[0..self.pos], &self.buffer) catch |err| {
         log.info("tls handsake failed {}", .{err});
         // if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
@@ -168,14 +180,3 @@ fn deinit(self: *Handshake) void {
     if (self.pipe) |p| self.server.pipes.put(p) catch {};
     self.server.destroy(self);
 }
-
-const std = @import("std");
-const assert = std.debug.assert;
-const net = std.net;
-const linux = std.os.linux;
-const fd_t = linux.fd_t;
-
-const tls = @import("tls");
-const Io = @import("Io.zig");
-const Server = @import("Server.zig");
-const log = std.log.scoped(.handshake);

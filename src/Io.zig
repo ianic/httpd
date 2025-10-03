@@ -1,4 +1,23 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const posix = std.posix;
+const net = std.net;
+const mem = std.mem;
+const math = std.math;
+const time = std.time;
+const Allocator = mem.Allocator;
+const fd_t = linux.fd_t;
+
+const errno = @import("errno.zig");
+const log = std.log.scoped(.io);
+
 const Io = @This();
+
+// from musl/include/fcnt.h
+const splice_f_nonblock = 0x02;
+const splice_no_offset = math.maxInt(u64);
+const yes_socket_option = mem.asBytes(&@as(u32, 1));
 
 ring: linux.IoUring = undefined,
 recv_buffer_group: linux.IoUring.BufferGroup = undefined,
@@ -424,21 +443,3 @@ const CloseNotify = struct {
         };
     }
 };
-
-// from musl/include/fcnt.h
-const splice_f_nonblock = 0x02;
-const splice_no_offset = math.maxInt(u64);
-const yes_socket_option = mem.asBytes(&@as(u32, 1));
-
-const std = @import("std");
-const assert = std.debug.assert;
-const linux = std.os.linux;
-const posix = std.posix;
-const net = std.net;
-const mem = std.mem;
-const math = std.math;
-const time = std.time;
-const Allocator = std.mem.Allocator;
-const fd_t = linux.fd_t;
-const errno = @import("errno.zig");
-const log = std.log.scoped(.io);

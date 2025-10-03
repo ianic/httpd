@@ -1,3 +1,19 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const net = std.net;
+const fs = std.fs;
+const linux = std.os.linux;
+const fd_t = linux.fd_t;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const http = std.http;
+
+const Io = @import("Io.zig");
+const Server = @import("Server.zig");
+const Head = @import("Head.zig");
+const log = std.log.scoped(.connection);
+const toLastModified = @import("time.zig").toLastModified;
+
 const Connection = @This();
 const keepalive_timeout = 30;
 const max_header_size = 8192;
@@ -463,7 +479,7 @@ const Response = struct {
             .{ ".atom", "application/rss+xml" },
         };
         for (mime_types) |pair| {
-            if (std.mem.endsWith(u8, file_name, pair[0])) return pair[1];
+            if (mem.endsWith(u8, file_name, pair[0])) return pair[1];
         }
         return "application/octet-stream"; // Default MIME type
     }
@@ -577,6 +593,8 @@ const ContentEncoding = enum {
     }
 
     test parse {
+        const testing = std.testing;
+
         var ar = (try parse(testing.allocator, "gzip, deflate, zstd")).?;
         try testing.expectEqual(3, ar.len);
         try testing.expectEqual(.plain, ar[0]);
@@ -594,8 +612,6 @@ const ContentEncoding = enum {
         try testing.expectEqual(null, try parse(testing.allocator, "one two"));
     }
 };
-
-const testing = std.testing;
 
 const File = struct {
     dir: fs.Dir,
@@ -637,7 +653,7 @@ const FileStatPool = struct {
                 .encoding = encoding,
                 .ptr = self,
                 .callback = join,
-                .path = try std.mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
+                .path = try mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
             };
             try (&self.files[i]).stat();
         }
@@ -741,23 +757,7 @@ pub fn compressible(file_name: []const u8) bool {
         ".atom",
     };
     for (extensions) |ex| {
-        if (std.mem.endsWith(u8, file_name, ex)) return true;
+        if (mem.endsWith(u8, file_name, ex)) return true;
     }
     return false;
 }
-
-const std = @import("std");
-const assert = std.debug.assert;
-const net = std.net;
-const fs = std.fs;
-const linux = std.os.linux;
-const fd_t = linux.fd_t;
-const mem = std.mem;
-const Allocator = mem.Allocator;
-const http = std.http;
-
-const Io = @import("Io.zig");
-const Server = @import("Server.zig");
-const Head = @import("Head.zig");
-const log = std.log.scoped(.connection);
-const toLastModified = @import("time.zig").toLastModified;

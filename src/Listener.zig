@@ -1,3 +1,13 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const net = std.net;
+const linux = std.os.linux;
+const fd_t = linux.fd_t;
+
+const Io = @import("Io.zig");
+const Server = @import("Server.zig");
+const log = std.log.scoped(.listener);
+
 const Listener = @This();
 
 server: *Server,
@@ -61,13 +71,3 @@ pub fn close(self: *Listener) !void {
     try self.io.cancel(self.fd);
     try self.io.close(self.fd);
 }
-
-const std = @import("std");
-const assert = std.debug.assert;
-const net = std.net;
-const linux = std.os.linux;
-const fd_t = linux.fd_t;
-
-const Io = @import("Io.zig");
-const Server = @import("Server.zig");
-const log = std.log.scoped(.listener);

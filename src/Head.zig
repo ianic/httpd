@@ -1,6 +1,11 @@
 /// Copy of std.http.Server.Request.Head
 /// https://github.com/ziglang/zig/blob/7b92d5f4052be651e9bc5cd4ad78a69ccbee865d/lib/std/http/Server.zig#L70
 /// with added etag and accept encoding
+const std = @import("std");
+const mem = std.mem;
+const http = std.http;
+const testing = std.testing;
+
 const Head = @This();
 
 method: http.Method,
@@ -177,8 +182,3 @@ fn invalidateStrings(h: *Head) void {
     if (h.expect) |*s| s.* = undefined;
     if (h.content_type) |*s| s.* = undefined;
 }
-
-const std = @import("std");
-const mem = std.mem;
-const http = std.http;
-const testing = std.testing;

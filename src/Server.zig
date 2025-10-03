@@ -1,3 +1,20 @@
+const std = @import("std");
+const assert = std.debug.assert;
+const linux = std.os.linux;
+const posix = std.posix;
+const fd_t = linux.fd_t;
+const net = std.net;
+const fs = std.fs;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+
+const tls = @import("tls");
+const Io = @import("Io.zig");
+const Listener = @import("Listener.zig");
+const Connection = @import("Connection.zig");
+const Handshake = @import("Handshake.zig");
+const log = std.log.scoped(.server);
+
 const Server = @This();
 
 /// Static site root.
@@ -38,7 +55,7 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
     // http
     {
-        const addr = try std.net.Address.resolveIp("0.0.0.0", http_port);
+        const addr = try net.Address.resolveIp("0.0.0.0", http_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr };
         try listener.init();
@@ -46,7 +63,7 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     }
     // https
     if (self.tls_auth) |_| {
-        const addr = try std.net.Address.resolveIp("0.0.0.0", https_port);
+        const addr = try net.Address.resolveIp("0.0.0.0", https_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
         try listener.init();
@@ -283,20 +300,3 @@ pub const Metric = struct {
         }
     };
 };
-
-const std = @import("std");
-const assert = std.debug.assert;
-const linux = std.os.linux;
-const posix = std.posix;
-const fd_t = linux.fd_t;
-const net = std.net;
-const fs = std.fs;
-const mem = std.mem;
-const Allocator = mem.Allocator;
-
-const tls = @import("tls");
-const Io = @import("Io.zig");
-const Listener = @import("Listener.zig");
-const Connection = @import("Connection.zig");
-const Handshake = @import("Handshake.zig");
-const log = std.log.scoped(.server);
