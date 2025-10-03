@@ -1,5 +1,6 @@
 const Connection = @This();
 const keepalive_timeout = 30;
+const max_header_size = 8192;
 
 server: *Server,
 gpa: Allocator,
@@ -79,7 +80,10 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         );
         return;
     }
-
+    if (self.short_recv.buffer.len >= max_header_size) {
+        try self.deinit();
+        return;
+    }
     try self.recv();
 }
 
