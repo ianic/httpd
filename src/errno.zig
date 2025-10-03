@@ -312,7 +312,7 @@ pub fn toError(errno: posix.E) Error {
     };
 }
 
-pub inline fn name(errno: posix.E) []const u8 {
+pub fn name(errno: posix.E) []const u8 {
     return @errorName(toError(errno));
 }
 

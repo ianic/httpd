@@ -29,7 +29,7 @@ send_buf: []const u8 = &.{},
 /// peeks.
 peek_count: usize = 0,
 
-inline fn parent(completion: *Io.Completion) *Handshake {
+fn parentPtr(completion: *Io.Completion) *Handshake {
     return @alignCast(@fieldParentPtr("completion", completion));
 }
 
@@ -57,7 +57,7 @@ fn close(self: *Handshake) !void {
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const n = Io.result(cqe) catch |err| {
         switch (err) {
             error.SignalInterrupt => try self.recv(),
@@ -109,7 +109,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const n = Io.result(cqe) catch |err| brk: {
         switch (err) {
             error.SignalInterrupt => break :brk 0,
@@ -131,7 +131,7 @@ fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const n = Io.result(cqe) catch |err| {
         log.err("discard failed {}", .{err});
         try self.close();
@@ -152,7 +152,7 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     _ = Io.result(cqe) catch |err| {
         log.err("kernel tls upgrade failed {}", .{err});
         try self.close();

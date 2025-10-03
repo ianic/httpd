@@ -18,7 +18,7 @@ fs_pool: FileStatPool = undefined,
 arena_instance: std.heap.ArenaAllocator = undefined,
 arena: Allocator = undefined,
 
-inline fn parent(completion: *Io.Completion) *Connection {
+fn parentPtr(completion: *Io.Completion) *Connection {
     return @alignCast(@fieldParentPtr("completion", completion));
 }
 
@@ -37,7 +37,7 @@ fn recv(self: *Connection) !void {
 }
 
 fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const n = Io.result(cqe) catch |err| brk: {
         switch (err) {
             error.SignalInterrupt, error.NoBufferSpaceAvailable => {
@@ -111,7 +111,7 @@ fn open(self: *Connection) !void {
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const rsp = &self.rsp;
     const fd = Io.result(cqe) catch |err| brk: {
         switch (err) {
@@ -148,7 +148,7 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const rsp = &self.rsp;
     self.offset += @intCast(Io.result(cqe) catch |err| brk: {
         switch (err) {
@@ -175,7 +175,7 @@ fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
 }
 
 fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parent(completion);
+    const self = parentPtr(completion);
     const rsp = &self.rsp;
     self.offset += @intCast(Io.result(cqe) catch |err| brk: {
         switch (err) {
@@ -286,10 +286,9 @@ const Request = struct {
             try allocator.dupeZ(u8, head.target[1..]);
 
         if (compressible(req.path)) {
-            if (head.accept_encoding) |ae| {
-                const encodings = ContentEncoding.parse(ae);
-                if (encodings.len > 1) {
-                    req.accept_encoding = try allocator.dupe(ContentEncoding, encodings);
+            if (head.accept_encoding) |accept_encoding| {
+                if (try ContentEncoding.parse(allocator, accept_encoding)) |encodings| {
+                    req.accept_encoding = encodings;
                 }
             }
         }
@@ -382,6 +381,7 @@ const Response = struct {
         encoding: ContentEncoding,
         keep_alive: bool,
     ) ![]const u8 {
+        var buf: [32]u8 = undefined;
         const fmt = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
@@ -394,12 +394,13 @@ const Response = struct {
             stat.size,
             stat.mtime,
             stat.size,
-            toLastModified(@intCast(@divTrunc(stat.mtime, std.time.ns_per_s))) catch "",
+            toLastModified(&buf, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s))),
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
     fn notModified(allocator: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]const u8 {
+        var buf: [32]u8 = undefined;
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
             "Last-Modified: {s}\r\n" ++
@@ -407,7 +408,7 @@ const Response = struct {
         return try std.fmt.allocPrint(allocator, fmt, .{
             stat.mtime,
             stat.size,
-            toLastModified(@intCast(@divTrunc(stat.mtime, std.time.ns_per_s))) catch "",
+            toLastModified(&buf, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s))),
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -524,41 +525,6 @@ const ShortRecvBuffer = struct {
     }
 };
 
-test "file open" {
-    const gpa = testing.allocator;
-
-    var io: Io = .{};
-    try io.init(gpa, .{
-        .entries = 16,
-        .fd_nr = 16,
-        .recv_buffers = .{ .count = 1, .size = 4096 },
-    });
-    defer io.deinit(gpa);
-    const dir = try fs.cwd().openDir("site/www.ziglang.org/zig-out/", .{});
-    const path = "index.html";
-
-    var conn: struct {
-        done: bool = false,
-        fn onFile(ptr: *anyopaque, stat: anyerror!File) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (stat) |s| {
-                std.debug.print("stat: {} {} {s}\n", .{ s.stat.size, s.encoding, s.path });
-            } else |err| {
-                std.debug.print("err: {}\n", .{err});
-            }
-            self.done = true;
-        }
-    } = .{};
-
-    var pool: FileStatPool = .{ .ptr = &conn, .callback = @TypeOf(conn).onFile };
-    try pool.init(gpa, &io, dir, path, ContentEncoding.parse("zstd gzip br pero zdero jozo bozo"));
-    defer pool.deinit(gpa);
-
-    while (!conn.done) {
-        try io.tick();
-    }
-}
-
 const ContentEncoding = enum {
     plain,
     gzip,
@@ -574,29 +540,31 @@ const ContentEncoding = enum {
         };
     }
 
-    /// Parse Accept-Encoding http header into list.
-    /// Plain is always included.
-    inline fn parse(accept_encoding: []const u8) []ContentEncoding {
-        var list: [4]ContentEncoding = undefined;
-        list[0] = .plain;
-        var idx: usize = 1;
+    /// Parse Accept-Encoding http header into list of ContentEncoding values.
+    /// Plain is always included at index 0.
+    /// Returns null if no supported encodings are found in accept_encoding string.
+    fn parse(allocator: Allocator, accept_encoding: []const u8) !?[]ContentEncoding {
+        var list: std.ArrayList(ContentEncoding) = .empty;
+        try list.append(allocator, .plain);
 
         var iter = mem.splitAny(u8, accept_encoding, ", ");
         while (iter.next()) |v| {
             if (v.len == 0) continue;
             const v1 = if (mem.indexOfScalar(u8, v, ';')) |i| v[0..i] else v;
             if (mem.eql(u8, v1, "gzip")) {
-                list[idx] = .gzip;
-                idx += 1;
+                try list.append(allocator, .gzip);
             } else if (mem.eql(u8, v1, "br")) {
-                list[idx] = .brotli;
-                idx += 1;
+                try list.append(allocator, .brotli);
             } else if (mem.eql(u8, v1, "zstd")) {
-                list[idx] = .zstd;
-                idx += 1;
+                try list.append(allocator, .zstd);
             }
         }
-        return list[0..idx];
+
+        if (list.items.len == 1) {
+            list.deinit(allocator);
+            return null;
+        }
+        return try list.toOwnedSlice(allocator);
     }
 
     pub fn header(self: ContentEncoding) []const u8 {
@@ -609,17 +577,21 @@ const ContentEncoding = enum {
     }
 
     test parse {
-        var ar = parse("gzip, deflate, zstd");
+        var ar = (try parse(testing.allocator, "gzip, deflate, zstd")).?;
         try testing.expectEqual(3, ar.len);
         try testing.expectEqual(.plain, ar[0]);
         try testing.expectEqual(.gzip, ar[1]);
         try testing.expectEqual(.zstd, ar[2]);
+        testing.allocator.free(ar);
 
-        ar = parse("br;q=1.0, gzip;q=0.8, *;q=0.1");
+        ar = (try parse(testing.allocator, "br;q=1.0, gzip;q=0.8, *;q=0.1")).?;
         try testing.expectEqual(3, ar.len);
         try testing.expectEqual(.plain, ar[0]);
         try testing.expectEqual(.brotli, ar[1]);
         try testing.expectEqual(.gzip, ar[2]);
+        testing.allocator.free(ar);
+
+        try testing.expectEqual(null, try parse(testing.allocator, "one two"));
     }
 };
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub fn main() !void {
     const now: i64 = std.time.timestamp();
@@ -25,13 +26,13 @@ const tm = extern struct {
     tm_isdst: i32,
 };
 
-pub inline fn toLastModified(sec: i64) ![]const u8 {
-    var buffer: [32]u8 = undefined;
+// For example:
+// Thu, 02 Oct 2025 19:16:36 GMT
+pub inline fn toLastModified(buffer: []u8, sec: i64) []const u8 {
+    assert(buffer.len >= 29);
     const format = "%a, %d %b %Y %H:%M:%S GMT";
     const tm_ptr = gmtime(&sec);
-    const res = strftime(&buffer, buffer.len, format, tm_ptr);
-    if (res == 0) {
-        return error.BufferTooSmall;
-    }
+    const res = strftime(buffer.ptr, buffer.len, format, tm_ptr);
+    assert(res > 0);
     return buffer[0..res];
 }
