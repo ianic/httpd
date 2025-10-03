@@ -15,7 +15,7 @@ pub fn main() !void {
     const root = args.root.?;
 
     if (args.command == .compress) {
-        try compress(gpa, root);
+        try compress(gpa, root, args.cache.?);
         return;
     }
 
@@ -31,6 +31,7 @@ pub fn main() !void {
         .gpa = gpa,
         .io = &io,
         .root = root,
+        .cache = args.cache orelse root,
         .tls_auth = if (args.cert) |dir| try tls.config.CertKeyPair.fromFilePath(gpa, dir, "cert.pem", "key.pem") else null,
     };
     try server.init(args.http_port, args.https_port);
@@ -61,6 +62,7 @@ pub fn main() !void {
 
 const Args = struct {
     root: ?fs.Dir = null,
+    cache: ?fs.Dir = null,
     cert: ?fs.Dir = null,
     http_port: u16 = 8080,
     https_port: u16 = 8443,
@@ -105,9 +107,11 @@ const Args = struct {
                         args.buf_count = v;
                     } else if (parseInt(u32, "buf-size", arg, &iter)) |v| {
                         args.buf_size = v;
-                    } else if (parseDir("root", arg, &iter)) |v| {
+                    } else if (parseDir("root", arg, &iter, false)) |v| {
                         args.root = v;
-                    } else if (parseDir("cert", arg, &iter)) |v| {
+                    } else if (parseDir("cache", arg, &iter, true)) |v| {
+                        args.cache = v;
+                    } else if (parseDir("cert", arg, &iter, false)) |v| {
                         args.cert = v;
                     } else if (mem.eql(u8, "-h", arg) or mem.eql(u8, "--help", arg)) {
                         help(0);
@@ -117,8 +121,10 @@ const Args = struct {
                     }
                 },
                 .compress => {
-                    if (parseDir("root", arg, &iter)) |v| {
+                    if (parseDir("root", arg, &iter, false)) |v| {
                         args.root = v;
+                    } else if (parseDir("cache", arg, &iter, true)) |v| {
+                        args.cache = v;
                     } else if (mem.eql(u8, "-h", arg) or mem.eql(u8, "--help", arg)) {
                         help(0);
                     } else {
@@ -133,17 +139,29 @@ const Args = struct {
             std.debug.print("missing required '--root' argument\n", .{});
             help(1);
         }
+        if (args.command == .compress and args.cache == null) {
+            std.debug.print("missing required '--cache' argument\n", .{});
+            help(1);
+        }
 
         return args;
     }
 
-    fn parseDir(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?fs.Dir {
+    fn parseDir(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator, mk_if_not_found: bool) ?fs.Dir {
         if (parseString(name, arg, iter)) |v| {
-            return std.fs.cwd().openDir(v, .{}) catch |err| {
-                fatal("cant't open root dir '{s}' {}", .{ v, err });
+            return fs.cwd().openDir(v, .{}) catch |err| {
+                if (mk_if_not_found and err == error.FileNotFound) {
+                    if (mkDir(v)) |d| return d;
+                }
+                fatal("cant't open dir '{s}' {}", .{ v, err });
             };
         }
         return null;
+    }
+
+    fn mkDir(path: []const u8) ?fs.Dir {
+        fs.cwd().makePath(path) catch return null;
+        return fs.cwd().openDir(path, .{}) catch return null;
     }
 
     fn parseInt(T: type, comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?T {
@@ -204,6 +222,7 @@ const Args = struct {
             \\
             \\Start command options:
             \\  --root              Root folder of the static site to serve
+            \\  --cache             Cache folder with precompressed site files
             \\  --cert              Certificate folder. Two files are expected there:
             \\                        cert.pem - site tls certificate
             \\                        key.pem  - certificate private key
@@ -217,6 +236,7 @@ const Args = struct {
             \\
             \\Compress command options:
             \\  --root              Root folder of the static site
+            \\  --cache             Compress desination
             \\
             \\General options:
             \\  --help, -h          Print this help
@@ -227,7 +247,7 @@ const Args = struct {
     }
 };
 
-fn compress(allocator: Allocator, root: fs.Dir) !void {
+fn compress(allocator: Allocator, root: fs.Dir, cache_dir: fs.Dir) !void {
     var dir = try root.openDir(".", .{ .iterate = true });
     defer dir.close();
 
@@ -242,24 +262,27 @@ fn compress(allocator: Allocator, root: fs.Dir) !void {
     defer walker.deinit();
     while (try walker.next()) |entry| {
         if (entry.kind == .file and compressible(entry.path)) {
-            const stat = try dir.statFile(entry.path);
-            if (stat.size > 512) {
-                const file_path = try allocator.dupe(u8, entry.path);
-                try pool.spawn(compressFile, .{ allocator, dir, file_path });
+            if (fs.path.dirname(entry.path)) |dir_name| {
+                try cache_dir.makePath(dir_name);
             }
+            const path = try allocator.dupe(u8, entry.path);
+            try pool.spawn(compressFile, .{ allocator, dir, path, cache_dir });
         }
     }
 }
 
-fn compressFile(allocator: Allocator, dir: fs.Dir, file_path: []const u8) void {
-    compressFileFallible(allocator, dir, file_path) catch |err| {
-        log.err("compress '{s}' failed {}", .{ file_path, err });
+fn compressFile(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) void {
+    compressFileFallible(allocator, dir, path, cache_dir) catch |err| {
+        log.err("compress '{s}' failed {}", .{ path, err });
     };
 }
 
-fn compressFileFallible(allocator: Allocator, dir: fs.Dir, file_path: []const u8) !void {
-    defer allocator.free(file_path);
-    const stat = try dir.statFile(file_path);
+fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) !void {
+    defer allocator.free(path);
+    const stat = try dir.statFile(path);
+    if (stat.size < 512) {
+        return;
+    }
 
     const cmds: [3]struct {
         cmd: []const u8,
@@ -271,28 +294,29 @@ fn compressFileFallible(allocator: Allocator, dir: fs.Dir, file_path: []const u8
         .{ .cmd = "zstd", .flags = "-kfq", .ext = ".zst" },
     };
     for (cmds) |c| {
-        const compressed_path = try std.mem.join(allocator, "", &.{ file_path, c.ext });
-        defer allocator.free(compressed_path);
-        if (dir.statFile(compressed_path)) |c_stat| {
+        const c_path = try std.mem.join(allocator, "", &.{ path, c.ext });
+        defer allocator.free(c_path);
+        if (cache_dir.statFile(c_path)) |c_stat| {
             if (c_stat.mtime == stat.mtime) {
                 continue;
             }
         } else |_| {}
 
-        var child = std.process.Child.init(&[_][]const u8{ c.cmd, c.flags, file_path }, allocator);
+        var child = std.process.Child.init(&[_][]const u8{ c.cmd, c.flags, path }, allocator);
         child.cwd_dir = dir;
         const term = try child.spawnAndWait();
         if (term.Exited == 0) {
-            const c_stat = try dir.statFile(compressed_path);
+            try posix.renameat(dir.fd, c_path, cache_dir.fd, c_path);
+            const c_stat = try cache_dir.statFile(c_path);
             log.info("{s:<6} {d:5.2}% {}->{} {s}", .{
                 c.cmd,
                 @as(f64, @floatFromInt(c_stat.size * 100)) / @as(f64, @floatFromInt(stat.size)),
                 stat.size,
                 c_stat.size,
-                file_path,
+                path,
             });
         } else {
-            log.err("{s} {s} exit: {}", .{ c.cmd, file_path, term.Exited });
+            log.err("{s} {s} exit: {}", .{ c.cmd, path, term.Exited });
         }
     }
 }

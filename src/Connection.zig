@@ -73,6 +73,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
             self.arena,
             self.io,
             self.server.root,
+            self.server.cache,
             req.path,
             req.accept_encoding orelse &[_]ContentEncoding{.plain},
         );
@@ -101,7 +102,8 @@ fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
 }
 
 fn open(self: *Connection) !void {
-    try self.io.openRead(&self.completion, onOpen, self.server.root.fd, self.rsp.file.?.path, null);
+    const file = self.rsp.file.?;
+    try self.io.openRead(&self.completion, onOpen, file.dir.fd, file.path, null);
 }
 
 fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
@@ -620,6 +622,7 @@ const ContentEncoding = enum {
 const testing = std.testing;
 
 const File = struct {
+    dir: fs.Dir,
     path: [:0]const u8 = &.{},
     stat: fs.File.Stat,
     encoding: ContentEncoding,
@@ -639,7 +642,8 @@ const FileStatPool = struct {
         callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
         allocator: Allocator,
         io: *Io,
-        dir: fs.Dir,
+        root: fs.Dir,
+        cache: fs.Dir,
         path: []const u8,
         encodings: []const ContentEncoding,
     ) !void {
@@ -653,7 +657,7 @@ const FileStatPool = struct {
         for (encodings, 0..) |encoding, i| {
             self.files[i] = .{
                 .io = io,
-                .dir = dir,
+                .dir = if (encoding == .plain) root else cache,
                 .encoding = encoding,
                 .ptr = self,
                 .callback = join,
@@ -695,6 +699,7 @@ const FileStatPool = struct {
         const match = &self.files[idx];
 
         const res: File = .{
+            .dir = match.dir,
             .path = match.path,
             .encoding = match.encoding,
             .stat = fs.File.Stat.fromLinux(match.statx),

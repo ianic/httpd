@@ -2,6 +2,8 @@ const Server = @This();
 
 /// Static site root.
 root: fs.Dir,
+/// Where to find precompressed files.
+cache: fs.Dir,
 /// Linux pipes used in sendfile and discard io operations. Pool allows reusing
 /// pipe without create/close for each operation.
 pipes: PipePool = undefined,
