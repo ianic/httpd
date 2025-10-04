@@ -9,10 +9,12 @@ zig-out/bin/httpd compress --root site/root --cache site/cache                  
 zig-out/bin/httpd --root site/root --cache site/cache --cert site/cert_ec --fds 65535 --buf-count 16 --sqes 32768 & # start server http: 8080 https: 8443
 pid=$!
 
-# start nginx listening on http: 8081 https: 8444
-mkdir -p tmp
-nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
-nginx_pid=$!
+if command -v nginx >/dev/null 2>&1; then
+    # start nginx listening on http: 8081 https: 8444
+    mkdir -p tmp
+    nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
+    nginx_pid=$!
+fi
 
 trap ctrl_c_handler INT
 

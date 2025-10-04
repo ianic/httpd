@@ -54,8 +54,6 @@ nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
 sleep 0.2
 
-
-
 echo -e "http"
 oha-tests http 8080 "$host"
 

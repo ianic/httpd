@@ -28,8 +28,3 @@ cd ..
 echo "start server; http on port 8080, https on port 8443"
 zig build
 zig-out/bin/httpd --root=./site/root --cert=./site/cert_ec/
-
-exit 0
-
-# list site files by size
-cd site/root && find . -type f -exec ls -lSh {} + && cd -
