@@ -4,13 +4,13 @@ const posix = std.posix;
 const fs = std.fs;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const Thread = std.Thread;
 
 const tls = @import("tls");
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const signal = @import("signal.zig");
-const compressible = @import("Connection.zig").compressible;
+
+const compress = @import("compress.zig").compress;
 const log = std.log.scoped(.main);
 
 pub fn main() !void {
@@ -261,80 +261,6 @@ const Args = struct {
         std.process.exit(status);
     }
 };
-
-fn compress(allocator: Allocator, root: fs.Dir, cache_dir: fs.Dir) !void {
-    var dir = try root.openDir(".", .{ .iterate = true });
-    defer dir.close();
-
-    var pool: Thread.Pool = undefined;
-    try Thread.Pool.init(&pool, Thread.Pool.Options{
-        .allocator = allocator,
-        .n_jobs = try Thread.getCpuCount(),
-    });
-    defer pool.deinit();
-
-    var walker = try dir.walk(allocator);
-    defer walker.deinit();
-    while (try walker.next()) |entry| {
-        if (entry.kind == .file and compressible(entry.path)) {
-            if (fs.path.dirname(entry.path)) |dir_name| {
-                try cache_dir.makePath(dir_name);
-            }
-            const path = try allocator.dupe(u8, entry.path);
-            try pool.spawn(compressFile, .{ allocator, dir, path, cache_dir });
-        }
-    }
-}
-
-fn compressFile(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) void {
-    compressFileFallible(allocator, dir, path, cache_dir) catch |err| {
-        log.err("compress '{s}' failed {}", .{ path, err });
-    };
-}
-
-fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) !void {
-    defer allocator.free(path);
-    const stat = try dir.statFile(path);
-    if (stat.size < 512) {
-        return;
-    }
-
-    const cmds: [3]struct {
-        cmd: []const u8,
-        flags: []const u8,
-        ext: []const u8,
-    } = .{
-        .{ .cmd = "gzip", .flags = "-kfq", .ext = ".gz" },
-        .{ .cmd = "brotli", .flags = "-kf", .ext = ".br" },
-        .{ .cmd = "zstd", .flags = "-kfq", .ext = ".zst" },
-    };
-    for (cmds) |c| {
-        const c_path = try mem.join(allocator, "", &.{ path, c.ext });
-        defer allocator.free(c_path);
-        if (cache_dir.statFile(c_path)) |c_stat| {
-            if (c_stat.mtime == stat.mtime) {
-                continue;
-            }
-        } else |_| {}
-
-        var child = std.process.Child.init(&[_][]const u8{ c.cmd, c.flags, path }, allocator);
-        child.cwd_dir = dir;
-        const term = try child.spawnAndWait();
-        if (term.Exited == 0) {
-            try posix.renameat(dir.fd, c_path, cache_dir.fd, c_path);
-            const c_stat = try cache_dir.statFile(c_path);
-            log.info("{s:<6} {d:5.2}% {}->{} {s}", .{
-                c.cmd,
-                @as(f64, @floatFromInt(c_stat.size * 100)) / @as(f64, @floatFromInt(stat.size)),
-                stat.size,
-                c_stat.size,
-                path,
-            });
-        } else {
-            log.err("{s} {s} exit: {}", .{ c.cmd, path, term.Exited });
-        }
-    }
-}
 
 test {
     _ = @import("Connection.zig");
