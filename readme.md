@@ -1,11 +1,11 @@
 # httpd 
 
-HTTP/HTTPS static file server in Zig with io_uring, kernel TLS
+HTTP/HTTPS static file server in Zig 
 
 - Linux only, uses Linux specific io_uring and kernel TLS
-- min Linux kernel version is 6.12.-io_uring is not supported at old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
+- min Linux kernel version is 6.12. io_uring is not supported at old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
+- should be build with latest master Zig
 - single threaded
-- kernel TLS enables sendfile
 
 ## Precompress files
 
@@ -37,7 +37,7 @@ echo tls | sudo tee /etc/modules-load.d/gnutls.conf
 
 ## Example
 
-Run `script/site.sh`, that will checkout example (ziglang.org) site, create https ca and certificate, build project and start httpd listening for http on port 8080 and for https on port 8443.
+Run `script/site.sh`, that will checkout an example site (ziglang.org), create https authority and site certificate, build project and start httpd listening for http on port 8080 and for https on port 8443.
 
 To run httpd in release mode with some higher resources and precompressed site files run `script/start.sh`. You can stress test with something like: 
 
@@ -50,11 +50,13 @@ script/targets.sh http 8080 && oha -z 60s --urls-from-file site/targets-oha -c 1
 
 ## Benchmark
 
-Using [oha](https://github.com/hatoo/oha) and comparing requests per second httpd with Nginx.  
-Nginx is using single worker thread, configured to my best knowledge similar to httpd: sendfile and ktls enabled.  
-Testing with few different number of concurrent connections 1/100/500. '1 close'
-is single concurrent connection without keep-alive, closing connection after
-each requests. Forces tls handshake on each https request.
+Benchmarking using [oha](https://github.com/hatoo/oha) and comparing requests
+per second of httpd with Nginx. Nginx is using single worker thread, configured
+to my best knowledge similar to httpd: sendfile and ktls enabled.
+
+Testing with different number of concurrent connections 1/100/500. '1 close'
+is  single concurrent  connection without  keep-alive; closing  connection after
+each request. Forces tls handshake on each https request.
 
 Example of `script/bench.sh` results running both server and oha benchmark tool on the same host:
 
