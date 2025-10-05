@@ -7,9 +7,14 @@ HTTP/HTTPS static file server in Zig
 - should be build with latest master Zig
 - single threaded
 
+
 ## Precompress files
 
-httpd can serve compressed files if they exists on the disk. To compress site files run: 
+httpd can serve compressed files if they exists on the disk. There is `compress`
+command to prepare compressed files. It uses system gzip, brotli ans zstd
+binaries so they must be on the system.
+
+To compress site files run: 
 ```sh
 $ httpd compress --root site/root --cache site/cache
 ```
@@ -20,6 +25,7 @@ To use precompressed files start httpd with the same cache argument:
 $ httpd --root site/root --cache site/cache --cert site/cert_ec
 ```
 Client will be served with best match. Shortest file in format which is supported by the client. 
+
 
 ## Kernel TLS
 
@@ -73,7 +79,15 @@ HTTPS
 |Nginx |  1860     | 13935     | 18391     | 17822     |
 
 
+
 <!--
+
+- sets and checks Etag, returns 304 if they match
+- sets Last-Modified for browser caching
+
+USR1, section o monitoring
+open files, mozda imati section o configuration
+
 https://atlarge-research.com/pdfs/2024-bingimarsson-msc_thesis.pdf  
 https://blog.cloudflare.com/missing-manuals-io_uring-worker-pool/  
 
