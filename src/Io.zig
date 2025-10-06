@@ -74,9 +74,9 @@ pub fn tick(io: *Io) !void {
         const cqe = io.cqes[0];
         if (cqe.user_data != 0) {
             const completion: *Completion = @ptrFromInt(cqe.user_data);
-            const callback = completion.callback;
+            const callback = completion.callback.?;
             // Reset completion.callback so that completion can be reused during callback.
-            completion.callback = Completion.noCallback;
+            completion.callback = null;
             try callback(completion, cqe);
             io.metric.completed(cqe);
         } else {
@@ -320,23 +320,19 @@ pub const MsgFlags = packed struct {
 
 pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
 pub const Completion = struct {
-    callback: Callback = Completion.noCallback,
+    callback: ?Callback = null,
 
-    /// True if operation for this completion is still in the subission queue,
-    /// in the kernel or in the completion queeue.
+    /// True if operation for this completion is still in the submission queue,
+    /// in the kernel or in the completion queue.
     /// False if callback is fired and completion can be reused.
     pub fn active(self: *Completion) bool {
-        return self.callback != noCallback;
-    }
-
-    fn noCallback(_: *Completion, _: linux.io_uring_cqe) !void {
-        unreachable;
+        return self.callback != null;
     }
 };
 
 /// Completion identifier for sqe user_data field.
 fn cid(io: *Io, c: *Completion, cb: Callback) u64 {
-    assert(c.callback == Completion.noCallback); // must be unused
+    assert(!c.active());
     c.callback = cb;
     io.metric.submitted();
     return @intFromPtr(c);

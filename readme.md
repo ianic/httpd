@@ -64,7 +64,7 @@ Testing with different number of concurrent connections 1/100/500. '1 close'
 is  single concurrent  connection without  keep-alive; closing  connection after
 each request. Forces tls handshake on each https request.
 
-Example of `script/bench.sh` results running both server and oha benchmark tool on the same host:
+Example of `script/bench.sh` results:
 
 HTTP
 |      | 1 close   | 1         | 100       | 500       |
