@@ -23,7 +23,6 @@ gpa: Allocator,
 io: *Io,
 fd: fd_t,
 protocol: Server.Protocol = .http,
-pipe: ?Server.Pipe = null, // for sendfile
 arena_instance: std.heap.ArenaAllocator = undefined,
 arena: Allocator = undefined,
 
@@ -33,10 +32,13 @@ rsp: Response = .{},
 
 // io operations
 recv_op: RequestRecv = undefined,
-file_stat_op: FileStatPool = undefined,
+file_stat_op: FileStat = undefined,
 file_open_op: FileOpen = undefined,
 header_send_op: SendBytes = undefined,
 sendfile_op: Sendfile = undefined,
+
+file_open_res: ?anyerror!fd_t = null,
+send_header_res: ?anyerror!void = null,
 
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
@@ -48,81 +50,130 @@ pub fn init(self: *Connection) !void {
         .fd = self.fd,
         .callback = onRequest,
     };
-    try self.recv();
+    self.file_stat_op = .{
+        .io = self.io,
+        .root = self.server.root,
+        .cache = self.server.cache,
+        .callback = onFileStat,
+    };
+    self.header_send_op = .{
+        .io = self.io,
+        .fd = self.fd,
+        .callback = onHeader,
+    };
+    self.file_open_op = .{
+        .io = self.io,
+        .callback = onOpen,
+    };
+    self.sendfile_op = .{
+        .io = self.io,
+        .conn_fd = self.fd,
+        .callback = onSendfile,
+    };
+
+    try self.readRequest();
 }
 
-fn recv(self: *Connection) !void {
+fn readRequest(self: *Connection) !void {
     if (self.server.closing()) {
-        try self.deinit();
+        try self.shutdown();
         return;
     }
-    try self.recv_op.recv();
+    try self.recv_op.prep();
 }
 
 /// res is http header bytes or error
 fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("recv_op", ptr));
     const bytes = res catch {
-        try self.deinit();
+        try self.shutdown();
         return;
     };
     self.req = Request.parse(self.arena, bytes) catch |err| {
-        log.debug("connection request parse {}", .{err});
-        try self.deinit();
+        log.debug("{} request parse {}\n{s}\n{x}\n", .{ self.fd, err, bytes, bytes });
+        try self.shutdown();
         return;
     };
-    try self.file_stat_op.init(
+    try self.file_stat_op.prep(
         self.arena,
-        self.io,
-        self.server.root,
-        self.server.cache,
         self.req.path,
         self.req.accept_encoding orelse &[_]ContentEncoding{.plain},
-        onFileStat,
     );
 }
 
-fn onFileStat(ptr: *FileStatPool, res: anyerror!File) !void {
+fn onFileStat(ptr: *FileStat, res: anyerror!FileStat.Result) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("file_stat_op", ptr));
-
-    const file = res catch |err| switch (err) {
-        error.NoSuchFileOrDirectory => {
-            try onOpen(&self.file_open_op, -1);
-            return;
-        },
+    const rsp = &self.rsp;
+    rsp.fsr = res catch |err| brk: switch (err) {
+        error.NoSuchFileOrDirectory => break :brk null,
         else => {
-            try self.deinit();
+            try self.shutdown();
             return;
         },
     };
-    self.rsp.file = file;
-    self.file_open_op = .{
-        .io = self.io,
-        .dir = file.dir,
-        .path = file.path,
-        .callback = onOpen,
-    };
-    try self.file_open_op.open();
+    try rsp.init(self.arena, self.req);
+    if (rsp.fsr) |fsr| {
+        try self.file_open_op.prep(fsr.dir, fsr.path);
+    }
+    try self.header_send_op.prep(rsp.header, rsp.hasBody());
 }
 
 fn onOpen(ptr: *FileOpen, res: anyerror!fd_t) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("file_open_op", ptr));
-    const fd = res catch |err| {
-        log.warn("connection file open '{s}' failed {}", .{ ptr.path, err });
-        try self.deinit();
+    self.file_open_res = res;
+    try self.sendfile();
+}
+
+fn onHeader(ptr: *SendBytes, res: anyerror!void) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("header_send_op", ptr));
+    self.send_header_res = res;
+    try self.sendfile();
+}
+
+fn sendfile(self: *Connection) !void {
+    if (self.header_send_op.active() or self.file_open_op.active()) {
+        return;
+    }
+    self.send_header_res.? catch {
+        try self.shutdown();
         return;
     };
-    const rsp = &self.rsp;
-    try rsp.init(self.arena, self.req, fd);
+    if (self.file_open_res) |res| {
+        const fd = res catch {
+            try self.shutdown();
+            return;
+        };
+        assert(self.sendfile_op.file_fd == -1);
+        try self.sendfile_op.prep(
+            fd,
+            try self.server.pipes.get(self.rsp.bodySize()),
+            self.rsp.bodySize(),
+        );
+        return;
+    }
+    assert(self.rsp.fsr == null);
+    try self.done();
+}
 
-    self.header_send_op = .{
-        .io = self.io,
-        .fd = self.fd,
-        .buffer = rsp.header,
-        .more = rsp.hasBody(),
-        .callback = onHeader,
+fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", ptr));
+    res catch {
+        // pipe can be unusable after broken pipe
+        // don't reuse it
+        self.server.pipes.broken(ptr.pipe);
+        try self.shutdown();
+        return;
     };
-    try self.header_send_op.send();
+    try self.server.pipes.put(ptr.pipe);
+    self.server.metric.files.count +%= 1;
+    self.server.metric.files.bytes +%= ptr.size;
+    self.server.metric.files.sendfile_more +%= ptr.metric_short_send;
+    try self.done();
+}
+
+// Response sent
+fn done(self: *Connection) !void {
+    const rsp = &self.rsp;
     log.debug(
         "{} {s} '{s}' {}/{} {s}",
         .{
@@ -134,74 +185,25 @@ fn onOpen(ptr: *FileOpen, res: anyerror!fd_t) !void {
             @tagName(rsp.contentEncoding()),
         },
     );
-}
 
-fn onHeader(ptr: *SendBytes, res: anyerror!void) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("header_send_op", ptr));
-    res catch {
-        try self.deinit();
-        return;
-    };
-    const rsp = &self.rsp;
-    if (!rsp.hasBody()) {
-        try self.done();
-        return;
-    }
-    // send file
-    assert(self.pipe == null);
-    self.pipe = try self.server.pipes.get(rsp.bodySize());
-    self.sendfile_op = .{
-        .io = self.io,
-        .conn_fd = self.fd,
-        .file_fd = rsp.fd,
-        .pipe = self.pipe.?,
-        .size = rsp.bodySize(),
-        .callback = onSendfile,
-    };
-    try self.sendfile_op.send();
-}
-
-fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", ptr));
-    res catch {
-        if (self.pipe) |pipe| {
-            // pipe can be unusable after broken pipe
-            // don't reuse it
-            self.server.pipes.broken(pipe);
-            self.pipe = null;
-        }
-        try self.deinit();
-        return;
-    };
-    self.server.metric.files.count +%= 1;
-    self.server.metric.files.bytes +%= ptr.size;
-    self.server.metric.files.sendfile_more +%= ptr.metric_short_send;
-    try self.done();
-}
-
-// Response sent
-fn done(self: *Connection) !void {
     if (self.req.keep_alive) {
-        try self.clear();
-        try self.recv();
+        try self.reset();
+        try self.readRequest();
         return;
     }
-    try self.deinit();
+    try self.shutdown();
 }
 
-fn clear(self: *Connection) !void {
-    if (self.pipe) |pipe| {
-        try self.server.pipes.put(pipe);
-        self.pipe = null;
-    }
-    if (self.rsp.fd >= 0) {
-        try self.io.close(self.rsp.fd);
-        self.rsp.fd = -1;
+fn reset(self: *Connection) !void {
+    if (self.sendfile_op.file_fd >= 0) {
+        try self.io.close(self.sendfile_op.file_fd);
+        self.sendfile_op.file_fd = -1;
     }
     _ = self.arena_instance.reset(.free_all);
     self.req = .{};
     self.rsp = .{};
-    self.file_stat_op = undefined;
+    self.file_open_res = null;
+    self.send_header_res = null;
 }
 
 pub fn close(self: *Connection) !void {
@@ -211,13 +213,14 @@ pub fn close(self: *Connection) !void {
     }
 }
 
-fn deinit(self: *Connection) !void {
-    try self.clear();
+fn shutdown(self: *Connection) !void {
+    try self.reset();
 
     if (self.protocol == .https) {
         try self.io.tlsCloseNotify(self.fd);
     }
     try self.io.close(self.fd);
+
     self.arena_instance.deinit();
     self.recv_op.deinit();
     self.server.destroy(self);
@@ -279,7 +282,7 @@ const Request = struct {
 
 const Response = struct {
     fd: fd_t = -1,
-    file: ?File = null,
+    fsr: ?FileStat.Result = null,
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
@@ -290,16 +293,13 @@ const Response = struct {
         rsp.* = .{};
     }
 
-    fn init(rsp: *Response, allocator: Allocator, req: Request, fd: fd_t) !void {
-        assert(rsp.fd == -1);
-        if (fd == -1) {
+    fn init(rsp: *Response, allocator: Allocator, req: Request) !void {
+        if (rsp.fsr == null) {
             rsp.status = .not_found;
             rsp.header = try notFound(allocator, req.keep_alive);
             return;
         }
-        rsp.fd = fd;
-        const stat = rsp.file.?.stat;
-
+        const stat = rsp.fsr.?.stat;
         switch (stat.kind) {
             .file, .sym_link => {
                 if (etagMatch(stat, req)) {
@@ -307,7 +307,7 @@ const Response = struct {
                     rsp.header = try notModified(allocator, stat, req.keep_alive);
                 } else {
                     rsp.status = .ok;
-                    rsp.header = try ok(allocator, stat, req.path, rsp.file.?.encoding, req.keep_alive);
+                    rsp.header = try ok(allocator, stat, req.path, rsp.fsr.?.encoding, req.keep_alive);
                 }
             },
             .directory => {
@@ -331,12 +331,12 @@ const Response = struct {
     }
 
     fn bodySize(rsp: Response) usize {
-        if (rsp.file) |f| return f.stat.size;
+        if (rsp.fsr) |f| return f.stat.size;
         return 0;
     }
 
     fn contentEncoding(rsp: Response) ContentEncoding {
-        if (rsp.file) |f| return f.encoding;
+        if (rsp.fsr) |f| return f.encoding;
         return .plain;
     }
 
@@ -510,56 +510,46 @@ const ContentEncoding = enum {
     }
 };
 
-const File = struct {
-    dir: fs.Dir,
-    path: [:0]const u8 = &.{},
-    stat: fs.File.Stat,
-    encoding: ContentEncoding,
-};
-
-const FileStatPool = struct {
+const FileStat = struct {
     const Self = @This();
 
-    files: []FileStat = &.{},
-    join_count: usize = 0,
-    callback: *const fn (*Self, anyerror!File) anyerror!void,
+    const Result = struct {
+        dir: fs.Dir,
+        path: [:0]const u8 = &.{},
+        stat: fs.File.Stat,
+        encoding: ContentEncoding,
+    };
 
-    fn init(
-        self: *Self,
-        allocator: Allocator,
-        io: *Io,
-        root: fs.Dir,
-        cache: fs.Dir,
-        path: []const u8,
-        encodings: []const ContentEncoding,
-        callback: *const fn (*Self, anyerror!File) anyerror!void,
-    ) !void {
-        self.* = .{
-            .callback = callback,
-            .files = try allocator.alloc(FileStat, encodings.len),
-            .join_count = encodings.len,
-        };
+    io: *Io,
+    completion: Io.Completion = .{},
+    callback: *const fn (*Self, anyerror!Result) anyerror!void,
+    root: fs.Dir,
+    cache: fs.Dir,
+
+    ops: []Op = &.{},
+    join_count: usize = 0,
+
+    fn prep(self: *Self, allocator: Allocator, path: []const u8, encodings: []const ContentEncoding) !void {
+        self.ops = try allocator.alloc(Op, encodings.len);
+        self.join_count = encodings.len;
 
         for (encodings, 0..) |encoding, i| {
-            self.files[i] = .{
-                .io = io,
-                .dir = if (encoding == .plain) root else cache,
+            self.ops[i] = .{
+                .parent = self,
+                .dir = if (encoding == .plain) self.root else self.cache,
                 .encoding = encoding,
-                .ptr = self,
-                .callback = join,
                 .path = try mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
             };
-            try (&self.files[i]).stat();
+            try (&self.ops[i]).prep();
         }
     }
 
-    fn join(ptr: *anyopaque) !void {
-        const self: *Self = @ptrCast(@alignCast(ptr));
+    fn join(self: *Self) !void {
         self.join_count -= 1;
         if (self.join_count > 0)
             return;
 
-        const plain = self.files[0];
+        const plain = self.ops[0];
         assert(plain.encoding == .plain);
         if (plain.err) |e| {
             try self.callback(self, e);
@@ -569,7 +559,7 @@ const FileStatPool = struct {
 
         // find best match, shortest one
         var idx: usize = 0;
-        for (self.files, 0..) |stat, i| {
+        for (self.ops, 0..) |stat, i| {
             if (stat.err != null) {
                 continue;
             }
@@ -578,61 +568,56 @@ const FileStatPool = struct {
             if (!(mtime.sec == plain_mtime.sec and mtime.nsec == mtime.nsec)) {
                 continue;
             }
-            if (stat.statx.size < self.files[idx].statx.size) {
+            if (stat.statx.size < self.ops[idx].statx.size) {
                 idx = i;
             }
         }
-        const match = &self.files[idx];
+        const match = &self.ops[idx];
 
-        const res: File = .{
+        try self.callback(self, .{
             .dir = match.dir,
             .path = match.path,
             .encoding = match.encoding,
             .stat = fs.File.Stat.fromLinux(match.statx),
-        };
-        try self.callback(self, res);
+        });
     }
 
     fn deinit(self: *Self, allocator: Allocator) void {
-        if (self.files.len == 0) return;
-        for (self.files) |f| {
+        if (self.ops.len == 0) return;
+        for (self.ops) |f| {
             allocator.free(f.path);
         }
-        allocator.free(self.files);
-        self.files = &.{};
-    }
-};
-
-const FileStat = struct {
-    const Self = @This();
-
-    io: *Io,
-    dir: fs.Dir,
-    path: [:0]const u8 = &.{},
-    statx: linux.Statx = mem.zeroes(linux.Statx),
-    completion: Io.Completion = .{},
-    err: ?anyerror = null,
-    encoding: ContentEncoding,
-    ptr: *anyopaque,
-    callback: *const fn (*anyopaque) anyerror!void,
-
-    fn stat(self: *Self) !void {
-        try self.io.statx(&self.completion, onStat, self.dir.fd, self.path, &self.statx);
+        allocator.free(self.ops);
+        self.ops = &.{};
     }
 
-    fn onStat(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
-        _ = Io.result(cqe) catch |err| switch (err) {
-            error.SignalInterrupt => {
-                try self.stat();
-                return;
-            },
-            else => {
-                self.err = err;
-            },
-        };
-        try self.callback(self.ptr);
-    }
+    const Op = struct {
+        parent: *FileStat,
+        completion: Io.Completion = .{},
+        dir: fs.Dir,
+        path: [:0]const u8 = &.{},
+        encoding: ContentEncoding,
+        statx: linux.Statx = mem.zeroes(linux.Statx),
+        err: ?anyerror = null,
+
+        fn prep(op: *Op) !void {
+            try op.parent.io.statx(&op.completion, onComplete, op.dir.fd, op.path, &op.statx);
+        }
+
+        fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+            const op: *Op = @alignCast(@fieldParentPtr("completion", completion));
+            _ = Io.result(cqe) catch |err| switch (err) {
+                error.SignalInterrupt => {
+                    try op.prep();
+                    return;
+                },
+                else => {
+                    op.err = err;
+                },
+            };
+            try op.parent.join();
+        }
+    };
 };
 
 pub fn compressible(file_name: []const u8) bool {
@@ -669,17 +654,17 @@ const RequestRecv = struct {
     fd: fd_t,
     callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
 
-    fn recv(self: *Self) !void {
-        try self.io.recvProvided(&self.completion, Self.onRecv, self.fd, &self.recv_timeout);
+    pub fn prep(self: *Self) !void {
+        try self.io.recvProvided(&self.completion, onComplete, self.fd, &self.recv_timeout);
     }
 
-    fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
         const n = Io.result(cqe) catch |err| {
             switch (err) {
                 error.SignalInterrupt, error.NoBufferSpaceAvailable => {
                     log.debug("connection recv retry on {}", .{err});
-                    try self.recv();
+                    try self.prep();
                     return;
                 },
                 error.OperationCanceled, // timeout or server close
@@ -707,18 +692,19 @@ const RequestRecv = struct {
                 return;
             }
             try self.short_recv.set(self.allocator, recv_buf);
-            try self.recv();
+            try self.prep();
             return;
         }
-        try self.short_recv.set(self.allocator, recv_buf[header_len..]);
+
         try self.callback(self, recv_buf[0..header_len]);
+        try self.short_recv.set(self.allocator, recv_buf[header_len..]);
     }
 
-    fn active(self: *Self) bool {
+    pub fn active(self: *Self) bool {
         return self.completion.active();
     }
 
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         self.short_recv.deinit(self.allocator);
     }
 };
@@ -784,37 +770,41 @@ const FileOpen = struct {
 
     completion: Io.Completion = .{},
     io: *Io,
-    dir: fs.Dir,
-    path: [:0]const u8,
     callback: *const fn (*Self, anyerror!fd_t) anyerror!void,
 
-    fn open(self: *Self) !void {
-        try self.io.openRead(&self.completion, Self.onOpen, self.dir.fd, self.path, null);
+    dir: fs.Dir = undefined,
+    path: [:0]const u8 = undefined,
+
+    pub fn prep(self: *Self, dir: fs.Dir, path: [:0]const u8) !void {
+        self.dir = dir;
+        self.path = path;
+        try self.open();
     }
 
-    fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn open(self: *Self) !void {
+        try self.io.openRead(&self.completion, onComplete, self.dir.fd, self.path, null);
+    }
+
+    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
 
-        const fd = Io.result(cqe) catch |err| brk: {
+        const fd = Io.result(cqe) catch |err| {
             switch (err) {
-                error.NoSuchFileOrDirectory => {
-                    break :brk -1;
-                },
-                error.SignalInterrupt => {
-                    try self.open();
-                },
+                error.SignalInterrupt => try self.open(),
                 error.FileTableOverflow => {
                     log.warn("connection file open '{s}' retry on {}", .{ self.path, err });
                     try self.open();
                 },
-                else => {
-                    try self.callback(self, err);
-                },
+                else => try self.callback(self, err),
             }
             return;
         };
 
         try self.callback(self, fd);
+    }
+
+    pub fn active(self: *Self) bool {
+        return self.completion.active();
     }
 };
 
@@ -822,18 +812,26 @@ const SendBytes = struct {
     const Self = @This();
 
     io: *Io,
+    callback: *const fn (*Self, anyerror!void) anyerror!void,
     completion: Io.Completion = .{},
     fd: fd_t,
-    buffer: []const u8,
-    offset: usize = 0,
-    more: bool,
-    callback: *const fn (*Self, anyerror!void) anyerror!void,
 
-    fn send(self: *Self) !void {
-        try self.io.send(&self.completion, Self.onSend, self.fd, self.buffer[self.offset..], .{ .more = self.more });
+    buffer: []const u8 = undefined,
+    more: bool = false,
+    offset: usize = 0,
+
+    fn prep(self: *Self, buffer: []const u8, more: bool) !void {
+        self.buffer = buffer;
+        self.more = more;
+        self.offset = 0;
+        try self.send();
     }
 
-    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn send(self: *Self) !void {
+        try self.io.send(&self.completion, onComplete, self.fd, self.buffer[self.offset..], .{ .more = self.more });
+    }
+
+    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
         self.offset += @intCast(Io.result(cqe) catch |err| brk: {
             switch (err) {
@@ -852,6 +850,10 @@ const SendBytes = struct {
 
         try self.callback(self, {});
     }
+
+    pub fn active(self: *Self) bool {
+        return self.completion.active();
+    }
 };
 
 const Sendfile = struct {
@@ -859,18 +861,28 @@ const Sendfile = struct {
 
     io: *Io,
     completion: Io.Completion = .{},
-    conn_fd: fd_t,
-    file_fd: fd_t,
-    pipe: Server.Pipe,
-    size: usize,
-    offset: usize = 0,
     callback: *const fn (*Self, anyerror!void) anyerror!void,
+
+    conn_fd: fd_t,
+    file_fd: fd_t = -1,
+    pipe: Server.Pipe = .{},
+    size: usize = 0,
+
+    offset: usize = 0,
     metric_short_send: usize = 0,
+
+    pub fn prep(self: *Self, file_fd: fd_t, pipe: Server.Pipe, size: usize) !void {
+        self.file_fd = file_fd;
+        self.pipe = pipe;
+        self.size = size;
+        self.offset = 0;
+        try self.send();
+    }
 
     fn send(self: *Self) !void {
         try self.io.sendfile(
             &self.completion,
-            Self.onSend,
+            onComplete,
             self.conn_fd,
             self.file_fd,
             self.pipe.fds,
@@ -879,7 +891,7 @@ const Sendfile = struct {
         );
     }
 
-    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
         self.offset += @intCast(Io.result(cqe) catch |err| brk: {
             switch (err) {
@@ -897,5 +909,9 @@ const Sendfile = struct {
             return;
         }
         try self.callback(self, {});
+    }
+
+    pub fn active(self: Self) bool {
+        return self.completion.active();
     }
 };
