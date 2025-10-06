@@ -17,6 +17,7 @@ const toLastModified = @import("time.zig").toLastModified;
 const Connection = @This();
 const keepalive_timeout = 30;
 const max_header_size = 8192;
+const max_retries = 1024;
 
 server: *Server,
 gpa: Allocator,
@@ -76,7 +77,7 @@ pub fn init(self: *Connection) !void {
 
 fn readRequest(self: *Connection) !void {
     if (self.server.closing()) {
-        try self.shutdown();
+        try self.shutdown(null);
         return;
     }
     try self.recv_op.prep();
@@ -85,15 +86,8 @@ fn readRequest(self: *Connection) !void {
 /// res is http header bytes or error
 fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("recv_op", ptr));
-    const bytes = res catch {
-        try self.shutdown();
-        return;
-    };
-    self.req = Request.parse(self.arena, bytes) catch |err| {
-        log.debug("{} request parse {}\n{s}\n{x}\n", .{ self.fd, err, bytes, bytes });
-        try self.shutdown();
-        return;
-    };
+    const bytes = res catch |err| return try self.shutdown(err);
+    self.req = Request.parse(self.arena, bytes) catch |err| return try self.shutdown(err);
     try self.file_stat_op.prep(
         self.arena,
         self.req.path,
@@ -106,10 +100,7 @@ fn onFileStat(ptr: *FileStat, res: anyerror!FileStat.Result) !void {
     const rsp = &self.rsp;
     rsp.fsr = res catch |err| brk: switch (err) {
         error.NoSuchFileOrDirectory => break :brk null,
-        else => {
-            try self.shutdown();
-            return;
-        },
+        else => return try self.shutdown(err),
     };
     try rsp.init(self.arena, self.req);
     if (rsp.fsr) |fsr| {
@@ -134,15 +125,10 @@ fn sendfile(self: *Connection) !void {
     if (self.header_send_op.active() or self.file_open_op.active()) {
         return;
     }
-    self.send_header_res.? catch {
-        try self.shutdown();
-        return;
-    };
+    self.send_header_res.? catch |err| return try self.shutdown(err);
+
     if (self.file_open_res) |res| {
-        const fd = res catch {
-            try self.shutdown();
-            return;
-        };
+        const fd = res catch |err| return try self.shutdown(err);
         assert(self.sendfile_op.file_fd == -1);
         try self.sendfile_op.prep(
             fd,
@@ -157,11 +143,11 @@ fn sendfile(self: *Connection) !void {
 
 fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", ptr));
-    res catch {
+    res catch |err| {
         // pipe can be unusable after broken pipe
         // don't reuse it
         self.server.pipes.broken(ptr.pipe);
-        try self.shutdown();
+        try self.shutdown(err);
         return;
     };
     try self.server.pipes.put(ptr.pipe);
@@ -171,7 +157,7 @@ fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
     try self.done();
 }
 
-// Response sent
+/// Done sending response
 fn done(self: *Connection) !void {
     const rsp = &self.rsp;
     log.debug(
@@ -191,9 +177,10 @@ fn done(self: *Connection) !void {
         try self.readRequest();
         return;
     }
-    try self.shutdown();
+    try self.shutdown(null);
 }
 
+/// Prepare conenction for next request
 fn reset(self: *Connection) !void {
     if (self.sendfile_op.file_fd >= 0) {
         try self.io.close(self.sendfile_op.file_fd);
@@ -206,14 +193,20 @@ fn reset(self: *Connection) !void {
     self.send_header_res = null;
 }
 
-pub fn close(self: *Connection) !void {
-    // Cancel if receiving, else wait for pending operations
-    if (self.recv_op.active()) {
-        try self.io.cancel(self.fd);
-    }
-}
-
-fn shutdown(self: *Connection) !void {
+fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
+    if (maybe_err) |err| switch (err) {
+        // timeout or server close
+        error.OperationCanceled,
+        // clean tcp connection close
+        error.EndOfFile,
+        error.EndOfStream,
+        // broken tcp connection
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.IOError,
+        => {},
+        else => log.warn("{} failed {}", .{ self.fd, err }), // unexpected error
+    };
     try self.reset();
 
     if (self.protocol == .https) {
@@ -224,6 +217,14 @@ fn shutdown(self: *Connection) !void {
     self.arena_instance.deinit();
     self.recv_op.deinit();
     self.server.destroy(self);
+}
+
+/// External close request
+pub fn close(self: *Connection) !void {
+    // Cancel if receiving, else wait for pending operations
+    if (self.recv_op.active()) {
+        try self.io.cancel(self.fd);
+    }
 }
 
 const Request = struct {
@@ -653,6 +654,7 @@ const RequestRecv = struct {
     io: *Io,
     fd: fd_t,
     callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
+    no_buf_retries: usize = 0,
 
     pub fn prep(self: *Self) !void {
         try self.io.recvProvided(&self.completion, onComplete, self.fd, &self.recv_timeout);
@@ -662,18 +664,14 @@ const RequestRecv = struct {
         const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
         const n = Io.result(cqe) catch |err| {
             switch (err) {
-                error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                    log.debug("connection recv retry on {}", .{err});
+                error.SignalInterrupt => try self.prep(),
+                error.NoBufferSpaceAvailable => {
+                    self.no_buf_retries += 1;
+                    if (self.no_buf_retries > max_retries) return try self.callback(self, err);
                     try self.prep();
-                    return;
                 },
-                error.OperationCanceled, // timeout or server close
-                error.IOError,
-                error.ConnectionResetByPeer, // connection closed
-                => {},
-                else => log.warn("connection recv failed {}", .{err}), // unexpected
+                else => try self.callback(self, err),
             }
-            try self.callback(self, err);
             return;
         };
         if (n == 0) {
@@ -696,6 +694,7 @@ const RequestRecv = struct {
             return;
         }
 
+        self.no_buf_retries = 0;
         try self.callback(self, recv_buf[0..header_len]);
         try self.short_recv.set(self.allocator, recv_buf[header_len..]);
     }
@@ -774,14 +773,16 @@ const FileOpen = struct {
 
     dir: fs.Dir = undefined,
     path: [:0]const u8 = undefined,
+    fd_retries: usize = 0,
 
     pub fn prep(self: *Self, dir: fs.Dir, path: [:0]const u8) !void {
         self.dir = dir;
         self.path = path;
-        try self.open();
+        self.fd_retries = 0;
+        try self.prepIo();
     }
 
-    fn open(self: *Self) !void {
+    fn prepIo(self: *Self) !void {
         try self.io.openRead(&self.completion, onComplete, self.dir.fd, self.path, null);
     }
 
@@ -790,10 +791,11 @@ const FileOpen = struct {
 
         const fd = Io.result(cqe) catch |err| {
             switch (err) {
-                error.SignalInterrupt => try self.open(),
+                error.SignalInterrupt => try self.prepIo(),
                 error.FileTableOverflow => {
-                    log.warn("connection file open '{s}' retry on {}", .{ self.path, err });
-                    try self.open();
+                    self.fd_retries += 1;
+                    if (self.fd_retries > max_retries) return try self.callback(self, err);
+                    try self.prepIo();
                 },
                 else => try self.callback(self, err),
             }
@@ -824,10 +826,10 @@ const SendBytes = struct {
         self.buffer = buffer;
         self.more = more;
         self.offset = 0;
-        try self.send();
+        try self.prepIo();
     }
 
-    fn send(self: *Self) !void {
+    fn prepIo(self: *Self) !void {
         try self.io.send(&self.completion, onComplete, self.fd, self.buffer[self.offset..], .{ .more = self.more });
     }
 
@@ -836,18 +838,11 @@ const SendBytes = struct {
         self.offset += @intCast(Io.result(cqe) catch |err| brk: {
             switch (err) {
                 error.SignalInterrupt => break :brk 0,
-                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
-                else => log.info("connection header send failed {}", .{err}),
+                else => return try self.callback(self, err),
             }
-            try self.callback(self, err);
-            return;
         });
-        if (self.offset < self.buffer.len) {
-            // short send send more
-            try self.send();
-            return;
-        }
-
+        // short send send more
+        if (self.offset < self.buffer.len) return try self.prepIo();
         try self.callback(self, {});
     }
 
@@ -876,10 +871,10 @@ const Sendfile = struct {
         self.pipe = pipe;
         self.size = size;
         self.offset = 0;
-        try self.send();
+        try self.prepIo();
     }
 
-    fn send(self: *Self) !void {
+    fn prepIo(self: *Self) !void {
         try self.io.sendfile(
             &self.completion,
             onComplete,
@@ -896,16 +891,12 @@ const Sendfile = struct {
         self.offset += @intCast(Io.result(cqe) catch |err| brk: {
             switch (err) {
                 error.SignalInterrupt => break :brk 0,
-                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
-                else => log.warn("sendfile failed {}", .{err}),
+                else => return try self.callback(self, err),
             }
-            try self.callback(self, err);
-            return;
         });
-        if (self.offset < self.size) {
-            // short send, send the rest of the file
+        if (self.offset < self.size) { // short send, send the rest of the file
             self.metric_short_send += 1;
-            try self.send();
+            try self.prepIo();
             return;
         }
         try self.callback(self, {});

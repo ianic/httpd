@@ -69,17 +69,16 @@ Example of `script/bench.sh` results running both server and oha benchmark tool 
 HTTP
 |      | 1 close   | 1         | 100       | 500       |
 | :--- | ---:      | ---:      | ---:      | ---:      |
-|httpd | 15984     | 25325     |130578     | 87364     |
-|Nginx | 20077     | 31750     | 55177     | 53746     |
+|httpd | 19347     | 32308     | 146916    | 90950     |
+|Nginx | 22754     | 40951     |  66906    | 64209     |
                                            
 HTTPS                                      
 |      | 1 close   | 1         | 100       | 500       |
 | :--- | ---:      | ---:      | ---:      | ---:      |
-|httpd |  1719     | 12016     | 72463     | 53671     | 
-|Nginx |  1860     | 13935     | 18391     | 17822     |
+|httpd |  1799     | 14025     |  81487    | 60258     |
+|Nginx |  2044     | 16608     |  19848    | 18491     |
 
-
-
+                
 <!--
 
 - sets and checks Etag, returns 304 if they match
