@@ -5,8 +5,20 @@ HTTP/HTTPS static file server in Zig
 - Linux only, uses Linux specific io_uring and kernel TLS
 - min Linux kernel version is 6.12. io_uring is not supported at old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
 - should be build with latest master Zig
-- single threaded
 
+## Example
+
+Run `script/site.sh`, that will checkout an example site (ziglang.org), create https authority and site certificate, build project, ask sudo pwd to enable kernel tls if module not loaded and start httpd. 
+
+To run httpd in release mode with some higher resources and precompressed site files run `script/start.sh`. You can stress test with something like: 
+
+```sh
+ulimit -n 65535
+script/targets.sh http 8080 && oha -z 60s --urls-from-file site/targets-oha -c 10000 -w --cacert site/ca/cert.pem
+```
+`script/targets.sh` will create oha targets file for all files in site/root so requests are made for each file in the site. 
+
+To remove browser https certificate error add certificate authority to trusted with `script/trust_ca.sh` (works on Arch Linux, not tested on others).
 
 ## Precompress files
 
@@ -26,7 +38,6 @@ $ httpd --root site/root --cache site/cache --cert site/cert_ec
 ```
 Client will be served with best match. Shortest file in format which is supported by the client. 
 
-
 ## Kernel TLS
 
 ```sh
@@ -40,18 +51,6 @@ sudo modprobe tls
 # cat /etc/modules-load.d/gnutls.conf
 echo tls | sudo tee /etc/modules-load.d/gnutls.conf
 ```
-
-## Example
-
-Run `script/site.sh`, that will checkout an example site (ziglang.org), create https authority and site certificate, build project and start httpd listening for http on port 8080 and for https on port 8443.
-
-To run httpd in release mode with some higher resources and precompressed site files run `script/start.sh`. You can stress test with something like: 
-
-```sh
-ulimit -n 65535
-script/targets.sh http 8080 && oha -z 60s --urls-from-file site/targets-oha -c 10000 -w --cacert site/ca/cert.pem
-```
-`script/targets.sh` will create oha targets file for all files in site/root so requests are made for each file in the site. 
 
 
 ## Benchmark

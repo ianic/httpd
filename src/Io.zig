@@ -45,11 +45,11 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.count,
     );
     close_notify.init();
-    //if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
-    log.debug(
-        "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
-        .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
-    );
+    // if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
+    //     log.debug(
+    //         "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
+    //         .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
+    //     );
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
