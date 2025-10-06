@@ -22,25 +22,32 @@ server: *Server,
 gpa: Allocator,
 io: *Io,
 fd: fd_t,
-completion: Io.Completion = .{},
-short_recv: ShortRecvBuffer = .{},
-recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
 protocol: Server.Protocol = .http,
 pipe: ?Server.Pipe = null, // for sendfile
-offset: usize = 0, // header/body send offset
-req: Request = .{},
-rsp: Response = .{},
-fs_pool: FileStatPool = undefined,
 arena_instance: std.heap.ArenaAllocator = undefined,
 arena: Allocator = undefined,
 
-fn parentPtr(completion: *Io.Completion) *Connection {
-    return @alignCast(@fieldParentPtr("completion", completion));
-}
+// http request and respone
+req: Request = .{},
+rsp: Response = .{},
+
+// io operations
+recv_op: RequestRecv = undefined,
+file_stat_op: FileStatPool = undefined,
+file_open_op: FileOpen = undefined,
+header_send_op: SendBytes = undefined,
+sendfile_op: Sendfile = undefined,
 
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
     self.arena = self.arena_instance.allocator();
+
+    self.recv_op = .{
+        .allocator = self.gpa,
+        .io = self.io,
+        .fd = self.fd,
+        .callback = onRequest,
+    };
     try self.recv();
 }
 
@@ -49,68 +56,38 @@ fn recv(self: *Connection) !void {
         try self.deinit();
         return;
     }
-    try self.io.recvProvided(&self.completion, onRecv, self.fd, &self.recv_timeout);
+    try self.recv_op.recv();
 }
 
-fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const n = Io.result(cqe) catch |err| brk: {
-        switch (err) {
-            error.SignalInterrupt, error.NoBufferSpaceAvailable => {
-                log.debug("connection recv retry on {}", .{err});
-                try self.recv();
-                return;
-            },
-            error.OperationCanceled => {}, // timeout or server close
-            error.IOError, error.ConnectionResetByPeer => {}, // connection closed
-            else => log.warn("connection recv failed {}", .{err}), // unexpected
-        }
-        break :brk 0;
-    };
-    if (n == 0) { // eof
+/// res is http header bytes or error
+fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", ptr));
+    const bytes = res catch {
         try self.deinit();
         return;
-    }
-
-    const recv_buf = try self.short_recv.append(self.gpa, try self.io.getProvidedBuffer(cqe));
-    const mreq = Request.parse(self.arena, recv_buf) catch |err| {
+    };
+    self.req = Request.parse(self.arena, bytes) catch |err| {
         log.debug("connection request parse {}", .{err});
-        self.io.putProvidedBuffer(cqe);
         try self.deinit();
         return;
     };
-    self.io.putProvidedBuffer(cqe);
-    try self.short_recv.set(self.gpa, recv_buf[if (mreq) |r| r.size else 0..]);
-
-    if (mreq) |req| {
-        self.req = req;
-        try self.fs_pool.init(
-            self,
-            onFile,
-            self.arena,
-            self.io,
-            self.server.root,
-            self.server.cache,
-            req.path,
-            req.accept_encoding orelse &[_]ContentEncoding{.plain},
-        );
-        return;
-    }
-    if (self.short_recv.buffer.len >= max_header_size) {
-        try self.deinit();
-        return;
-    }
-    try self.recv();
+    try self.file_stat_op.init(
+        self.arena,
+        self.io,
+        self.server.root,
+        self.server.cache,
+        self.req.path,
+        self.req.accept_encoding orelse &[_]ContentEncoding{.plain},
+        onFileStat,
+    );
 }
 
-fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
-    const self: *Connection = @ptrCast(@alignCast(ptr));
-    const rsp = &self.rsp;
-    rsp.file = res catch |err| switch (err) {
+fn onFileStat(ptr: *FileStatPool, res: anyerror!File) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("file_stat_op", ptr));
+
+    const file = res catch |err| switch (err) {
         error.NoSuchFileOrDirectory => {
-            //TODO: rethinkg
-            try rsp.init(self.arena, self.req, -1);
-            try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
+            try onOpen(&self.file_open_op, -1);
             return;
         },
         else => {
@@ -118,38 +95,34 @@ fn onFile(ptr: *anyopaque, res: anyerror!File) !void {
             return;
         },
     };
-    try self.open();
+    self.rsp.file = file;
+    self.file_open_op = .{
+        .io = self.io,
+        .dir = file.dir,
+        .path = file.path,
+        .callback = onOpen,
+    };
+    try self.file_open_op.open();
 }
 
-fn open(self: *Connection) !void {
-    const file = self.rsp.file.?;
-    try self.io.openRead(&self.completion, onOpen, file.dir.fd, file.path, null);
-}
-
-fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const rsp = &self.rsp;
-    const fd = Io.result(cqe) catch |err| brk: {
-        switch (err) {
-            error.NoSuchFileOrDirectory => {
-                break :brk -1;
-            },
-            error.SignalInterrupt => {
-                try self.open();
-            },
-            error.FileTableOverflow => {
-                log.warn("connection file open '{s}' retry on {}", .{ self.req.path, err });
-                try self.open();
-            },
-            else => {
-                log.warn("connection file open '{s}' failed {}", .{ self.req.path, err });
-                try self.deinit();
-            },
-        }
+fn onOpen(ptr: *FileOpen, res: anyerror!fd_t) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("file_open_op", ptr));
+    const fd = res catch |err| {
+        log.warn("connection file open '{s}' failed {}", .{ ptr.path, err });
+        try self.deinit();
         return;
     };
+    const rsp = &self.rsp;
     try rsp.init(self.arena, self.req, fd);
-    try self.io.send(&self.completion, onHeader, self.fd, rsp.header, .{ .more = rsp.hasBody() });
+
+    self.header_send_op = .{
+        .io = self.io,
+        .fd = self.fd,
+        .buffer = rsp.header,
+        .more = rsp.hasBody(),
+        .callback = onHeader,
+    };
+    try self.header_send_op.send();
     log.debug(
         "{} {s} '{s}' {}/{} {s}",
         .{
@@ -163,57 +136,46 @@ fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     );
 }
 
-fn onHeader(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const rsp = &self.rsp;
-    self.offset += @intCast(Io.result(cqe) catch |err| brk: {
-        switch (err) {
-            error.SignalInterrupt => break :brk 0,
-            error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.info("connection header send failed {}", .{err}),
-        }
+fn onHeader(ptr: *SendBytes, res: anyerror!void) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("header_send_op", ptr));
+    res catch {
         try self.deinit();
         return;
-    });
-    if (self.offset < rsp.header.len) { // short send send more
-        try self.io.send(completion, onHeader, self.fd, rsp.header[self.offset..], .{ .more = rsp.hasBody() });
-        return;
-    }
-    self.offset = 0;
+    };
+    const rsp = &self.rsp;
     if (!rsp.hasBody()) {
         try self.done();
         return;
     }
     // send file
     assert(self.pipe == null);
-    self.pipe = try self.server.pipes.get(rsp.file.?.stat.size);
-    try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, 0, @intCast(rsp.file.?.stat.size));
+    self.pipe = try self.server.pipes.get(rsp.bodySize());
+    self.sendfile_op = .{
+        .io = self.io,
+        .conn_fd = self.fd,
+        .file_fd = rsp.fd,
+        .pipe = self.pipe.?,
+        .size = rsp.bodySize(),
+        .callback = onSendfile,
+    };
+    try self.sendfile_op.send();
 }
 
-fn onBody(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const rsp = &self.rsp;
-    self.offset += @intCast(Io.result(cqe) catch |err| brk: {
-        switch (err) {
-            error.SignalInterrupt => break :brk 0,
-            error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.info("connection body send failed {}", .{err}),
-        }
-        if (self.pipe) |pipe| { // pipe can be unusable after broken pipe
+fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", ptr));
+    res catch {
+        if (self.pipe) |pipe| {
+            // pipe can be unusable after broken pipe
+            // don't reuse it
             self.server.pipes.broken(pipe);
             self.pipe = null;
         }
         try self.deinit();
         return;
-    });
-    if (self.offset < rsp.file.?.stat.size) { // short send, send the rest of the file
-        const len = self.rsp.file.?.stat.size - self.offset;
-        try self.io.sendfile(completion, onBody, self.fd, rsp.fd, self.pipe.?.fds, @intCast(self.offset), @intCast(len));
-        self.server.metric.files.sendfile_more +%= 1;
-        return;
-    }
+    };
     self.server.metric.files.count +%= 1;
-    self.server.metric.files.bytes +%= rsp.file.?.stat.size;
+    self.server.metric.files.bytes +%= ptr.size;
+    self.server.metric.files.sendfile_more +%= ptr.metric_short_send;
     try self.done();
 }
 
@@ -232,7 +194,6 @@ fn clear(self: *Connection) !void {
         try self.server.pipes.put(pipe);
         self.pipe = null;
     }
-    self.offset = 0;
     if (self.rsp.fd >= 0) {
         try self.io.close(self.rsp.fd);
         self.rsp.fd = -1;
@@ -240,12 +201,12 @@ fn clear(self: *Connection) !void {
     _ = self.arena_instance.reset(.free_all);
     self.req = .{};
     self.rsp = .{};
-    self.fs_pool = undefined;
+    self.file_stat_op = undefined;
 }
 
 pub fn close(self: *Connection) !void {
-    // Cancel if receiving, else wait for send to finish
-    if (self.completion.active() and self.completion.callback == onRecv) {
+    // Cancel if receiving, else wait for pending operations
+    if (self.recv_op.active()) {
         try self.io.cancel(self.fd);
     }
 }
@@ -258,7 +219,7 @@ fn deinit(self: *Connection) !void {
     }
     try self.io.close(self.fd);
     self.arena_instance.deinit();
-    self.short_recv.deinit(self.gpa);
+    self.recv_op.deinit();
     self.server.destroy(self);
 }
 
@@ -269,17 +230,11 @@ const Request = struct {
         mtime: i128 = 0,
     } = .{},
     keep_alive: bool = false,
-    size: usize = 0, // size of the request in bytes, how much of recv_buf is used
     accept_encoding: ?[]ContentEncoding = null,
 
     /// Returns null if recv_buf doesn't hold full http request
-    fn parse(allocator: Allocator, recv_buf: []const u8) !?Request {
-        var hp: http.HeadParser = .{};
-        const size = hp.feed(recv_buf);
-        if (hp.state != .finished) {
-            return null;
-        }
-        const head = try Head.parse(recv_buf[0..size]);
+    fn parse(allocator: Allocator, buf: []const u8) !Request {
+        const head = try Head.parse(buf);
         const content_length: u64 = head.content_length orelse 0;
         if (!(head.method == .GET and content_length == 0)) {
             return error.BadRequest;
@@ -287,7 +242,6 @@ const Request = struct {
 
         var req: Request = .{
             .keep_alive = head.keep_alive,
-            .size = size,
         };
         if (head.etag) |et| { // parse etag
             var it = mem.splitScalar(u8, et, '-');
@@ -324,7 +278,6 @@ const Request = struct {
 };
 
 const Response = struct {
-    // statx: linux.Statx = mem.zeroes(linux.Statx),
     fd: fd_t = -1,
     file: ?File = null,
     status: http.Status = @enumFromInt(0),
@@ -485,62 +438,6 @@ const Response = struct {
     }
 };
 
-const ShortRecvBuffer = struct {
-    buffer: []u8 = &.{},
-    reset_buffer: []u8 = &.{},
-
-    fn append(self: *ShortRecvBuffer, allocator: Allocator, recv_buf: []const u8) ![]const u8 {
-        self.reset_buffer = self.buffer;
-        if (self.buffer.len == 0) {
-            // nothing to append to
-            return recv_buf;
-        }
-        if (recv_buf.len == 0) {
-            return self.buffer;
-        }
-        self.reset_buffer = self.buffer;
-        self.buffer = try allocator.alloc(u8, self.reset_buffer.len + recv_buf.len);
-        @memcpy(self.buffer[0..self.reset_buffer.len], self.reset_buffer);
-        @memcpy(self.buffer[self.reset_buffer.len..], recv_buf);
-        return self.buffer;
-    }
-
-    fn reset(self: *ShortRecvBuffer, allocator: Allocator) void {
-        allocator.free(self.buffer);
-        self.buffer = self.reset_buffer;
-        self.reset_buffer = &.{};
-    }
-
-    fn set(self: *ShortRecvBuffer, allocator: Allocator, unused: []const u8) !void {
-        if (self.reset_buffer.len > 0) {
-            @branchHint(.unlikely);
-            allocator.free(self.reset_buffer);
-            self.reset_buffer = &.{};
-        }
-        if (unused.len == 0) {
-            @branchHint(.likely);
-            if (self.buffer.len > 0) {
-                @branchHint(.unlikely);
-                allocator.free(self.buffer);
-                self.buffer = &.{};
-            }
-            return;
-        }
-        if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
-            return;
-        }
-        // unused is part of the self.buffer make copy before free
-        const copy = try allocator.dupe(u8, unused);
-        allocator.free(self.buffer);
-        self.buffer = copy;
-    }
-
-    fn deinit(self: *ShortRecvBuffer, allocator: Allocator) void {
-        allocator.free(self.buffer);
-        allocator.free(self.reset_buffer);
-    }
-};
-
 const ContentEncoding = enum {
     plain,
     gzip,
@@ -625,22 +522,19 @@ const FileStatPool = struct {
 
     files: []FileStat = &.{},
     join_count: usize = 0,
-    ptr: *anyopaque,
-    callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
+    callback: *const fn (*Self, anyerror!File) anyerror!void,
 
     fn init(
         self: *Self,
-        ptr: *anyopaque,
-        callback: *const fn (*anyopaque, anyerror!File) anyerror!void,
         allocator: Allocator,
         io: *Io,
         root: fs.Dir,
         cache: fs.Dir,
         path: []const u8,
         encodings: []const ContentEncoding,
+        callback: *const fn (*Self, anyerror!File) anyerror!void,
     ) !void {
         self.* = .{
-            .ptr = ptr,
             .callback = callback,
             .files = try allocator.alloc(FileStat, encodings.len),
             .join_count = encodings.len,
@@ -668,7 +562,7 @@ const FileStatPool = struct {
         const plain = self.files[0];
         assert(plain.encoding == .plain);
         if (plain.err) |e| {
-            try self.callback(self.ptr, e);
+            try self.callback(self, e);
             return;
         }
         const plain_mtime = plain.statx.mtime;
@@ -696,7 +590,7 @@ const FileStatPool = struct {
             .encoding = match.encoding,
             .stat = fs.File.Stat.fromLinux(match.statx),
         };
-        try self.callback(self.ptr, res);
+        try self.callback(self, res);
     }
 
     fn deinit(self: *Self, allocator: Allocator) void {
@@ -761,3 +655,247 @@ pub fn compressible(file_name: []const u8) bool {
     }
     return false;
 }
+
+/// io.recv into provided buffer, parse bytes into http request, handle
+/// interrupts, short reads, pipelining (multiple request in the buffer)
+const RequestRecv = struct {
+    const Self = @This();
+
+    completion: Io.Completion = .{},
+    recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
+    short_recv: ShortRecvBuffer = .{},
+    allocator: Allocator,
+    io: *Io,
+    fd: fd_t,
+    callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
+
+    fn recv(self: *Self) !void {
+        try self.io.recvProvided(&self.completion, Self.onRecv, self.fd, &self.recv_timeout);
+    }
+
+    fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
+        const n = Io.result(cqe) catch |err| {
+            switch (err) {
+                error.SignalInterrupt, error.NoBufferSpaceAvailable => {
+                    log.debug("connection recv retry on {}", .{err});
+                    try self.recv();
+                    return;
+                },
+                error.OperationCanceled, // timeout or server close
+                error.IOError,
+                error.ConnectionResetByPeer, // connection closed
+                => {},
+                else => log.warn("connection recv failed {}", .{err}), // unexpected
+            }
+            try self.callback(self, err);
+            return;
+        };
+        if (n == 0) {
+            try self.callback(self, error.EndOfStream);
+            return;
+        }
+
+        const recv_buf = try self.short_recv.append(self.allocator, try self.io.getProvidedBuffer(cqe));
+        defer self.io.putProvidedBuffer(cqe);
+
+        var hp: http.HeadParser = .{};
+        const header_len = hp.feed(recv_buf);
+        if (hp.state != .finished) {
+            if (recv_buf.len >= max_header_size) {
+                try self.callback(self, error.RequestBufferOverflow);
+                return;
+            }
+            try self.short_recv.set(self.allocator, recv_buf);
+            try self.recv();
+            return;
+        }
+        try self.short_recv.set(self.allocator, recv_buf[header_len..]);
+        try self.callback(self, recv_buf[0..header_len]);
+    }
+
+    fn active(self: *Self) bool {
+        return self.completion.active();
+    }
+
+    fn deinit(self: *Self) void {
+        self.short_recv.deinit(self.allocator);
+    }
+};
+
+const ShortRecvBuffer = struct {
+    buffer: []u8 = &.{},
+    reset_buffer: []u8 = &.{},
+
+    fn append(self: *ShortRecvBuffer, allocator: Allocator, recv_buf: []const u8) ![]const u8 {
+        self.reset_buffer = self.buffer;
+        if (self.buffer.len == 0) {
+            // nothing to append to
+            return recv_buf;
+        }
+        if (recv_buf.len == 0) {
+            return self.buffer;
+        }
+        self.reset_buffer = self.buffer;
+        self.buffer = try allocator.alloc(u8, self.reset_buffer.len + recv_buf.len);
+        @memcpy(self.buffer[0..self.reset_buffer.len], self.reset_buffer);
+        @memcpy(self.buffer[self.reset_buffer.len..], recv_buf);
+        return self.buffer;
+    }
+
+    fn reset(self: *ShortRecvBuffer, allocator: Allocator) void {
+        allocator.free(self.buffer);
+        self.buffer = self.reset_buffer;
+        self.reset_buffer = &.{};
+    }
+
+    fn set(self: *ShortRecvBuffer, allocator: Allocator, unused: []const u8) !void {
+        if (self.reset_buffer.len > 0) {
+            @branchHint(.unlikely);
+            allocator.free(self.reset_buffer);
+            self.reset_buffer = &.{};
+        }
+        if (unused.len == 0) {
+            @branchHint(.likely);
+            if (self.buffer.len > 0) {
+                @branchHint(.unlikely);
+                allocator.free(self.buffer);
+                self.buffer = &.{};
+            }
+            return;
+        }
+        if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
+            return;
+        }
+        // unused is part of the self.buffer make copy before free
+        const copy = try allocator.dupe(u8, unused);
+        allocator.free(self.buffer);
+        self.buffer = copy;
+    }
+
+    fn deinit(self: *ShortRecvBuffer, allocator: Allocator) void {
+        allocator.free(self.buffer);
+        allocator.free(self.reset_buffer);
+    }
+};
+
+const FileOpen = struct {
+    const Self = @This();
+
+    completion: Io.Completion = .{},
+    io: *Io,
+    dir: fs.Dir,
+    path: [:0]const u8,
+    callback: *const fn (*Self, anyerror!fd_t) anyerror!void,
+
+    fn open(self: *Self) !void {
+        try self.io.openRead(&self.completion, Self.onOpen, self.dir.fd, self.path, null);
+    }
+
+    fn onOpen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
+
+        const fd = Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.NoSuchFileOrDirectory => {
+                    break :brk -1;
+                },
+                error.SignalInterrupt => {
+                    try self.open();
+                },
+                error.FileTableOverflow => {
+                    log.warn("connection file open '{s}' retry on {}", .{ self.path, err });
+                    try self.open();
+                },
+                else => {
+                    try self.callback(self, err);
+                },
+            }
+            return;
+        };
+
+        try self.callback(self, fd);
+    }
+};
+
+const SendBytes = struct {
+    const Self = @This();
+
+    io: *Io,
+    completion: Io.Completion = .{},
+    fd: fd_t,
+    buffer: []const u8,
+    offset: usize = 0,
+    more: bool,
+    callback: *const fn (*Self, anyerror!void) anyerror!void,
+
+    fn send(self: *Self) !void {
+        try self.io.send(&self.completion, Self.onSend, self.fd, self.buffer[self.offset..], .{ .more = self.more });
+    }
+
+    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
+        self.offset += @intCast(Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.SignalInterrupt => break :brk 0,
+                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
+                else => log.info("connection header send failed {}", .{err}),
+            }
+            try self.callback(self, err);
+            return;
+        });
+        if (self.offset < self.buffer.len) {
+            // short send send more
+            try self.send();
+            return;
+        }
+
+        try self.callback(self, {});
+    }
+};
+
+const Sendfile = struct {
+    const Self = @This();
+
+    io: *Io,
+    completion: Io.Completion = .{},
+    conn_fd: fd_t,
+    file_fd: fd_t,
+    pipe: Server.Pipe,
+    size: usize,
+    offset: usize = 0,
+    callback: *const fn (*Self, anyerror!void) anyerror!void,
+    metric_short_send: usize = 0,
+
+    fn send(self: *Self) !void {
+        try self.io.sendfile(
+            &self.completion,
+            Self.onSend,
+            self.conn_fd,
+            self.file_fd,
+            self.pipe.fds,
+            @intCast(self.offset),
+            @intCast(self.size - self.offset),
+        );
+    }
+
+    fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
+        self.offset += @intCast(Io.result(cqe) catch |err| brk: {
+            switch (err) {
+                error.SignalInterrupt => break :brk 0,
+                error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
+                else => log.warn("sendfile failed {}", .{err}),
+            }
+            try self.callback(self, err);
+            return;
+        });
+        if (self.offset < self.size) {
+            // short send, send the rest of the file
+            self.metric_short_send += 1;
+            try self.send();
+            return;
+        }
+        try self.callback(self, {});
+    }
+};
