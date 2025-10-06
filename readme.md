@@ -3,20 +3,14 @@
 HTTP/HTTPS static file server in Zig 
 
 - Linux only, uses Linux specific io_uring and kernel TLS
-- min Linux kernel version is 6.12. io_uring is not supported at old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
+- min Linux kernel version is 6.12. io_uring is not supported on old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
 - should be build with latest master Zig
 
 ## Example
 
 Run `script/site.sh`, that will checkout an example site (ziglang.org), create https authority and site certificate, build project, ask sudo pwd to enable kernel tls if module not loaded and start httpd. 
 
-To run httpd in release mode with some higher resources and precompressed site files run `script/start.sh`. You can stress test with something like: 
-
-```sh
-ulimit -n 65535
-script/targets.sh http 8080 && oha -z 60s --urls-from-file site/targets-oha -c 10000 -w --cacert site/ca/cert.pem
-```
-`script/targets.sh` will create oha targets file for all files in site/root so requests are made for each file in the site. 
+To run httpd in release mode with some higher resources and precompressed site files run `script/start.sh`.
 
 To remove browser https certificate error add certificate authority to trusted with `script/trust_ca.sh` (works on Arch Linux, not tested on others).
 
@@ -55,11 +49,22 @@ echo tls | sudo tee /etc/modules-load.d/gnutls.conf
 
 ## Benchmark
 
-Benchmarking using [oha](https://github.com/hatoo/oha) and comparing requests
-per second of httpd with Nginx. Nginx is using single worker thread, configured
-to my best knowledge similar to httpd: sendfile and ktls enabled.
+Using [oha](https://github.com/hatoo/oha) to generate load.
 
-Testing with different number of concurrent connections 1/100/500. '1 close'
+
+Run `script/start.sh` to start httpd and then generate some load, for example:
+```sh
+ulimit -n 65535
+script/targets.sh http 8080 && oha -z 60s --urls-from-file site/targets-oha -c 10000 -w --cacert site/ca/cert.pem
+```
+`script/targets.sh` will create oha targets file for all files in site/root, so requests are made for each file in the site. 
+
+
+`script/bench.sh` will compare requests per second of httpd with Nginx. Nginx is
+using single worker thread, configured to my best knowledge similar to httpd:
+sendfile and ktls enabled.
+
+It will run load with different number of concurrent connections 1/100/500. '1 close'
 is  single concurrent  connection without  keep-alive; closing  connection after
 each request. Forces tls handshake on each https request.
 
