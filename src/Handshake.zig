@@ -16,8 +16,8 @@ const Handshake = @This();
 
 server: *Server,
 io: *Io,
-/// retrun point of the io operation
-completion: Io.Completion = .{},
+/// io operation
+op: Io.Op = .{},
 /// pipe used in discard
 pipe: ?Server.Pipe = null,
 /// tcp connection fd
@@ -41,8 +41,8 @@ send_buf: []const u8 = &.{},
 /// peeks.
 peek_count: usize = 0,
 
-fn parentPtr(completion: *Io.Completion) *Handshake {
-    return @alignCast(@fieldParentPtr("completion", completion));
+fn parentPtr(res: Io.Result) *Handshake {
+    return @alignCast(@fieldParentPtr("op", res.ptr));
 }
 
 pub fn init(self: *Handshake, config: tls.config.Server) !void {
@@ -53,13 +53,13 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
 fn recv(self: *Handshake) !void {
     if (self.hs.state == .init) {
         // Read client hello message in the buffer
-        try self.io.recvDirect(&self.completion, onRecv, self.fd, self.buffer[self.pos..], &self.recv_timeout);
+        try self.io.recvDirect(&self.op, onRecv, self.fd, self.buffer[self.pos..], &self.recv_timeout);
         return;
     }
     // Peek client flight into buffer. We will later discard bytes consumed
     // in handshake leaving other bytes for connection to consume.
     self.pos = 0;
-    try self.io.peek(&self.completion, onRecv, self.fd, &self.buffer);
+    try self.io.peek(&self.op, onRecv, self.fd, &self.buffer);
     self.peek_count += 1;
 }
 
@@ -68,9 +68,9 @@ fn close(self: *Handshake) !void {
     self.deinit();
 }
 
-fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const n = Io.result(cqe) catch |err| {
+fn onRecv(io_res: Io.Result) !void {
+    const self = parentPtr(io_res);
+    const n = io_res.bytes() catch |err| {
         switch (err) {
             error.SignalInterrupt => try self.recv(),
             error.OperationCanceled => try self.close(), // recv timeout
@@ -100,7 +100,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (res.send_pos > 0) {
         // server flight
         self.send_buf = res.send;
-        try self.io.send(completion, onSend, self.fd, self.send_buf, .{});
+        try self.io.send(&self.op, onSend, self.fd, self.send_buf, .{});
         return;
     }
     if (self.hs.done()) {
@@ -109,7 +109,7 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
         // consumed in connection.
         self.pipe = try self.server.pipes.get(self.pos);
         self.pos = res.recv_pos;
-        try self.io.discard(completion, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
+        try self.io.discard(&self.op, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
         return;
     }
     if (self.peek_count > 32) {
@@ -120,9 +120,9 @@ fn onRecv(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     try self.recv();
 }
 
-fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const n = Io.result(cqe) catch |err| brk: {
+fn onSend(res: Io.Result) !void {
+    const self = parentPtr(res);
+    const n = res.bytes() catch |err| brk: {
         switch (err) {
             error.SignalInterrupt => break :brk 0,
             // client gone
@@ -135,16 +135,16 @@ fn onSend(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     if (n < self.send_buf.len) {
         // short send, send rest
         self.send_buf = self.send_buf[@intCast(n)..];
-        try self.io.send(completion, onSend, self.fd, self.send_buf, .{});
+        try self.io.send(&self.op, onSend, self.fd, self.send_buf, .{});
         return;
     }
     // server flight sent, get client flight 2
     try self.recv();
 }
 
-fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const n = Io.result(cqe) catch |err| {
+fn onDiscard(res: Io.Result) !void {
+    const self = parentPtr(res);
+    const n = res.bytes() catch |err| {
         log.err("discard failed {}", .{err});
         try self.close();
         return;
@@ -152,7 +152,7 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     self.pos -= @intCast(n);
     if (self.pos > 0) {
         // short discard
-        try self.io.discard(completion, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
+        try self.io.discard(&self.op, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
         return;
     }
     // discard done
@@ -160,12 +160,12 @@ fn onDiscard(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
     try self.server.pipes.put(self.pipe.?);
     self.pipe = null;
     self.ktls = tls.Ktls.init(self.hs.cipher().?);
-    try self.io.ktlsUgrade(completion, onUpgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
+    try self.io.ktlsUgrade(&self.op, onUpgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
 }
 
-fn onUpgrade(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    _ = Io.result(cqe) catch |err| {
+fn onUpgrade(res: Io.Result) !void {
+    const self = parentPtr(res);
+    res.ok() catch |err| {
         log.err("kernel tls upgrade failed {}", .{err});
         try self.close();
         return;

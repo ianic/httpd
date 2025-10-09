@@ -15,35 +15,35 @@ io: *Io,
 addr: net.Address,
 protocol: Server.Protocol = .http,
 fd: fd_t = -1,
-completion: Io.Completion = .{},
+op: Io.Op = .{},
 
-fn parentPtr(completion: *Io.Completion) *Listener {
-    return @alignCast(@fieldParentPtr("completion", completion));
+fn parentPtr(res: Io.Result) *Listener {
+    return @alignCast(@fieldParentPtr("op", res.ptr));
 }
 
 pub fn init(self: *Listener) !void {
-    try self.io.socket(&self.completion, onSocket, &self.addr);
+    try self.io.socket(&self.op, onSocket, &self.addr);
 }
 
-fn onSocket(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    self.fd = try Io.result(cqe);
-    try self.io.listen(completion, onListen, &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
+fn onSocket(res: Io.Result) !void {
+    const self = parentPtr(res);
+    self.fd = try res.fd();
+    try self.io.listen(&self.op, onListen, &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
 }
 
-fn onListen(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    assert(0 == try Io.result(cqe));
+fn onListen(res: Io.Result) !void {
+    const self = parentPtr(res);
+    try res.ok();
     try self.accept();
 }
 
 fn accept(self: *Listener) !void {
-    try self.io.accept(&self.completion, onAccept, self.fd);
+    try self.io.accept(&self.op, onAccept, self.fd);
 }
 
-fn onAccept(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-    const self = parentPtr(completion);
-    const fd: fd_t = Io.result(cqe) catch |err| {
+fn onAccept(res: Io.Result) !void {
+    const self = parentPtr(res);
+    const fd = res.fd() catch |err| {
         switch (err) {
             error.SignalInterrupt => {
                 try self.accept();

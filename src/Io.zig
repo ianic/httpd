@@ -72,12 +72,11 @@ pub fn tick(io: *Io) !void {
     var timer = try time.Timer.start();
     while (io.cqes.len > 0) {
         const cqe = io.cqes[0];
+        io.cqes = io.cqes[1..];
         if (cqe.user_data != 0) {
-            const completion: *Completion = @ptrFromInt(cqe.user_data);
-            const callback = completion.callback.?;
-            // Reset completion.callback so that completion can be reused during callback.
-            completion.callback = null;
-            try callback(completion, cqe);
+            const op: *Op = @ptrFromInt(cqe.user_data);
+            const callback = op.reset(); // op can be reused during callback
+            try callback(.{ .ptr = op, .cqe = cqe });
             io.metric.completed(cqe);
         } else {
             _ = result(cqe) catch |err| {
@@ -88,7 +87,6 @@ pub fn tick(io: *Io) !void {
                 }
             };
         }
-        io.cqes = io.cqes[1..];
     }
     io.metric.tick_duration +%= timer.read();
 }
@@ -132,9 +130,9 @@ pub fn drain(io: *Io) !void {
     }
 }
 
-pub fn socket(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address) !void {
+pub fn socket(io: *Io, op: *Op, cb: Op.Callback, addr: *const net.Address) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.socket_direct_alloc(cid(io, c, cb), addr.any.family, linux.SOCK.STREAM, 0, 0);
+    _ = try io.ring.socket_direct_alloc(op.prep(cb, io), addr.any.family, linux.SOCK.STREAM, 0, 0);
 }
 
 pub const ListenOption = struct {
@@ -142,7 +140,7 @@ pub const ListenOption = struct {
     kernel_backlog: u31 = 128,
 };
 
-pub fn listen(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address, fd: fd_t, opt: ListenOption) !void {
+pub fn listen(io: *Io, op: *Op, cb: Op.Callback, addr: *const net.Address, fd: fd_t, opt: ListenOption) !void {
     try io.ensureSqCapacity(4);
     var sqe: *linux.io_uring_sqe = undefined;
     if (opt.reuse_address) {
@@ -153,11 +151,11 @@ pub fn listen(io: *Io, c: *Completion, cb: Callback, addr: *const net.Address, f
     }
     sqe = try io.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.listen(cid(io, c, cb), fd, opt.kernel_backlog, 0);
+    sqe = try io.ring.listen(op.prep(cb, io), fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn ktlsUgrade(io: *Io, c: *Completion, cb: Callback, fd: fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
+pub fn ktlsUgrade(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, tx_opt: []const u8, rx_opt: []const u8) !void {
     try io.ensureSqCapacity(3);
     const TX = @as(c_int, 1);
     const RX = @as(c_int, 2);
@@ -166,7 +164,7 @@ pub fn ktlsUgrade(io: *Io, c: *Completion, cb: Callback, fd: fd_t, tx_opt: []con
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(0, fd, linux.SOL.TLS, TX, tx_opt);
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.setsockopt(cid(io, c, cb), fd, linux.SOL.TLS, RX, rx_opt);
+    sqe = try io.ring.setsockopt(op.prep(cb, io), fd, linux.SOL.TLS, RX, rx_opt);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
@@ -176,9 +174,9 @@ pub fn tcpNodelay(io: *Io, fd: fd_t) !void {
     sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub fn accept(io: *Io, c: *Completion, cb: Callback, fd: fd_t) !void {
+pub fn accept(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t) !void {
     try io.ensureSqCapacity(1);
-    var sqe = try io.ring.accept_direct(cid(io, c, cb), fd, null, null, 0);
+    var sqe = try io.ring.accept_direct(op.prep(cb, io), fd, null, null, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
@@ -189,11 +187,11 @@ pub const RecvBuffer = union(enum) {
     provided: void,
 };
 
-pub fn recv(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: RecvBuffer, timeout: ?*const linux.kernel_timespec) !void {
+pub fn recv(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: RecvBuffer, timeout: ?*const linux.kernel_timespec) !void {
     try io.ensureSqCapacity(2);
     var sqe = switch (buffer) {
-        .buffer => |b| try io.ring.recv(cid(io, c, cb), fd, .{ .buffer = b }, 0),
-        .provided => try io.recv_buffer_group.recv(cid(io, c, cb), fd, 0),
+        .buffer => |b| try io.ring.recv(op.prep(cb, io), fd, .{ .buffer = b }, 0),
+        .provided => try io.recv_buffer_group.recv(op.prep(cb, io), fd, 0),
     };
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     if (timeout) |ts| {
@@ -202,37 +200,37 @@ pub fn recv(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: RecvBuffer,
     }
 }
 
-pub fn recvProvided(io: *Io, c: *Completion, cb: Callback, fd: fd_t, timeout: ?*const linux.kernel_timespec) !void {
-    return io.recv(c, cb, fd, .{ .provided = {} }, timeout);
+pub fn recvProvided(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, timeout: ?*const linux.kernel_timespec) !void {
+    return io.recv(op, cb, fd, .{ .provided = {} }, timeout);
 }
 
-pub fn recvDirect(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: []u8, timeout: ?*const linux.kernel_timespec) !void {
-    return io.recv(c, cb, fd, .{ .buffer = buffer }, timeout);
+pub fn recvDirect(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []u8, timeout: ?*const linux.kernel_timespec) !void {
+    return io.recv(op, cb, fd, .{ .buffer = buffer }, timeout);
 }
 
-pub fn getProvidedBuffer(io: *Io, cqe: linux.io_uring_cqe) ![]const u8 {
-    return try io.recv_buffer_group.get(cqe);
+pub fn getProvidedBuffer(io: *Io, res: Result) ![]const u8 {
+    return try io.recv_buffer_group.get(res.cqe);
 }
 
-pub fn putProvidedBuffer(io: *Io, cqe: linux.io_uring_cqe) void {
-    io.recv_buffer_group.put(cqe) catch unreachable;
+pub fn putProvidedBuffer(io: *Io, res: Result) void {
+    io.recv_buffer_group.put(res.cqe) catch unreachable;
 }
 
-pub fn peek(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: []u8) !void {
+pub fn peek(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []u8) !void {
     try io.ensureSqCapacity(1);
     const flags: MsgFlags = .{ .peek = true };
-    var sqe = try io.ring.recv(cid(io, c, cb), fd, .{ .buffer = buffer }, @bitCast(flags));
+    var sqe = try io.ring.recv(op.prep(cb, io), fd, .{ .buffer = buffer }, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
 /// Discard len bytes from fd to the /dev/null, without copying them to the userspace.
-pub fn discard(io: *Io, c: *Completion, cb: Callback, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
+pub fn discard(io: *Io, op: *Op, cb: Op.Callback, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
     try io.ensureSqCapacity(2);
     const fd_out = io.dev_null_fd;
     var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.splice(cid(io, c, cb), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = splice_f_nonblock;
 }
 
@@ -259,43 +257,43 @@ pub fn cancel(io: *Io, fd: fd_t) !void {
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
-pub fn send(io: *Io, c: *Completion, cb: Callback, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
+pub fn send(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {
     try io.ensureSqCapacity(1);
-    var sqe = try io.ring.send(cid(io, c, cb), fd, buffer, @bitCast(flags));
+    var sqe = try io.ring.send(op.prep(cb, io), fd, buffer, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn sendmsg(io: *Io, c: *Completion, cb: Callback, fd: fd_t, msg: *const posix.msghdr_const, flags: MsgFlags) !void {
+pub fn sendmsg(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, msg: *const posix.msghdr_const, flags: MsgFlags) !void {
     try io.ensureSqCapacity(1);
-    var sqe = try io.ring.sendmsg(cid(io, c, cb), fd, msg, @bitCast(flags));
+    var sqe = try io.ring.sendmsg(op.prep(cb, io), fd, msg, @bitCast(flags));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-pub fn statx(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
+pub fn statx(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.statx(cid(io, c, cb), dir, path, 0, linux.STATX_BASIC_STATS, stat);
+    _ = try io.ring.statx(op.prep(cb, io), dir, path, 0, linux.STATX_BASIC_STATS, stat);
 }
 
-pub fn openAt(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
+pub fn openAt(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.openat_direct(cid(io, c, cb), dir, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC);
+    _ = try io.ring.openat_direct(op.prep(cb, io), dir, path, flags, mode, linux.IORING_FILE_INDEX_ALLOC);
 }
 
-pub fn openRead(io: *Io, c: *Completion, cb: Callback, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
+pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
     try io.ensureSqCapacity(2);
     if (stat) |s| {
         var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_BASIC_STATS, s);
         sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
-    return io.openAt(c, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
+    return io.openAt(op, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
-pub fn sendfile(io: *Io, c: *Completion, cb: Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
+pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     try io.ensureSqCapacity(2);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.splice(cid(io, c, cb), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = splice_f_nonblock;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -318,25 +316,60 @@ pub const MsgFlags = packed struct {
     _reserved4: u16 = 0,
 };
 
-pub const Callback = *const fn (c: *Completion, cqe: linux.io_uring_cqe) anyerror!void;
-pub const Completion = struct {
+pub const Result = struct {
+    ptr: *Op,
+    cqe: linux.io_uring_cqe,
+
+    fn value(r: Result) errno.Error!i32 {
+        switch (r.cqe.err()) {
+            .SUCCESS => return r.cqe.res,
+            else => |e| return errno.toError(e),
+        }
+    }
+
+    pub fn fd(r: Result) errno.Error!fd_t {
+        return try r.value();
+    }
+
+    pub fn ok(r: Result) errno.Error!void {
+        assert(try r.value() == 0);
+    }
+
+    pub fn bytes(r: Result) errno.Error!usize {
+        return @intCast(try r.value());
+    }
+
+    pub fn parentPtr(r: Result, comptime T: type, comptime field_name: []const u8) *T {
+        return @alignCast(@fieldParentPtr(field_name, r.ptr));
+    }
+};
+
+pub const Op = struct {
+    const Callback = *const fn (Result) anyerror!void;
+
     callback: ?Callback = null,
 
     /// True if operation for this completion is still in the submission queue,
     /// in the kernel or in the completion queue.
     /// False if callback is fired and completion can be reused.
-    pub fn active(self: *Completion) bool {
+    pub fn active(self: *Op) bool {
         return self.callback != null;
     }
-};
 
-/// Completion identifier for sqe user_data field.
-fn cid(io: *Io, c: *Completion, cb: Callback) u64 {
-    assert(!c.active());
-    c.callback = cb;
-    io.metric.submitted();
-    return @intFromPtr(c);
-}
+    /// Arms operation with callback and returns sqe user_data
+    fn prep(self: *Op, cb: Op.Callback, io: *Io) u64 {
+        assert(!self.active());
+        self.callback = cb;
+        io.metric.submitted();
+        return @intFromPtr(self);
+    }
+
+    fn reset(self: *Op) Op.Callback {
+        assert(self.active());
+        defer self.callback = null;
+        return self.callback.?;
+    }
+};
 
 pub const Options = struct {
     /// Number of submission queue entries

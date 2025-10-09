@@ -522,16 +522,15 @@ const FileStat = struct {
     };
 
     io: *Io,
-    completion: Io.Completion = .{},
     callback: *const fn (*Self, anyerror!Result) anyerror!void,
     root: fs.Dir,
     cache: fs.Dir,
 
-    ops: []Op = &.{},
+    ops: []StatOp = &.{},
     join_count: usize = 0,
 
     fn prep(self: *Self, allocator: Allocator, path: []const u8, encodings: []const ContentEncoding) !void {
-        self.ops = try allocator.alloc(Op, encodings.len);
+        self.ops = try allocator.alloc(StatOp, encodings.len);
         self.join_count = encodings.len;
 
         for (encodings, 0..) |encoding, i| {
@@ -592,22 +591,22 @@ const FileStat = struct {
         self.ops = &.{};
     }
 
-    const Op = struct {
+    const StatOp = struct {
         parent: *FileStat,
-        completion: Io.Completion = .{},
+        op: Io.Op = .{},
         dir: fs.Dir,
         path: [:0]const u8 = &.{},
         encoding: ContentEncoding,
         statx: linux.Statx = mem.zeroes(linux.Statx),
         err: ?anyerror = null,
 
-        fn prep(op: *Op) !void {
-            try op.parent.io.statx(&op.completion, onComplete, op.dir.fd, op.path, &op.statx);
+        fn prep(op: *StatOp) !void {
+            try op.parent.io.statx(&op.op, onComplete, op.dir.fd, op.path, &op.statx);
         }
 
-        fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-            const op: *Op = @alignCast(@fieldParentPtr("completion", completion));
-            _ = Io.result(cqe) catch |err| switch (err) {
+        fn onComplete(res: Io.Result) !void {
+            const op: *StatOp = @alignCast(@fieldParentPtr("op", res.ptr));
+            res.ok() catch |err| switch (err) {
                 error.SignalInterrupt => {
                     try op.prep();
                     return;
@@ -647,7 +646,7 @@ pub fn compressible(file_name: []const u8) bool {
 const RequestRecv = struct {
     const Self = @This();
 
-    completion: Io.Completion = .{},
+    op: Io.Op = .{},
     recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
     short_recv: ShortRecvBuffer = .{},
     allocator: Allocator,
@@ -657,12 +656,12 @@ const RequestRecv = struct {
     no_buf_retries: usize = 0,
 
     pub fn prep(self: *Self) !void {
-        try self.io.recvProvided(&self.completion, onComplete, self.fd, &self.recv_timeout);
+        try self.io.recvProvided(&self.op, onComplete, self.fd, &self.recv_timeout);
     }
 
-    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
-        const n = Io.result(cqe) catch |err| {
+    fn onComplete(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        const n = res.bytes() catch |err| {
             switch (err) {
                 error.SignalInterrupt => try self.prep(),
                 error.NoBufferSpaceAvailable => {
@@ -679,8 +678,8 @@ const RequestRecv = struct {
             return;
         }
 
-        const recv_buf = try self.short_recv.append(self.allocator, try self.io.getProvidedBuffer(cqe));
-        defer self.io.putProvidedBuffer(cqe);
+        const recv_buf = try self.short_recv.append(self.allocator, try self.io.getProvidedBuffer(res));
+        defer self.io.putProvidedBuffer(res);
 
         var hp: http.HeadParser = .{};
         const header_len = hp.feed(recv_buf);
@@ -700,7 +699,7 @@ const RequestRecv = struct {
     }
 
     pub fn active(self: *Self) bool {
-        return self.completion.active();
+        return self.op.active();
     }
 
     pub fn deinit(self: *Self) void {
@@ -767,7 +766,7 @@ const ShortRecvBuffer = struct {
 const FileOpen = struct {
     const Self = @This();
 
-    completion: Io.Completion = .{},
+    op: Io.Op = .{},
     io: *Io,
     callback: *const fn (*Self, anyerror!fd_t) anyerror!void,
 
@@ -783,13 +782,13 @@ const FileOpen = struct {
     }
 
     fn prepIo(self: *Self) !void {
-        try self.io.openRead(&self.completion, onComplete, self.dir.fd, self.path, null);
+        try self.io.openRead(&self.op, onComplete, self.dir.fd, self.path, null);
     }
 
-    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
+    fn onComplete(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
 
-        const fd = Io.result(cqe) catch |err| {
+        const fd = res.fd() catch |err| {
             switch (err) {
                 error.SignalInterrupt => try self.prepIo(),
                 error.FileTableOverflow => {
@@ -806,7 +805,7 @@ const FileOpen = struct {
     }
 
     pub fn active(self: *Self) bool {
-        return self.completion.active();
+        return self.op.active();
     }
 };
 
@@ -815,7 +814,7 @@ const SendBytes = struct {
 
     io: *Io,
     callback: *const fn (*Self, anyerror!void) anyerror!void,
-    completion: Io.Completion = .{},
+    op: Io.Op = .{},
     fd: fd_t,
 
     buffer: []const u8 = undefined,
@@ -830,24 +829,24 @@ const SendBytes = struct {
     }
 
     fn prepIo(self: *Self) !void {
-        try self.io.send(&self.completion, onComplete, self.fd, self.buffer[self.offset..], .{ .more = self.more });
+        try self.io.send(&self.op, onComplete, self.fd, self.buffer[self.offset..], .{ .more = self.more });
     }
 
-    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
-        self.offset += @intCast(Io.result(cqe) catch |err| brk: {
+    fn onComplete(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        self.offset += res.bytes() catch |err| brk: {
             switch (err) {
                 error.SignalInterrupt => break :brk 0,
                 else => return try self.callback(self, err),
             }
-        });
+        };
         // short send send more
         if (self.offset < self.buffer.len) return try self.prepIo();
         try self.callback(self, {});
     }
 
     pub fn active(self: *Self) bool {
-        return self.completion.active();
+        return self.op.active();
     }
 };
 
@@ -855,7 +854,7 @@ const Sendfile = struct {
     const Self = @This();
 
     io: *Io,
-    completion: Io.Completion = .{},
+    op: Io.Op = .{},
     callback: *const fn (*Self, anyerror!void) anyerror!void,
 
     conn_fd: fd_t,
@@ -876,7 +875,7 @@ const Sendfile = struct {
 
     fn prepIo(self: *Self) !void {
         try self.io.sendfile(
-            &self.completion,
+            &self.op,
             onComplete,
             self.conn_fd,
             self.file_fd,
@@ -886,14 +885,14 @@ const Sendfile = struct {
         );
     }
 
-    fn onComplete(completion: *Io.Completion, cqe: linux.io_uring_cqe) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("completion", completion));
-        self.offset += @intCast(Io.result(cqe) catch |err| brk: {
+    fn onComplete(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        self.offset += res.bytes() catch |err| brk: {
             switch (err) {
                 error.SignalInterrupt => break :brk 0,
                 else => return try self.callback(self, err),
             }
-        });
+        };
         if (self.offset < self.size) { // short send, send the rest of the file
             self.metric_short_send += 1;
             try self.prepIo();
@@ -903,6 +902,6 @@ const Sendfile = struct {
     }
 
     pub fn active(self: Self) bool {
-        return self.completion.active();
+        return self.op.active();
     }
 };
