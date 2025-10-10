@@ -375,7 +375,7 @@ pub const Options = struct {
     /// Number of submission queue entries
     entries: u16,
     /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_SQPOLL,
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_TASKRUN_FLAG,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
 

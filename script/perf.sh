@@ -28,14 +28,14 @@ zig build -Doptimize=ReleaseFast
                 -e io_uring:io_uring_submit_req \
                 -e io_uring:io_uring_task_add \
                 -e io_uring:io_uring_task_work_run \
-                -- zig-out/bin/httpd --root site/www.ziglang.org/zig-out --cert site/localhost_ec
+                -- zig-out/bin/httpd --root site/root --cert site/cert_ec
 } &
 perf_pid=$!
 sleep 0.2
 pid=$(pidof httpd)
 
 script/targets.sh http 8080
-oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem | grep Requests
+oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-compression | grep Requests
 # oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
 script/targets.sh https 8443
 #oha -z 2s --no-tui --urls-from-file site/targets-oha -c 400 -w --cacert site/ca/cert.pem | grep Requests
