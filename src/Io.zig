@@ -24,7 +24,6 @@ recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: []linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
-dev_null_fd: fd_t = -1,
 
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
@@ -36,7 +35,6 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / 2));
     errdefer allocator.free(io.cqes_buf);
 
-    io.dev_null_fd = try posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     io.recv_buffer_group = try linux.IoUring.BufferGroup.init(
         &io.ring,
         allocator,
@@ -54,7 +52,6 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
     io.recv_buffer_group.deinit(allocator);
-    posix.close(io.dev_null_fd);
     allocator.free(io.cqes_buf);
     io.ring.deinit();
 }
@@ -223,17 +220,6 @@ pub fn peek(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []u8) !void {
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
 
-/// Discard len bytes from fd to the /dev/null, without copying them to the userspace.
-pub fn discard(io: *Io, op: *Op, cb: Op.Callback, fd_in: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
-    try io.ensureSqCapacity(2);
-    const fd_out = io.dev_null_fd;
-    var sqe = try io.ring.splice(0, fd_in, splice_no_offset, pipe_fds[1], splice_no_offset, len);
-    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
-    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
-    sqe.rw_flags = splice_f_nonblock;
-}
-
 /// Sends tls close notify alert
 pub fn tlsCloseNotify(io: *Io, fd: fd_t) !void {
     try io.ensureSqCapacity(1);
@@ -289,16 +275,6 @@ pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8
 }
 
 pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
-    try io.ensureSqCapacity(2);
-    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
-    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
-    sqe.rw_flags = splice_f_nonblock;
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
-}
-
-pub fn sendfile2(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     try io.ensureSqCapacity(2);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;

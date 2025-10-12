@@ -17,7 +17,6 @@ const toLastModified = @import("time.zig").toLastModified;
 const Connection = @This();
 const keepalive_timeout = 30;
 const max_header_size = 8192;
-const max_retries = 1024;
 
 server: *Server,
 gpa: Allocator,
@@ -807,7 +806,7 @@ const Sendfile = struct {
     }
 
     pub fn sendfile(self: *Self) !void {
-        try self.io.sendfile2(
+        try self.io.sendfile(
             &self.op,
             onComplete,
             self.conn_fd,
