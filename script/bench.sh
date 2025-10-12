@@ -10,27 +10,29 @@ oha-tests() {
     protocol=$1
     port=$2
     host=$3
+    app=$4
 
     script/targets.sh "$protocol" "$port" "$host"
 
     rs=()
+    rs+=("$app")
 
-    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive > tmp/oha-out
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 1 connection without keepalive $r
 
-    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem > tmp/oha-out
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 1 connection $r
 
-    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem > tmp/oha-out
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 100 connections $r
 
-    oha -z 2s --no-tui --urls-from-file site/targets-oha -c 500 -w --cacert site/ca/cert.pem  > tmp/oha-out
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 500 -w --cacert site/ca/cert.pem  > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
     echo 500 connections $r
@@ -55,29 +57,30 @@ nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
 sleep 0.2
 
+results+=( "" "http" "" )
 echo -e "http"
-oha-tests http 8080 "$host"
+oha-tests http 8080 "$host" httpd
 
 echo -e "\nhttp nginx"
-oha-tests http 8081 "$host"
+oha-tests http 8081 "$host" Nginx
 
+results+=( "https" "" )
 echo -e "\nhttps"
-oha-tests https 8443 "$host"
+oha-tests https 8443 "$host" httpd
 
 echo -e "\nhttps nginx"
-oha-tests https 8444 "$host"
+oha-tests https 8444 "$host" Nginx
 
 # number of files in static site
 echo
 echo site files count: "$(cat site/targets-oha | wc -l)"
 
 # result table
-echo
 for r in "${results[@]}"; do
     if [ -z "$r" ]; then
-        printf "\n"
+        printf "\n|"
     else
-        printf "%12s" $r
+        printf "%8s|" $(echo $r | cut -d '.' -f 1)
     fi
 done
 

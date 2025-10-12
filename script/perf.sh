@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-cd $(git rev-parse --show-toplevel)
+cd "$(git rev-parse --show-toplevel)"
 
 zig build -Doptimize=ReleaseFast
 
@@ -35,7 +35,7 @@ sleep 0.2
 pid=$(pidof httpd)
 
 script/targets.sh http 8080
-oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem | grep Requests # --disable-compression | grep Requests
+oha -z 2s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem | grep Requests #--disable-compression #| grep Requests
 # oha -z 2s --no-tui --urls-from-file site/targets-oha -c 1 -w --cacert site/ca/cert.pem --disable-keepalive | grep Requests
 script/targets.sh https 8443
 #oha -z 2s --no-tui --urls-from-file site/targets-oha -c 400 -w --cacert site/ca/cert.pem | grep Requests
@@ -45,10 +45,10 @@ script/targets.sh https 8443
 # ps -o thcount $pid
 
 # httpd metric
-kill -USR1 $pid
+kill -USR1 "$pid"
 sleep 0.5
 
-kill $pid
+kill "$pid"
 wait $perf_pid
 
 #sudo bpftrace -e "tracepoint:syscalls:sys_enter_io_uring_enter {@c[tid] = count();}"

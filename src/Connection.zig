@@ -614,12 +614,12 @@ const RequestRecv = struct {
 
     op: Io.Op = .{},
     recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
-    short_recv: ShortRecvBuffer = .{},
     allocator: Allocator,
     io: *Io,
     fd: fd_t,
     callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
     no_buf_retries: usize = 0,
+    buffer: []u8 = &.{},
 
     pub fn prep(self: *Self) !void {
         try self.io.recvProvided(&self.op, onComplete, self.fd, &self.recv_timeout);
@@ -644,7 +644,15 @@ const RequestRecv = struct {
             return;
         }
 
-        const recv_buf = try self.short_recv.append(self.allocator, try self.io.getProvidedBuffer(res));
+        const recv_buf: []const u8 = brk: {
+            const provided_buf = try self.io.getProvidedBuffer(res);
+            if (self.buffer.len == 0) break :brk provided_buf;
+            // there is saved part in the buffer append to it
+            const prev_len = self.buffer.len;
+            self.buffer = try self.allocator.realloc(self.buffer, prev_len + provided_buf.len);
+            @memcpy(self.buffer[prev_len..], provided_buf);
+            break :brk self.buffer;
+        };
         defer self.io.putProvidedBuffer(res);
 
         var hp: http.HeadParser = .{};
@@ -654,14 +662,27 @@ const RequestRecv = struct {
                 try self.callback(self, error.RequestBufferOverflow);
                 return;
             }
-            try self.short_recv.set(self.allocator, recv_buf);
+            if (self.buffer.len == 0) {
+                // partial msg in provided recv_buf save that part
+                self.buffer = try self.allocator.dupe(u8, recv_buf);
+            }
             try self.prep();
             return;
         }
 
         self.no_buf_retries = 0;
         try self.callback(self, recv_buf[0..header_len]);
-        try self.short_recv.set(self.allocator, recv_buf[header_len..]);
+        {
+            const unused = recv_buf[header_len..];
+            const prev = self.buffer;
+            if (unused.len > 0) {
+                self.buffer = try self.allocator.dupe(u8, unused);
+            }
+            if (prev.len > 0) {
+                self.allocator.free(prev);
+                self.buffer = &.{};
+            }
+        }
     }
 
     pub fn active(self: *Self) bool {
@@ -669,63 +690,7 @@ const RequestRecv = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.short_recv.deinit(self.allocator);
-    }
-};
-
-const ShortRecvBuffer = struct {
-    buffer: []u8 = &.{},
-    reset_buffer: []u8 = &.{},
-
-    fn append(self: *ShortRecvBuffer, allocator: Allocator, recv_buf: []const u8) ![]const u8 {
-        self.reset_buffer = self.buffer;
-        if (self.buffer.len == 0) {
-            // nothing to append to
-            return recv_buf;
-        }
-        if (recv_buf.len == 0) {
-            return self.buffer;
-        }
-        self.reset_buffer = self.buffer;
-        self.buffer = try allocator.alloc(u8, self.reset_buffer.len + recv_buf.len);
-        @memcpy(self.buffer[0..self.reset_buffer.len], self.reset_buffer);
-        @memcpy(self.buffer[self.reset_buffer.len..], recv_buf);
-        return self.buffer;
-    }
-
-    fn reset(self: *ShortRecvBuffer, allocator: Allocator) void {
-        allocator.free(self.buffer);
-        self.buffer = self.reset_buffer;
-        self.reset_buffer = &.{};
-    }
-
-    fn set(self: *ShortRecvBuffer, allocator: Allocator, unused: []const u8) !void {
-        if (self.reset_buffer.len > 0) {
-            @branchHint(.unlikely);
-            allocator.free(self.reset_buffer);
-            self.reset_buffer = &.{};
-        }
-        if (unused.len == 0) {
-            @branchHint(.likely);
-            if (self.buffer.len > 0) {
-                @branchHint(.unlikely);
-                allocator.free(self.buffer);
-                self.buffer = &.{};
-            }
-            return;
-        }
-        if (unused.ptr == self.buffer.ptr and unused.len == self.buffer.len) {
-            return;
-        }
-        // unused is part of the self.buffer make copy before free
-        const copy = try allocator.dupe(u8, unused);
-        allocator.free(self.buffer);
-        self.buffer = copy;
-    }
-
-    fn deinit(self: *ShortRecvBuffer, allocator: Allocator) void {
-        allocator.free(self.buffer);
-        allocator.free(self.reset_buffer);
+        self.allocator.free(self.buffer);
     }
 };
 
