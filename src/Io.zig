@@ -187,10 +187,10 @@ pub const RecvBuffer = union(enum) {
     provided: void,
 };
 
-pub fn recv(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: RecvBuffer, timeout: ?*const linux.kernel_timespec) !void {
+pub fn recv(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: RecvBuffer, flags: MsgFlags, timeout: ?*const linux.kernel_timespec) !void {
     try io.ensureSqCapacity(2);
     var sqe = switch (buffer) {
-        .buffer => |b| try io.ring.recv(op.prep(cb, io), fd, .{ .buffer = b }, 0),
+        .buffer => |b| try io.ring.recv(op.prep(cb, io), fd, .{ .buffer = b }, @bitCast(flags)),
         .provided => try io.recv_buffer_group.recv(op.prep(cb, io), fd, 0),
     };
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -201,11 +201,11 @@ pub fn recv(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: RecvBuffer, tim
 }
 
 pub fn recvProvided(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, timeout: ?*const linux.kernel_timespec) !void {
-    return io.recv(op, cb, fd, .{ .provided = {} }, timeout);
+    return io.recv(op, cb, fd, .{ .provided = {} }, .{}, timeout);
 }
 
 pub fn recvDirect(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []u8, timeout: ?*const linux.kernel_timespec) !void {
-    return io.recv(op, cb, fd, .{ .buffer = buffer }, timeout);
+    return io.recv(op, cb, fd, .{ .buffer = buffer }, .{}, timeout);
 }
 
 pub fn getProvidedBuffer(io: *Io, res: Result) ![]const u8 {
@@ -296,6 +296,29 @@ pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pi
     sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = splice_f_nonblock;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+pub fn sendfile2(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
+    try io.ensureSqCapacity(2);
+    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_FIXED_FILE;
+    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+}
+
+pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {
+    try io.ensureSqCapacity(1);
+
+    const ring = &io.ring;
+    const sqe = try ring.get_sqe();
+    const OP_PIPE = 62;
+    sqe.prep_rw(@enumFromInt(OP_PIPE), 0, @intFromPtr(fds), 0, 0);
+    const file_index: u32 = linux.IORING_FILE_INDEX_ALLOC;
+    sqe.splice_fd_in = @bitCast(file_index); //  sqe_file_index: u32
+    sqe.flags |= linux.IOSQE_FIXED_FILE;
+    sqe.user_data = op.prep(cb, io);
 }
 
 pub fn result(cqe: linux.io_uring_cqe) errno.Error!i32 {
@@ -472,3 +495,35 @@ const CloseNotify = struct {
         };
     }
 };
+
+test "pipe" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var io: Io = .{};
+    try io.init(gpa, .{
+        .entries = 128,
+        .fd_nr = 128,
+        .recv_buffers = .{ .count = 1, .size = 4096 },
+    });
+    defer io.deinit(gpa);
+
+    var handler: struct {
+        op: Op = .{},
+        res: ?Result = null,
+        fds: [2]fd_t = .{ -1, -1 },
+        fn onComplete(res: Result) anyerror!void {
+            const self: *@This() = @fieldParentPtr("op", res.ptr);
+            self.res = res;
+        }
+    } = .{};
+
+    try io.pipe(&handler.op, @TypeOf(handler).onComplete, &handler.fds);
+    while (handler.res == null) {
+        try io.tick();
+    }
+    try handler.res.?.ok();
+    try testing.expect(handler.fds[0] >= 0);
+    try testing.expect(handler.fds[1] > 0);
+    //std.debug.print("fds: {any}\n", .{handler.fds});
+}

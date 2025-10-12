@@ -21,9 +21,6 @@ const Server = @This();
 root: fs.Dir,
 /// Where to find precompressed files.
 cache: fs.Dir,
-/// Linux pipes used in sendfile and discard io operations. Pool allows reusing
-/// pipe without create/close for each operation.
-pipes: PipePool = undefined,
 /// Basic metric counters.
 metric: Metric = .{},
 
@@ -49,9 +46,6 @@ const cipher_suites = &[_]tls.config.CipherSuite{
 };
 
 pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
-    self.pipes = .{ .allocator = self.gpa, .metric = &self.metric };
-    try self.pipes.initPreheated(16);
-
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
     // http
     {
@@ -81,7 +75,6 @@ pub fn deinit(self: *Server) void {
         self.gpa.destroy(conn);
     }
     self.connections.deinit(self.gpa);
-    self.pipes.deinit();
 }
 
 /// Listener has accepted new connection
@@ -147,95 +140,6 @@ pub fn closed(self: *Server) bool {
     return self.listeners.count() == 0 and self.connections.count() == 0;
 }
 
-pub const Pipe = struct {
-    fds: [2]fd_t = .{ -1, -1 },
-    large: bool = false,
-};
-
-/// Pool of linux pipes (pair of file descirptors) used in sendfile. Cached to
-/// skip pipe system calls. Default pipe size is 64K, can be increased to up to
-/// 1M (if kernel allows). Here we have two pools one for default size and
-/// another for large size. If file in sendfile is big it will be given large
-/// pipe so it will be sent in less short send cycles.
-const PipePool = struct {
-    allocator: Allocator,
-    large: std.ArrayList(Pipe) = .empty,
-    small: std.ArrayList(Pipe) = .empty,
-    metric: *Metric,
-
-    fn initPreheated(self: *PipePool, count: usize) !void {
-        for (0..count) |i| {
-            const p = try self.create(i % 2 == 0);
-            if (p.large)
-                try self.large.append(self.allocator, p)
-            else
-                try self.small.append(self.allocator, p);
-        }
-    }
-
-    pub fn deinit(self: *PipePool) void {
-        for (self.large.items) |p| {
-            posix.close(p.fds[0]);
-            posix.close(p.fds[1]);
-        }
-        for (self.small.items) |p| {
-            posix.close(p.fds[0]);
-            posix.close(p.fds[1]);
-        }
-        self.large.deinit(self.allocator);
-        self.small.deinit(self.allocator);
-    }
-
-    fn create(self: *PipePool, large: bool) !Pipe {
-        const fds = try posix.pipe();
-        var p: Pipe = .{ .fds = fds, .large = false };
-        if (large) {
-            // try to increase pipe size
-            const F_SETPIPE_SZ = 1031;
-            const rc = linux.fcntl(p.fds[1], F_SETPIPE_SZ, max_pipe_size);
-            switch (linux.E.init(rc)) {
-                .SUCCESS => p.large = true,
-                else => |errno| log.debug("set pipe size failed {}", .{@import("errno.zig").toError(errno)}),
-            }
-        }
-        if (p.large) {
-            self.metric.pipe.large += 1;
-        } else {
-            self.metric.pipe.small += 1;
-        }
-        return p;
-    }
-
-    pub fn get(self: *PipePool, size: usize) !Pipe {
-        const large = size > default_pipe_size;
-        if (large) {
-            if (self.large.pop()) |p| return p;
-            if (self.small.pop()) |p| return p;
-        } else {
-            if (self.small.pop()) |p| return p;
-            if (self.large.pop()) |p| return p;
-        }
-        return try self.create(large);
-    }
-
-    pub fn put(self: *PipePool, p: Pipe) !void {
-        if (p.large) {
-            try self.large.append(self.allocator, p);
-            return;
-        }
-        try self.small.append(self.allocator, p);
-    }
-
-    pub fn broken(self: *PipePool, p: Pipe) void {
-        _ = self;
-        posix.close(p.fds[0]);
-        posix.close(p.fds[1]);
-    }
-
-    const default_pipe_size = 64 * 1024;
-    const max_pipe_size = 1024 * 1024;
-};
-
 pub const Protocol = enum {
     /// plain http
     http,
@@ -278,10 +182,6 @@ pub const Metric = struct {
         count: usize = 0,
         bytes: usize = 0,
         sendfile_more: usize = 0,
-    } = .{},
-    pipe: struct {
-        large: usize = 0,
-        small: usize = 0,
     } = .{},
 
     const Gauge = struct {

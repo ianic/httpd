@@ -10,166 +10,129 @@ const fd_t = linux.fd_t;
 const tls = @import("tls");
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
+const SendBytes = @import("Connection.zig").SendBytes;
 const log = std.log.scoped(.handshake);
 
 const Handshake = @This();
+const recv_timeout = 10; // timeout of the single recv/peek operation
+const handshake_timeout = 30; // timeout of the entire handshake
+// Guards against inifinte peek loop.
+// Peek operation can return n bytes which are not valid handshake message. If
+// the connection is broken we will never recive more bytes nor get EndOfStrem
+// resulting in infite loop.
 
 server: *Server,
 io: *Io,
-/// io operation
-op: Io.Op = .{},
-/// pipe used in discard
-pipe: ?Server.Pipe = null,
-/// tcp connection fd
 fd: fd_t,
-/// timeout for the receive operation
-recv_timeout: linux.kernel_timespec = .{ .sec = 30, .nsec = 0 },
-
-/// tls handsake algorithm
-hs: tls.nonblock.Server = undefined,
+op: Io.Op = .{},
 /// tls keys in kernel format
 ktls: tls.Ktls = undefined,
-
+/// tls handsake algorithm
+hs: tls.nonblock.Server = undefined,
 /// buffer used for both read client messages and write server flight messages
 buffer: [tls.output_buffer_len]u8 = undefined,
-/// 0..pos part of the buffer read, written
-pos: usize = 0,
-/// pointer to the part of the buffer used in send, needed in the case of short send
-send_buf: []const u8 = &.{},
-/// Number of peeks; if the socket is closed but there is something in the
-/// buffer peeek will retrun that bytes over and over. This limits number of
-/// peeks.
-peek_count: usize = 0,
-
-fn parentPtr(res: Io.Result) *Handshake {
-    return @alignCast(@fieldParentPtr("op", res.ptr));
-}
+recv_op: Recv = undefined,
+send_op: SendBytes = undefined,
+timer: time.Timer = undefined,
 
 pub fn init(self: *Handshake, config: tls.config.Server) !void {
     self.hs = .init(config);
+    self.recv_op = .{
+        .io = self.io,
+        .fd = self.fd,
+        .buffer = &self.buffer,
+        .callback = onRecv,
+    };
+    self.send_op = .{
+        .io = self.io,
+        .fd = self.fd,
+        .callback = onSend,
+    };
+    self.timer = try time.Timer.start();
     try self.recv();
 }
 
-fn recv(self: *Handshake) !void {
-    if (self.hs.state == .init) {
-        // Read client hello message in the buffer
-        try self.io.recvDirect(&self.op, onRecv, self.fd, self.buffer[self.pos..], &self.recv_timeout);
+fn onRecv(ptr: *Recv, io_res: anyerror![]const u8) anyerror!void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("recv_op", ptr));
+    const buf = io_res catch |err| return try self.shutdown(err);
+    if (self.hs.done()) {
+        try self.upgrade();
         return;
     }
-    // Peek client flight into buffer. We will later discard bytes consumed
-    // in handshake leaving other bytes for connection to consume.
-    self.pos = 0;
-    try self.io.peek(&self.op, onRecv, self.fd, &self.buffer);
-    self.peek_count += 1;
-}
 
-fn close(self: *Handshake) !void {
-    try self.io.close(self.fd);
-    self.deinit();
-}
+    var hs_timer = try time.Timer.start();
+    const hs_res = self.hs.run(buf, &self.buffer) catch |err| return try self.shutdown(err);
+    self.server.metric.handshake.duration +%= hs_timer.read();
+    self.recv_op.take(hs_res.recv_pos);
 
-fn onRecv(io_res: Io.Result) !void {
-    const self = parentPtr(io_res);
-    const n = io_res.bytes() catch |err| {
-        switch (err) {
-            error.SignalInterrupt => try self.recv(),
-            error.OperationCanceled => try self.close(), // recv timeout
-            error.IOError => try self.close(), // connection closed
-            else => {
-                log.info("handshake recv failed {}", .{err});
-                try self.close();
-            },
-        }
-        return;
-    };
-    if (n == 0) {
-        try self.close();
-        return;
-    }
-    self.pos += @intCast(n);
-
-    var t = try time.Timer.start();
-    const res = self.hs.run(self.buffer[0..self.pos], &self.buffer) catch |err| {
-        log.info("tls handsake failed {}", .{err});
-        // if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace.*);
-        try self.close();
-        return;
-    };
-    self.server.metric.handshake.duration +%= t.read();
-
-    if (res.send_pos > 0) {
+    if (hs_res.send_pos > 0) {
         // server flight
-        self.send_buf = res.send;
-        try self.io.send(&self.op, onSend, self.fd, self.send_buf, .{});
+        try self.send_op.prep(hs_res.send, false);
         return;
     }
     if (self.hs.done()) {
         // Hanshake done. Discard peeked bytes consumed in handshake leave
         // the rest in the tcp buffer to be decompressed by kernel and
         // consumed in connection.
-        self.pipe = try self.server.pipes.get(self.pos);
-        self.pos = res.recv_pos;
-        try self.io.discard(&self.op, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
-        return;
-    }
-    if (self.peek_count > 32) {
-        try self.close();
+        try self.recv_op.recvExact(hs_res.recv_pos);
         return;
     }
     // short read, get more
     try self.recv();
 }
 
-fn onSend(res: Io.Result) !void {
-    const self = parentPtr(res);
-    const n = res.bytes() catch |err| brk: {
-        switch (err) {
-            error.SignalInterrupt => break :brk 0,
-            // client gone
-            error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer => {},
-            else => log.info("handshake send failed {}", .{err}),
-        }
-        try self.close();
-        return;
-    };
-    if (n < self.send_buf.len) {
-        // short send, send rest
-        self.send_buf = self.send_buf[@intCast(n)..];
-        try self.io.send(&self.op, onSend, self.fd, self.send_buf, .{});
+fn recv(self: *Handshake) !void {
+    if (self.timer.read() > handshake_timeout * time.ns_per_s) {
+        return try self.shutdown(error.OperationCanceled);
+    }
+    if (self.hs.state == .init) {
+        // Read client hello message in the buffer
+        try self.recv_op.recv();
         return;
     }
-    // server flight sent, get client flight 2
+    // Peek client flight 2. We will later read bytes consumed in handshake
+    // leaving possible encrypted message part in the tcp buffer.
+    try self.recv_op.peek();
+}
+
+fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
+    if (maybe_err) |err| switch (err) {
+        // timeout or server close
+        error.OperationCanceled,
+        // clean tcp connection close
+        error.EndOfFile,
+        error.EndOfStream,
+        // broken tcp connection
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.IOError,
+        => {},
+        else => {
+            // unexpected error
+            log.warn("{} failed {}", .{ self.fd, err });
+            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace);
+        },
+    };
+
+    try self.io.close(self.fd);
+    self.deinit();
+}
+
+fn onSend(ptr: *SendBytes, res: anyerror!void) !void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", ptr));
+    res catch |err| return try self.shutdown(err);
     try self.recv();
 }
 
-fn onDiscard(res: Io.Result) !void {
-    const self = parentPtr(res);
-    const n = res.bytes() catch |err| {
-        log.err("discard failed {}", .{err});
-        try self.close();
-        return;
-    };
-    self.pos -= @intCast(n);
-    if (self.pos > 0) {
-        // short discard
-        try self.io.discard(&self.op, onDiscard, self.fd, self.pipe.?.fds, @intCast(self.pos));
-        return;
-    }
-    // discard done
+fn upgrade(self: *Handshake) !void {
     // upgrade connection, push cipher to the kernel
-    try self.server.pipes.put(self.pipe.?);
-    self.pipe = null;
     self.ktls = tls.Ktls.init(self.hs.cipher().?);
     try self.io.ktlsUgrade(&self.op, onUpgrade, self.fd, self.ktls.txBytes(), self.ktls.rxBytes());
 }
 
 fn onUpgrade(res: Io.Result) !void {
-    const self = parentPtr(res);
-    res.ok() catch |err| {
-        log.err("kernel tls upgrade failed {}", .{err});
-        try self.close();
-        return;
-    };
+    const self = res.parentPtr(Handshake, "op");
+    res.ok() catch |err| return try self.shutdown(err);
     // cipher keys are int the kernel
     // create connection to handle cleartext stream
     try self.server.connect(.https, self.fd);
@@ -177,6 +140,86 @@ fn onUpgrade(res: Io.Result) !void {
 }
 
 fn deinit(self: *Handshake) void {
-    if (self.pipe) |p| self.server.pipes.put(p) catch {};
     self.server.destroy(self);
 }
+
+const Recv = struct {
+    const Self = @This();
+
+    io: *Io,
+    op: Io.Op = .{},
+    fd: fd_t,
+    callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
+
+    buffer: []u8,
+    end: usize = 0,
+    count: usize = 0,
+
+    offset: usize = 0,
+    recv_timeout: linux.kernel_timespec = .{ .sec = recv_timeout, .nsec = 0 },
+    kind: enum {
+        recv,
+        peek,
+    } = undefined,
+
+    pub fn recv(self: *Self) !void {
+        self.kind = .recv;
+        self.count = 0;
+        try self.prep();
+    }
+
+    pub fn recvExact(self: *Self, n: usize) !void {
+        self.kind = .recv;
+        self.count = n;
+        try self.prep();
+    }
+
+    pub fn peek(self: *Self) !void {
+        self.kind = .peek;
+        self.count = 0;
+        try self.prep();
+    }
+
+    fn prep(self: *Self) !void {
+        const n = if (self.count > 0) self.count else self.buffer.len - self.end;
+        const buf = self.buffer[self.end..][0..n];
+        try self.io.recv(&self.op, onComplete, self.fd, .{ .buffer = buf }, .{ .peek = self.kind == .peek }, &self.recv_timeout);
+    }
+
+    pub fn take(self: *Self, n: usize) void {
+        if (n == 0 or self.kind == .peek) return;
+        assert(n <= self.end);
+        if (n == self.end) {
+            self.end = 0;
+            return;
+        }
+        std.mem.copyForwards(u8, self.buffer, self.buffer[n..self.end]);
+        self.offset = n;
+    }
+
+    fn onComplete(res: Io.Result) !void {
+        const self = res.parentPtr(Self, "op");
+        const n = res.bytes() catch |err| {
+            switch (err) {
+                error.SignalInterrupt => try self.prep(),
+                else => try self.callback(self, err),
+            }
+            return;
+        };
+        if (n == 0) {
+            try self.callback(self, error.EndOfStream);
+            return;
+        }
+
+        if (self.kind == .peek) {
+            try self.callback(self, self.buffer[0 .. self.end + n]);
+            return;
+        }
+        self.end += n;
+        if (self.count > 0) {
+            self.count -= n;
+            if (self.count > 0) return try self.prep();
+        }
+        try self.callback(self, self.buffer[0..self.end]);
+    }
+};
