@@ -65,10 +65,10 @@ pub fn init(self: *Connection) !void {
         .callback = onSendfile,
     };
 
-    try self.readRequest();
+    try self.recv();
 }
 
-fn readRequest(self: *Connection) !void {
+fn recv(self: *Connection) !void {
     if (self.server.closing()) {
         try self.shutdown(null);
         return;
@@ -76,16 +76,29 @@ fn readRequest(self: *Connection) !void {
     try self.recv_op.prep();
 }
 
-/// res is http header bytes or error
-fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !void {
+fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !usize {
     const self: *Connection = @alignCast(@fieldParentPtr("recv_op", ptr));
-    const bytes = res catch |err| return try self.shutdown(err);
-    self.req = Request.parse(self.arena, bytes) catch |err| return try self.shutdown(err);
+    const bytes = res catch |err| {
+        try self.shutdown(err);
+        return 0;
+    };
+    self.req = Request.parse(self.arena, bytes) catch |err| {
+        try self.shutdown(err);
+        return 0;
+    } orelse {
+        if (bytes.len >= max_header_size) {
+            try self.shutdown(error.RequestBufferOverflow);
+            return 0;
+        }
+        try self.recv();
+        return 0;
+    };
     try self.file_stat_op.prep(
         self.arena,
         self.req.path,
         self.req.accept_encoding orelse &[_]ContentEncoding{.plain},
     );
+    return self.req.size;
 }
 
 fn onFileStat(ptr: *FileStat, res: anyerror!FileStat.Result) !void {
@@ -125,7 +138,7 @@ fn done(self: *Connection) !void {
     self.logAccess();
     if (self.req.keep_alive) {
         try self.reset();
-        try self.readRequest();
+        try self.recv();
         return;
     }
     try self.shutdown(null);
@@ -201,10 +214,17 @@ const Request = struct {
     } = .{},
     keep_alive: bool = false,
     accept_encoding: ?[]ContentEncoding = null,
+    size: usize = 0,
 
     /// Returns null if recv_buf doesn't hold full http request
-    fn parse(allocator: Allocator, buf: []const u8) !Request {
-        const head = try Head.parse(buf);
+    fn parse(allocator: Allocator, buf: []const u8) !?Request {
+        var hp: http.HeadParser = .{};
+        const n = hp.feed(buf);
+        if (hp.state != .finished) {
+            return null;
+        }
+
+        const head = try Head.parse(buf[0..n]);
         const content_length: u64 = head.content_length orelse 0;
         if (!(head.method == .GET and content_length == 0)) {
             return error.BadRequest;
@@ -212,6 +232,7 @@ const Request = struct {
 
         var req: Request = .{
             .keep_alive = head.keep_alive,
+            .size = n,
         };
         if (head.etag) |et| { // parse etag
             var it = mem.splitScalar(u8, et, '-');
@@ -617,7 +638,8 @@ const RequestRecv = struct {
     allocator: Allocator,
     io: *Io,
     fd: fd_t,
-    callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
+    // callback returns number of bytes consumed
+    callback: *const fn (*Self, anyerror![]const u8) anyerror!usize,
     no_buf_retries: usize = 0,
     buffer: []u8 = &.{},
 
@@ -630,17 +652,12 @@ const RequestRecv = struct {
         const n = res.bytes() catch |err| {
             switch (err) {
                 error.SignalInterrupt => try self.prep(),
-                error.NoBufferSpaceAvailable => {
-                    self.no_buf_retries += 1;
-                    if (self.no_buf_retries > max_retries) return try self.callback(self, err);
-                    try self.prep();
-                },
-                else => try self.callback(self, err),
+                else => _ = try self.callback(self, err),
             }
             return;
         };
         if (n == 0) {
-            try self.callback(self, error.EndOfStream);
+            _ = try self.callback(self, error.EndOfStream);
             return;
         }
 
@@ -655,25 +672,16 @@ const RequestRecv = struct {
         };
         defer self.io.putProvidedBuffer(res);
 
-        var hp: http.HeadParser = .{};
-        const header_len = hp.feed(recv_buf);
-        if (hp.state != .finished) {
-            if (recv_buf.len >= max_header_size) {
-                try self.callback(self, error.RequestBufferOverflow);
-                return;
-            }
+        const m = try self.callback(self, recv_buf);
+        if (m == 0) {
             if (self.buffer.len == 0) {
                 // partial msg in provided recv_buf save that part
                 self.buffer = try self.allocator.dupe(u8, recv_buf);
             }
-            try self.prep();
             return;
         }
-
-        self.no_buf_retries = 0;
-        try self.callback(self, recv_buf[0..header_len]);
         {
-            const unused = recv_buf[header_len..];
+            const unused = recv_buf[m..];
             const prev = self.buffer;
             if (unused.len > 0) {
                 self.buffer = try self.allocator.dupe(u8, unused);
