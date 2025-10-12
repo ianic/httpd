@@ -3,7 +3,7 @@
 HTTP/HTTPS static file server in Zig 
 
 - Linux only, uses Linux specific io_uring and kernel TLS
-- min Linux kernel version is 6.12. io_uring is not supported on old kernels, and features are added in each version, httpd depends on features added in kernel 6.12 (bind/listen, incremental buffer consumption). 
+- min Linux kernel version is 6.16. io_uring is not supported on old kernels, and features are added in each version, httpd depends on features added in kernel 6.16 (direct pipe file descriptors).
 - should be build with latest master Zig
 
 ## Example
