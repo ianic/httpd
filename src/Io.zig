@@ -14,11 +14,6 @@ const log = std.log.scoped(.io);
 
 const Io = @This();
 
-// from musl/include/fcnt.h
-const splice_f_nonblock = 0x02;
-const splice_no_offset = math.maxInt(u64);
-const yes_socket_option = mem.asBytes(&@as(u32, 1));
-
 ring: linux.IoUring = undefined,
 recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: []linux.io_uring_cqe = undefined,
@@ -76,12 +71,10 @@ pub fn tick(io: *Io) !void {
             try callback(.{ .ptr = op, .cqe = cqe });
             io.metric.completed(cqe);
         } else {
-            _ = result(cqe) catch |err| {
-                switch (err) {
-                    error.TimerExpired => {}, // timer triggers cancel of linked operation (recv)
-                    error.OperationCanceled => {}, // timer is canceled by linked operation
-                    else => log.debug("noop completion failed {}", .{err}),
-                }
+            _ = result(cqe) catch |err| switch (err) {
+                error.TimerExpired => {}, // timer triggers cancel of linked operation (recv)
+                error.OperationCanceled => {}, // timer is canceled by linked operation
+                else => log.debug("noop completion failed {}", .{err}),
             };
         }
     }
@@ -275,6 +268,10 @@ pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8
 }
 
 pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
+    // from musl/include/fcnt.h
+    const splice_f_nonblock = 0x02;
+    const splice_no_offset = math.maxInt(u64);
+
     try io.ensureSqCapacity(2);
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
@@ -297,12 +294,14 @@ pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {
     sqe.user_data = op.prep(cb, io);
 }
 
-pub fn result(cqe: linux.io_uring_cqe) errno.Error!i32 {
+fn result(cqe: linux.io_uring_cqe) errno.Error!i32 {
     switch (cqe.err()) {
         .SUCCESS => return cqe.res,
         else => |e| return errno.toError(e),
     }
 }
+
+const yes_socket_option = mem.asBytes(&@as(u32, 1)); // stable pointer to 1
 
 pub const MsgFlags = packed struct {
     _reserved1: u1 = 0,
