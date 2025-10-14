@@ -44,24 +44,40 @@ pub fn init(self: *Connection) !void {
     self.recv_op = .{
         .allocator = self.gpa,
         .io = self.io,
+        .vtable = .{
+            .ptr = self,
+            .success = onRecv,
+            .fail = onError,
+        },
         .fd = self.fd,
-        .callback = onRequest,
     };
     self.file_stat_op = .{
         .io = self.io,
+        .vtable = .{
+            .ptr = self,
+            .success = onFileStat,
+            .fail = onError,
+        },
         .root = self.server.root,
         .cache = self.server.cache,
-        .callback = onFileStat,
     };
     self.send_op = .{
         .io = self.io,
+        .vtable = .{
+            .ptr = self,
+            .success = onHeader,
+            .fail = onError,
+        },
         .fd = self.fd,
-        .callback = onHeader,
     };
     self.sendfile_op = .{
         .io = self.io,
+        .vtable = .{
+            .ptr = self,
+            .success = onSendfile,
+            .fail = onError,
+        },
         .conn_fd = self.fd,
-        .callback = onSendfile,
     };
 
     try self.recv();
@@ -75,19 +91,12 @@ fn recv(self: *Connection) !void {
     try self.recv_op.prep();
 }
 
-fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !usize {
-    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", ptr));
-    const bytes = res catch |err| {
-        try self.shutdown(err);
-        return 0;
-    };
-    self.req = Request.parse(self.arena, bytes) catch |err| {
-        try self.shutdown(err);
-        return 0;
-    } orelse {
+/// Some bytes are recieved parse it into request
+fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    self.req = try Request.parse(self.arena, bytes) orelse {
         if (bytes.len >= max_header_size) {
-            try self.shutdown(error.RequestBufferOverflow);
-            return 0;
+            return error.RequestBufferOverflow;
         }
         try self.recv();
         return 0;
@@ -100,20 +109,18 @@ fn onRequest(ptr: *RequestRecv, res: anyerror![]const u8) !usize {
     return self.req.size;
 }
 
-fn onFileStat(ptr: *FileStat, res: anyerror!FileStat.Result) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("file_stat_op", ptr));
+/// File system file is found, or null if no such file, prepare repsonse header
+fn onFileStat(ptr: *anyopaque, fsr: ?FileStat.Result) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
     const rsp = &self.rsp;
-    rsp.fsr = res catch |err| brk: switch (err) {
-        error.NoSuchFileOrDirectory => break :brk null,
-        else => return try self.shutdown(err),
-    };
+    rsp.fsr = fsr;
     try rsp.init(self.arena, self.req);
     try self.send_op.prep(rsp.header, rsp.hasBody());
 }
 
-fn onHeader(ptr: *SendBytes, res: anyerror!void) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("send_op", ptr));
-    res catch |err| return try self.shutdown(err);
+/// Header is sent, prepare sending body
+fn onHeader(ptr: *anyopaque) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
     if (self.rsp.fsr) |fsr| {
         // there is file to send as body
         try self.sendfile_op.prep(fsr.dir, fsr.path, fsr.stat.size);
@@ -123,26 +130,34 @@ fn onHeader(ptr: *SendBytes, res: anyerror!void) !void {
     try self.done();
 }
 
-fn onSendfile(ptr: *Sendfile, res: anyerror!void) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", ptr));
-    res catch |err| return try self.shutdown(err);
-    self.server.metric.files.count +%= 1;
-    self.server.metric.files.bytes +%= ptr.size;
-    self.server.metric.files.sendfile_more +%= ptr.metric_short_send;
+/// Body is sent
+fn onSendfile(ptr: *anyopaque, metric: Sendfile.Metric) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    const files = &self.server.metric.files;
+    files.count +%= 1;
+    files.bytes +%= metric.bytes;
+    files.short_send +%= metric.short_send;
     try self.done();
+}
+
+/// Io operation failed
+fn onError(ptr: *anyopaque, err: anyerror) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    try self.shutdown(err);
 }
 
 /// Done sending response
 fn done(self: *Connection) !void {
     self.logAccess();
     if (self.req.keep_alive) {
-        try self.reset();
+        self.reset();
         try self.recv();
         return;
     }
     try self.shutdown(null);
 }
 
+/// Access log line
 fn logAccess(self: Connection) void {
     const rsp = &self.rsp;
     log.debug(
@@ -160,12 +175,13 @@ fn logAccess(self: Connection) void {
 }
 
 /// Prepare connection for next request
-fn reset(self: *Connection) !void {
+fn reset(self: *Connection) void {
     _ = self.arena_instance.reset(.free_all);
     self.req = .{};
     self.rsp = .{};
 }
 
+/// Shutdown connection
 fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
     if (maybe_err) |err| switch (err) {
         // timeout or server close
@@ -184,9 +200,9 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
             if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace);
         },
     };
-    try self.reset();
-    try self.sendfile_op.close();
+    self.reset();
 
+    try self.sendfile_op.close();
     if (self.protocol == .https) {
         try self.io.tlsCloseNotify(self.fd);
     }
@@ -508,10 +524,13 @@ const FileStat = struct {
     };
 
     io: *Io,
-    callback: *const fn (*Self, anyerror!Result) anyerror!void,
     root: fs.Dir,
     cache: fs.Dir,
-
+    vtable: struct {
+        ptr: *anyopaque,
+        success: *const fn (*anyopaque, ?Result) anyerror!void,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+    },
     ops: []StatOp = &.{},
     join_count: usize = 0,
 
@@ -532,15 +551,20 @@ const FileStat = struct {
 
     fn join(self: *Self) !void {
         self.join_count -= 1;
-        if (self.join_count > 0)
-            return;
+        if (self.join_count > 0) return;
 
+        self.joinFallible() catch |err| {
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn joinFallible(self: *Self) !void {
         const plain = self.ops[0];
         assert(plain.encoding == .plain);
-        if (plain.err) |e| {
-            try self.callback(self, e);
-            return;
-        }
+        if (plain.err) |err| switch (err) {
+            error.NoSuchFileOrDirectory => return try self.vtable.success(self.vtable.ptr, null),
+            else => return err,
+        };
         const plain_mtime = plain.statx.mtime;
 
         // find best match, shortest one
@@ -560,7 +584,7 @@ const FileStat = struct {
         }
         const match = &self.ops[idx];
 
-        try self.callback(self, .{
+        try self.vtable.success(self.vtable.ptr, .{
             .dir = match.dir,
             .path = match.path,
             .encoding = match.encoding,
@@ -632,15 +656,18 @@ pub fn compressible(file_name: []const u8) bool {
 const RequestRecv = struct {
     const Self = @This();
 
-    op: Io.Op = .{},
-    recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
     allocator: Allocator,
     io: *Io,
+    op: Io.Op = .{},
     fd: fd_t,
-    // callback returns number of bytes consumed
-    callback: *const fn (*Self, anyerror![]const u8) anyerror!usize,
-    no_buf_retries: usize = 0,
+    vtable: struct {
+        ptr: *anyopaque,
+        // success callback returns number of bytes consumed
+        success: *const fn (*anyopaque, []const u8) anyerror!usize,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+    },
     buffer: []u8 = &.{},
+    recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
 
     pub fn prep(self: *Self) !void {
         try self.io.recvProvided(&self.op, onComplete, self.fd, &self.recv_timeout);
@@ -648,16 +675,18 @@ const RequestRecv = struct {
 
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
-        const n = res.bytes() catch |err| {
-            switch (err) {
-                error.SignalInterrupt => try self.prep(),
-                else => _ = try self.callback(self, err),
-            }
-            return;
+        self.onCompleteFallible(res) catch |err| {
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn onCompleteFallible(self: *Self, res: Io.Result) !void {
+        const n = res.bytes() catch |err| switch (err) {
+            error.SignalInterrupt => return try self.prep(),
+            else => return err,
         };
         if (n == 0) {
-            _ = try self.callback(self, error.EndOfStream);
-            return;
+            return error.EndOfStream;
         }
 
         const recv_buf: []const u8 = brk: {
@@ -671,7 +700,7 @@ const RequestRecv = struct {
         };
         defer self.io.putProvidedBuffer(res);
 
-        const m = try self.callback(self, recv_buf);
+        const m = try self.vtable.success(self.vtable.ptr, recv_buf);
         if (m == 0) {
             if (self.buffer.len == 0) {
                 // partial msg in provided recv_buf save that part
@@ -705,9 +734,13 @@ pub const SendBytes = struct {
     const Self = @This();
 
     io: *Io,
-    callback: *const fn (*Self, anyerror!void) anyerror!void,
     op: Io.Op = .{},
     fd: fd_t,
+    vtable: struct {
+        ptr: *anyopaque,
+        success: *const fn (*anyopaque) anyerror!void,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+    },
 
     buffer: []const u8 = undefined,
     more: bool = false,
@@ -717,24 +750,32 @@ pub const SendBytes = struct {
         self.buffer = buffer;
         self.more = more;
         self.offset = 0;
-        try self.prepIo();
+        try self.send();
     }
 
-    fn prepIo(self: *Self) !void {
+    fn send(self: *Self) !void {
         try self.io.send(&self.op, onComplete, self.fd, self.buffer[self.offset..], .{ .more = self.more });
     }
 
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        self.onCompleteFallible(res) catch |err| {
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn onCompleteFallible(self: *Self, res: Io.Result) !void {
         self.offset += res.bytes() catch |err| brk: {
             switch (err) {
                 error.SignalInterrupt => break :brk 0,
-                else => return try self.callback(self, err),
+                else => return err,
             }
         };
-        // short send send more
-        if (self.offset < self.buffer.len) return try self.prepIo();
-        try self.callback(self, {});
+        if (self.offset < self.buffer.len) {
+            // short send
+            return try self.send();
+        }
+        try self.vtable.success(self.vtable.ptr);
     }
 
     pub fn active(self: *Self) bool {
@@ -744,10 +785,18 @@ pub const SendBytes = struct {
 
 const Sendfile = struct {
     const Self = @This();
+    const Metric = struct {
+        bytes: usize,
+        short_send: usize,
+    };
 
     io: *Io,
     op: Io.Op = .{},
-    callback: *const fn (*Self, anyerror!void) anyerror!void,
+    vtable: struct {
+        ptr: *anyopaque,
+        success: *const fn (*anyopaque, Metric) anyerror!void,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+    },
 
     conn_fd: fd_t,
     file_fd: fd_t = -1,
@@ -782,12 +831,9 @@ const Sendfile = struct {
 
     fn onPipe(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
-        res.ok() catch |err| {
-            switch (err) {
-                error.SignalInterrupt => try self.pipe(),
-                else => try self.callback(self, err),
-            }
-            return;
+        res.ok() catch |err| return switch (err) {
+            error.SignalInterrupt => try self.pipe(),
+            else => try self.vtable.fail(self.vtable.ptr, err),
         };
         try self.open();
     }
@@ -795,17 +841,14 @@ const Sendfile = struct {
     fn onOpen(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         assert(self.file_fd == -1);
-        self.file_fd = res.fd() catch |err| {
-            switch (err) {
-                error.SignalInterrupt => try self.open(),
-                else => try self.callback(self, err),
-            }
-            return;
+        self.file_fd = res.fd() catch |err| return switch (err) {
+            error.SignalInterrupt => try self.open(),
+            else => try self.vtable.fail(self.vtable.ptr, err),
         };
         try self.sendfile();
     }
 
-    pub fn sendfile(self: *Self) !void {
+    fn sendfile(self: *Self) !void {
         try self.io.sendfile(
             &self.op,
             onComplete,
@@ -819,9 +862,15 @@ const Sendfile = struct {
 
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        self.onCompleteFallible(res) catch |err| {
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn onCompleteFallible(self: *Self, res: Io.Result) !void {
         self.offset += res.bytes() catch |err| brk: switch (err) {
             error.SignalInterrupt => break :brk 0,
-            else => return try self.callback(self, err),
+            else => return err,
         };
         if (self.offset < self.size) { // short send, send the rest of the file
             self.metric_short_send += 1;
@@ -832,7 +881,7 @@ const Sendfile = struct {
             try self.io.close(self.file_fd);
             self.file_fd = -1;
         }
-        try self.callback(self, {});
+        try self.vtable.success(self.vtable.ptr, .{ .bytes = self.size, .short_send = self.metric_short_send });
     }
 
     pub fn close(self: *Self) !void {

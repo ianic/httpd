@@ -181,7 +181,7 @@ pub const Metric = struct {
     files: struct {
         count: usize = 0,
         bytes: usize = 0,
-        sendfile_more: usize = 0,
+        short_send: usize = 0,
     } = .{},
 
     const Gauge = struct {

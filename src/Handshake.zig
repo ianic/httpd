@@ -41,20 +41,27 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
         .io = self.io,
         .fd = self.fd,
         .buffer = &self.buffer,
-        .callback = onRecv,
+        .vtable = .{
+            .ptr = self,
+            .success = onRecv,
+            .fail = onError,
+        },
     };
     self.send_op = .{
         .io = self.io,
         .fd = self.fd,
-        .callback = onSend,
+        .vtable = .{
+            .ptr = self,
+            .success = onSend,
+            .fail = onError,
+        },
     };
     self.timer = try time.Timer.start();
     try self.recv();
 }
 
-fn onRecv(ptr: *Recv, io_res: anyerror![]const u8) anyerror!void {
-    const self: *Handshake = @alignCast(@fieldParentPtr("recv_op", ptr));
-    const buf = io_res catch |err| return try self.shutdown(err);
+fn onRecv(ptr: *anyopaque, buf: []const u8) anyerror!void {
+    const self: *Handshake = @ptrCast(@alignCast(ptr));
     if (self.hs.done()) {
         try self.upgrade();
         return;
@@ -83,7 +90,8 @@ fn onRecv(ptr: *Recv, io_res: anyerror![]const u8) anyerror!void {
 
 fn recv(self: *Handshake) !void {
     if (self.timer.read() > handshake_timeout * time.ns_per_s) {
-        return try self.shutdown(error.OperationCanceled);
+        try self.shutdown(error.OperationCanceled);
+        return;
     }
     if (self.hs.state == .init) {
         // Read client hello message in the buffer
@@ -118,10 +126,14 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
     self.deinit();
 }
 
-fn onSend(ptr: *SendBytes, res: anyerror!void) !void {
-    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", ptr));
-    res catch |err| return try self.shutdown(err);
+fn onSend(ptr: *anyopaque) !void {
+    const self: *Handshake = @ptrCast(@alignCast(ptr));
     try self.recv();
+}
+
+fn onError(ptr: *anyopaque, err: anyerror) !void {
+    const self: *Handshake = @ptrCast(@alignCast(ptr));
+    try self.shutdown(err);
 }
 
 fn upgrade(self: *Handshake) !void {
@@ -149,7 +161,11 @@ const Recv = struct {
     io: *Io,
     op: Io.Op = .{},
     fd: fd_t,
-    callback: *const fn (*Self, anyerror![]const u8) anyerror!void,
+    vtable: struct {
+        ptr: *anyopaque,
+        success: *const fn (*anyopaque, []const u8) anyerror!void,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+    },
 
     buffer: []u8,
     end: usize = 0,
@@ -169,8 +185,8 @@ const Recv = struct {
     }
 
     pub fn recvExact(self: *Self, n: usize) !void {
+        self.count = if (self.kind == .peek) n - self.end else n;
         self.kind = .recv;
-        self.count = n;
         try self.prep();
     }
 
@@ -186,6 +202,34 @@ const Recv = struct {
         try self.io.recv(&self.op, onComplete, self.fd, .{ .buffer = buf }, .{ .peek = self.kind == .peek }, &self.recv_timeout);
     }
 
+    fn onComplete(res: Io.Result) !void {
+        const self = res.parentPtr(Self, "op");
+        self.onCompleteFallible(res) catch |err| {
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn onCompleteFallible(self: *Self, res: Io.Result) !void {
+        const n = res.bytes() catch |err| return switch (err) {
+            error.SignalInterrupt => try self.prep(),
+            else => err,
+        };
+        if (n == 0) {
+            return error.EndOfStream;
+        }
+        if (self.kind == .peek) {
+            _ = try self.vtable.success(self.vtable.ptr, self.buffer[0 .. self.end + n]);
+            return;
+        }
+        self.end += n;
+        if (self.count > 0) {
+            self.count -= n;
+            if (self.count > 0) return try self.prep();
+        }
+        try self.vtable.success(self.vtable.ptr, self.buffer[0..self.end]);
+    }
+
+    // n bytes is consumed from the buffer
     pub fn take(self: *Self, n: usize) void {
         if (n == 0 or self.kind == .peek) return;
         assert(n <= self.end);
@@ -195,31 +239,5 @@ const Recv = struct {
         }
         std.mem.copyForwards(u8, self.buffer, self.buffer[n..self.end]);
         self.offset = n;
-    }
-
-    fn onComplete(res: Io.Result) !void {
-        const self = res.parentPtr(Self, "op");
-        const n = res.bytes() catch |err| {
-            switch (err) {
-                error.SignalInterrupt => try self.prep(),
-                else => try self.callback(self, err),
-            }
-            return;
-        };
-        if (n == 0) {
-            try self.callback(self, error.EndOfStream);
-            return;
-        }
-
-        if (self.kind == .peek) {
-            try self.callback(self, self.buffer[0 .. self.end + n]);
-            return;
-        }
-        self.end += n;
-        if (self.count > 0) {
-            self.count -= n;
-            if (self.count > 0) return try self.prep();
-        }
-        try self.callback(self, self.buffer[0..self.end]);
     }
 };
