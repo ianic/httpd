@@ -115,19 +115,24 @@ fn onFileStat(ptr: *anyopaque, fsr: ?FileStat.Result) !void {
     const rsp = &self.rsp;
     rsp.fsr = fsr;
     try rsp.init(self.arena, self.req);
-    try self.send_op.prep(rsp.header, rsp.hasBody());
+    try self.send_op.prep(rsp.header, self.hasBody());
+}
+
+fn hasBody(self: Connection) bool {
+    return !self.req.onlyHeader() and self.rsp.hasBody();
 }
 
 /// Header is sent, prepare sending body
 fn onHeader(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
-    if (self.rsp.fsr) |fsr| {
-        // there is file to send as body
-        try self.sendfile_op.prep(fsr.dir, fsr.path, fsr.stat.size);
+    if (!self.hasBody()) {
+        // no body and header sent
+        try self.done();
         return;
     }
-    // no body
-    try self.done();
+    // there is file to send as body
+    const fsr = self.rsp.fsr.?;
+    try self.sendfile_op.prep(fsr.dir, fsr.path, fsr.stat.size);
 }
 
 /// Body is sent
@@ -230,6 +235,7 @@ const Request = struct {
     keep_alive: bool = false,
     accept_encoding: ?[]ContentEncoding = null,
     size: usize = 0,
+    method: http.Method = .GET,
 
     /// Returns null if recv_buf doesn't hold full http request
     fn parse(allocator: Allocator, buf: []const u8) !?Request {
@@ -240,14 +246,17 @@ const Request = struct {
         }
 
         const head = try Head.parse(buf[0..n]);
-        const content_length: u64 = head.content_length orelse 0;
-        if (!(head.method == .GET and content_length == 0)) {
+        if (head.method != .GET and head.method != .HEAD) {
             return error.BadRequest;
         }
+        if (head.content_length) |content_length| if (content_length != 0) {
+            return error.BadRequest;
+        };
 
         var req: Request = .{
             .keep_alive = head.keep_alive,
             .size = n,
+            .method = head.method,
         };
         if (head.etag) |et| { // parse etag
             var it = mem.splitScalar(u8, et, '-');
@@ -270,6 +279,10 @@ const Request = struct {
         }
 
         return req;
+    }
+
+    fn onlyHeader(req: Request) bool {
+        return req.method == .HEAD;
     }
 
     fn deinit(req: *Request, allocator: Allocator) void {
