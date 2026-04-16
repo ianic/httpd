@@ -2,7 +2,6 @@
 /// descriptor to the server.
 const std = @import("std");
 const assert = std.debug.assert;
-const net = std.net;
 const time = std.time;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
@@ -33,7 +32,8 @@ hs: tls.nonblock.Server = undefined,
 buffer: [tls.output_buffer_len]u8 = undefined,
 recv_op: Recv = undefined,
 send_op: SendBytes = undefined,
-timer: time.Timer = undefined,
+
+timer: @import("Timer.zig"),
 
 pub fn init(self: *Handshake, config: tls.config.Server) !void {
     self.hs = .init(config);
@@ -56,7 +56,7 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
             .fail = onError,
         },
     };
-    self.timer = try time.Timer.start();
+    self.timer.start();
     try self.recv();
 }
 
@@ -67,7 +67,8 @@ fn onRecv(ptr: *anyopaque, buf: []const u8) anyerror!void {
         return;
     }
 
-    var hs_timer = try time.Timer.start();
+    var hs_timer = self.timer.clone();
+    hs_timer.start();
     const hs_res = self.hs.run(buf, &self.buffer) catch |err| return try self.shutdown(err);
     self.server.metric.handshake.duration +%= hs_timer.read();
     self.recv_op.take(hs_res.recv_pos);
@@ -93,6 +94,7 @@ fn recv(self: *Handshake) !void {
         try self.shutdown(error.OperationCanceled);
         return;
     }
+
     if (self.hs.state == .init) {
         // Read client hello message in the buffer
         try self.recv_op.recv();
@@ -118,7 +120,7 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
         else => {
             // unexpected error
             log.warn("{} failed {}", .{ self.fd, err });
-            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace);
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         },
     };
 

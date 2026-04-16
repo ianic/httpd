@@ -4,3 +4,4 @@
 /tmp/
 /callgrind.out.*
 /site/
+/zig-pkg/

@@ -3,7 +3,6 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
 const fd_t = linux.fd_t;
-const net = std.net;
 const fs = std.fs;
 const mem = std.mem;
 const Allocator = mem.Allocator;
@@ -18,19 +17,21 @@ const log = std.log.scoped(.server);
 const Server = @This();
 
 /// Static site root.
-root: fs.Dir,
+root: std.Io.Dir,
 /// Where to find precompressed files.
-cache: fs.Dir,
+cache: std.Io.Dir,
 /// Basic metric counters.
 metric: Metric = .{},
 
 gpa: Allocator,
+std_io: std.Io,
 io: *Io,
 listeners: std.AutoArrayHashMapUnmanaged(*Listener, void) = .empty,
 connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
-/// Tls certificate and private key pair. Null if cert argument is not provided.
-/// If null https listener is not started.
-tls_auth: ?tls.config.CertKeyPair,
+/// Tls config with certificate and private key pair.
+/// If tls_config.auht is null https listener is not started.
+tls_config: tls.config.Server,
+timer: @import("Timer.zig"),
 
 state: State = .active,
 const State = enum {
@@ -39,7 +40,7 @@ const State = enum {
 };
 
 /// Ciphers supported by both tls handshake library and kernel
-const cipher_suites = &[_]tls.config.CipherSuite{
+pub const cipher_suites = &[_]tls.config.CipherSuite{
     .AES_128_GCM_SHA256,
     .AES_256_GCM_SHA384,
     .CHACHA20_POLY1305_SHA256,
@@ -49,15 +50,15 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
     try self.listeners.ensureUnusedCapacity(self.gpa, 2);
     // http
     {
-        const addr = try net.Address.resolveIp("0.0.0.0", http_port);
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", http_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr };
         try listener.init();
         self.listeners.putAssumeCapacity(listener, {});
     }
     // https
-    if (self.tls_auth) |_| {
-        const addr = try net.Address.resolveIp("0.0.0.0", https_port);
+    if (self.tls_config.auth) |_| {
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", https_port);
         const listener = try self.gpa.create(Listener);
         listener.* = .{ .server = self, .io = self.io, .addr = addr, .protocol = .tls };
         try listener.init();
@@ -66,7 +67,6 @@ pub fn init(self: *Server, http_port: u16, https_port: u16) !void {
 }
 
 pub fn deinit(self: *Server) void {
-    if (self.tls_auth) |*a| a.deinit(self.gpa);
     for (self.listeners.keys()) |listener| {
         self.gpa.destroy(listener);
     }
@@ -97,11 +97,8 @@ pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
         },
         .tls => {
             const handshake = try self.gpa.create(Handshake);
-            handshake.* = .{ .server = self, .io = self.io, .fd = fd };
-            try handshake.init(.{
-                .auth = if (self.tls_auth) |*a| a else null,
-                .cipher_suites = cipher_suites,
-            });
+            handshake.* = .{ .server = self, .io = self.io, .fd = fd, .timer = self.timer.clone() };
+            try handshake.init(self.tls_config);
             self.metric.handshake.count +%= 1;
         },
     }

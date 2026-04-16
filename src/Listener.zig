@@ -1,6 +1,5 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const net = std.net;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
 
@@ -12,23 +11,33 @@ const Listener = @This();
 
 server: *Server,
 io: *Io,
-addr: net.Address,
+addr: std.Io.net.IpAddress,
 protocol: Server.Protocol = .http,
 fd: fd_t = -1,
 op: Io.Op = .{},
+posix_addr: std.Io.Threaded.PosixAddress = undefined,
 
 fn parentPtr(res: Io.Result) *Listener {
     return @alignCast(@fieldParentPtr("op", res.ptr));
 }
 
 pub fn init(self: *Listener) !void {
-    try self.io.socket(&self.op, onSocket, &self.addr);
+    const family = std.Io.Threaded.posixAddressFamily(&self.addr);
+    try self.io.socket(&self.op, onSocket, family);
 }
 
 fn onSocket(res: Io.Result) !void {
     const self = parentPtr(res);
     self.fd = try res.fd();
-    try self.io.listen(&self.op, onListen, &self.addr, self.fd, .{ .kernel_backlog = 1024, .reuse_address = true });
+    const addr_len = std.Io.Threaded.addressToPosix(&self.addr, &self.posix_addr);
+    try self.io.listen(
+        &self.op,
+        onListen,
+        &self.posix_addr.any,
+        addr_len,
+        self.fd,
+        .{ .kernel_backlog = 1024, .reuse_address = true },
+    );
 }
 
 fn onListen(res: Io.Result) !void {

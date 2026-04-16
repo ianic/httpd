@@ -20,77 +20,89 @@ const commands: [3]struct {
     .{ .bin = "zstd", .flags = "-kfq", .ext = ".zst" },
 };
 
-pub fn compress(allocator: Allocator, root: fs.Dir, cache_dir: fs.Dir) !void {
-    try ensureBin(allocator);
-
-    var dir = try root.openDir(".", .{ .iterate = true });
-    defer dir.close();
-
-    var pool: Thread.Pool = undefined;
-    try Thread.Pool.init(&pool, Thread.Pool.Options{
-        .allocator = allocator,
-        .n_jobs = try Thread.getCpuCount(),
+pub fn compress(init: std.process.Init, gpa: Allocator, root: std.Io.Dir, cache_dir: std.Io.Dir) !void {
+    var threaded: std.Io.Threaded = .init(gpa, .{
+        .environ = init.minimal.environ,
+        .async_limit = std.Io.Limit.limited(try std.Thread.getCpuCount()),
     });
-    defer pool.deinit();
+    defer threaded.deinit();
+    const io = threaded.io();
 
-    var walker = try dir.walk(allocator);
+    try ensureBin(io);
+
+    var dir = try root.openDir(io, ".", .{ .iterate = true });
+    defer dir.close(io);
+
+    var group: std.Io.Group = .init;
+    var walker = try dir.walk(gpa);
     defer walker.deinit();
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind == .file and compressible(entry.path)) {
             if (fs.path.dirname(entry.path)) |dir_name| {
-                try cache_dir.makePath(dir_name);
+                try cache_dir.createDirPath(io, dir_name);
             }
-            const path = try allocator.dupe(u8, entry.path);
-            try pool.spawn(compressFile, .{ allocator, dir, path, cache_dir });
+            const path = try gpa.dupe(u8, entry.path);
+            group.async(io, compressFile, .{ io, gpa, dir, path, cache_dir });
         }
     }
+    try group.await(io);
 }
 
-fn compressFile(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) void {
-    defer allocator.free(path);
-    compressFileFallible(allocator, dir, path, cache_dir) catch |err| {
+fn compressFile(io: std.Io, gpa: Allocator, dir: std.Io.Dir, path: []const u8, cache_dir: std.Io.Dir) void {
+    defer gpa.free(path);
+    compressFileFallible(io, gpa, dir, path, cache_dir) catch |err| {
         log.err("compress '{s}' failed {}", .{ path, err });
     };
 }
 
-fn ensureBin(allocator: Allocator) !void {
+fn ensureBin(io: std.Io) !void {
     for (commands) |cmd| {
-        var child = std.process.Child.init(&[_][]const u8{ cmd.bin, "--version" }, allocator);
-        child.stdout_behavior = .Ignore;
-        const term = child.spawnAndWait() catch |err| {
+        const argv = &[_][]const u8{ cmd.bin, "--version" };
+        var child = std.process.spawn(io, .{
+            .argv = argv,
+            .stdout = .ignore,
+        }) catch |err| {
             switch (err) {
                 error.FileNotFound => log.err("{s} not found in PATH", .{cmd.bin}),
                 else => {},
             }
             return err;
         };
-        if (term.Exited != 0) {
-            log.err("{s} exit: {}", .{ cmd.bin, term.Exited });
+        const term = try child.wait(io);
+        if (term.exited != 0) {
+            log.err("{s} exit: {}", .{ cmd.bin, term.exited });
         }
     }
 }
 
-fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cache_dir: fs.Dir) !void {
-    const stat = try dir.statFile(path);
+fn compressFileFallible(io: std.Io, gpa: Allocator, dir: std.Io.Dir, path: []const u8, cache_dir: std.Io.Dir) !void {
+    const stat = try dir.statFile(io, path, .{});
     if (stat.size < compress_min_file_size) {
         return;
     }
 
     for (commands) |cmd| {
-        const c_path = try mem.join(allocator, "", &.{ path, cmd.ext });
-        defer allocator.free(c_path);
-        if (cache_dir.statFile(c_path)) |c_stat| {
-            if (c_stat.mtime == stat.mtime) {
+        const c_path = try mem.joinZ(gpa, "", &.{ path, cmd.ext });
+        defer gpa.free(c_path);
+        if (cache_dir.statFile(io, c_path, .{})) |c_stat| {
+            if (c_stat.mtime.nanoseconds == stat.mtime.nanoseconds) {
                 continue;
             }
         } else |_| {}
 
-        var child = std.process.Child.init(&[_][]const u8{ cmd.bin, cmd.flags, path }, allocator);
-        child.cwd_dir = dir;
-        const term = try child.spawnAndWait();
-        if (term.Exited == 0) {
-            try posix.renameat(dir.fd, c_path, cache_dir.fd, c_path);
-            const c_stat = try cache_dir.statFile(c_path);
+        const argv = &[_][]const u8{ cmd.bin, cmd.flags, path };
+        var child = try std.process.spawn(io, .{
+            .argv = argv,
+            .cwd = .{ .dir = dir },
+        });
+
+        const term = try child.wait(io);
+        if (term.exited == 0) {
+            switch (posix.system.errno(posix.system.renameat(dir.handle, c_path, cache_dir.handle, c_path))) {
+                .SUCCESS => {},
+                else => |err| return posix.unexpectedErrno(err),
+            }
+            const c_stat = try cache_dir.statFile(io, c_path, .{});
             log.info("{s:<6} {d:5.2}% {}->{} {s}", .{
                 cmd.bin,
                 @as(f64, @floatFromInt(c_stat.size * 100)) / @as(f64, @floatFromInt(stat.size)),
@@ -99,7 +111,7 @@ fn compressFileFallible(allocator: Allocator, dir: fs.Dir, path: []const u8, cac
                 path,
             });
         } else {
-            log.err("{s} {s} exit: {}", .{ cmd.bin, path, term.Exited });
+            log.err("{s} {s} exit: {}", .{ cmd.bin, path, term.exited });
         }
     }
 }

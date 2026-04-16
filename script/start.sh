@@ -2,7 +2,7 @@
 set -e
 cd $(git rev-parse --show-toplevel)
 
-zig build -Doptimize=ReleaseFast
+zig build #-Doptimize=ReleaseFast
 
 ulimit -n 65535                                                                                                     # rise open files limit
 zig-out/bin/httpd compress --root site/root --cache site/cache                                                      # precompress files

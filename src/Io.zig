@@ -2,7 +2,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
-const net = std.net;
 const mem = std.mem;
 const math = std.math;
 const time = std.time;
@@ -19,6 +18,7 @@ recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: []linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
+timer: @import("Timer.zig"),
 
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);
@@ -61,7 +61,7 @@ pub fn tick(io: *Io) !void {
         else => return err,
     };
 
-    var timer = try time.Timer.start();
+    io.timer.start();
     while (io.cqes.len > 0) {
         const cqe = io.cqes[0];
         io.cqes = io.cqes[1..];
@@ -78,7 +78,7 @@ pub fn tick(io: *Io) !void {
             };
         }
     }
-    io.metric.tick_duration +%= timer.read();
+    io.metric.tick_duration +%= io.timer.read();
 }
 
 fn getCqes(io: *Io) !void {
@@ -120,9 +120,9 @@ pub fn drain(io: *Io) !void {
     }
 }
 
-pub fn socket(io: *Io, op: *Op, cb: Op.Callback, addr: *const net.Address) !void {
+pub fn socket(io: *Io, op: *Op, cb: Op.Callback, family: posix.sa_family_t) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.socket_direct_alloc(op.prep(cb, io), addr.any.family, linux.SOCK.STREAM, 0, 0);
+    _ = try io.ring.socket_direct_alloc(op.prep(cb, io), family, linux.SOCK.STREAM, 0, 0);
 }
 
 pub const ListenOption = struct {
@@ -130,7 +130,15 @@ pub const ListenOption = struct {
     kernel_backlog: u31 = 128,
 };
 
-pub fn listen(io: *Io, op: *Op, cb: Op.Callback, addr: *const net.Address, fd: fd_t, opt: ListenOption) !void {
+pub fn listen(
+    io: *Io,
+    op: *Op,
+    cb: Op.Callback,
+    addr: *const posix.sockaddr,
+    addr_len: posix.socklen_t,
+    fd: fd_t,
+    opt: ListenOption,
+) !void {
     try io.ensureSqCapacity(4);
     var sqe: *linux.io_uring_sqe = undefined;
     if (opt.reuse_address) {
@@ -139,7 +147,7 @@ pub fn listen(io: *Io, op: *Op, cb: Op.Callback, addr: *const net.Address, fd: f
         sqe = try io.ring.setsockopt(0, fd, linux.SOL.SOCKET, linux.SO.REUSEPORT, yes_socket_option);
         sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
-    sqe = try io.ring.bind(0, fd, &addr.any, addr.getOsSockLen(), 0);
+    sqe = try io.ring.bind(0, fd, addr, addr_len, 0);
     sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.listen(op.prep(cb, io), fd, opt.kernel_backlog, 0);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
@@ -250,7 +258,7 @@ pub fn sendmsg(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, msg: *const posix.ms
 
 pub fn statx(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8, stat: *linux.Statx) !void {
     try io.ensureSqCapacity(1);
-    _ = try io.ring.statx(op.prep(cb, io), dir, path, 0, linux.STATX_BASIC_STATS, stat);
+    _ = try io.ring.statx(op.prep(cb, io), dir, path, 0, linux.STATX.BASIC_STATS, stat);
 }
 
 pub fn openAt(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [*:0]const u8, flags: linux.O, mode: linux.mode_t) !void {
@@ -261,7 +269,7 @@ pub fn openAt(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [*:0]const u8,
 pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8, stat: ?*linux.Statx) !void {
     try io.ensureSqCapacity(2);
     if (stat) |s| {
-        var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX_BASIC_STATS, s);
+        var sqe = try io.ring.statx(0, dir, path, 0, linux.STATX.BASIC_STATS, s);
         sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_CQE_SKIP_SUCCESS;
     }
     return io.openAt(op, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);

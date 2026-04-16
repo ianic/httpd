@@ -1,6 +1,5 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const net = std.net;
 const fs = std.fs;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
@@ -202,7 +201,7 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
         else => {
             // unexpected error
             log.warn("{} failed {}", .{ self.fd, err });
-            if (@errorReturnTrace()) |trace| std.debug.dumpStackTrace(trace);
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         },
     };
     self.reset();
@@ -230,7 +229,7 @@ const Request = struct {
     path: [:0]const u8 = &.{},
     etag: struct {
         size: u64 = 0,
-        mtime: i128 = 0,
+        mtime: i96 = 0,
     } = .{},
     keep_alive: bool = false,
     accept_encoding: ?[]ContentEncoding = null,
@@ -260,7 +259,7 @@ const Request = struct {
         };
         if (head.etag) |et| { // parse etag
             var it = mem.splitScalar(u8, et, '-');
-            req.etag.mtime = std.fmt.parseInt(i128, it.first(), 16) catch 0;
+            req.etag.mtime = std.fmt.parseInt(i96, it.first(), 16) catch 0;
             req.etag.size = std.fmt.parseInt(u64, it.rest(), 16) catch 0;
         }
         req.path = if (head.target.len <= 1)
@@ -338,8 +337,8 @@ const Response = struct {
         }
     }
 
-    fn etagMatch(stat: fs.File.Stat, req: Request) bool {
-        return stat.size == req.etag.size and stat.mtime == req.etag.mtime;
+    fn etagMatch(stat: std.Io.File.Stat, req: Request) bool {
+        return stat.size == req.etag.size and stat.mtime.nanoseconds == req.etag.mtime;
     }
 
     fn hasBody(rsp: Response) bool {
@@ -361,7 +360,7 @@ const Response = struct {
 
     fn ok(
         allocator: Allocator,
-        stat: fs.File.Stat,
+        stat: std.Io.File.Stat,
         file: [:0]const u8,
         encoding: ContentEncoding,
         keep_alive: bool,
@@ -379,12 +378,12 @@ const Response = struct {
             stat.size,
             stat.mtime,
             stat.size,
-            toLastModified(&buf, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s))),
+            toLastModified(&buf, @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s))),
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn notModified(allocator: Allocator, stat: fs.File.Stat, keep_alive: bool) ![]const u8 {
+    fn notModified(allocator: Allocator, stat: std.Io.File.Stat, keep_alive: bool) ![]const u8 {
         var buf: [32]u8 = undefined;
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
@@ -393,7 +392,7 @@ const Response = struct {
         return try std.fmt.allocPrint(allocator, fmt, .{
             stat.mtime,
             stat.size,
-            toLastModified(&buf, @intCast(@divTrunc(stat.mtime, std.time.ns_per_s))),
+            toLastModified(&buf, @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s))),
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
@@ -530,15 +529,15 @@ const FileStat = struct {
     const Self = @This();
 
     const Result = struct {
-        dir: fs.Dir,
+        dir: std.Io.Dir,
         path: [:0]const u8 = &.{},
-        stat: fs.File.Stat,
+        stat: std.Io.File.Stat,
         encoding: ContentEncoding,
     };
 
     io: *Io,
-    root: fs.Dir,
-    cache: fs.Dir,
+    root: std.Io.Dir,
+    cache: std.Io.Dir,
     vtable: struct {
         ptr: *anyopaque,
         success: *const fn (*anyopaque, ?Result) anyerror!void,
@@ -601,7 +600,7 @@ const FileStat = struct {
             .dir = match.dir,
             .path = match.path,
             .encoding = match.encoding,
-            .stat = fs.File.Stat.fromLinux(match.statx),
+            .stat = try std.Io.Threaded.statFromLinux(&match.statx),
         });
     }
 
@@ -617,14 +616,14 @@ const FileStat = struct {
     const StatOp = struct {
         parent: *FileStat,
         op: Io.Op = .{},
-        dir: fs.Dir,
+        dir: std.Io.Dir,
         path: [:0]const u8 = &.{},
         encoding: ContentEncoding,
         statx: linux.Statx = mem.zeroes(linux.Statx),
         err: ?anyerror = null,
 
         fn prep(op: *StatOp) !void {
-            try op.parent.io.statx(&op.op, onComplete, op.dir.fd, op.path, &op.statx);
+            try op.parent.io.statx(&op.op, onComplete, op.dir.handle, op.path, &op.statx);
         }
 
         fn onComplete(res: Io.Result) !void {
@@ -814,14 +813,14 @@ const Sendfile = struct {
     conn_fd: fd_t,
     file_fd: fd_t = -1,
     pipe_fds: [2]fd_t = .{ -1, -1 },
-    dir: fs.Dir = undefined,
+    dir: std.Io.Dir = undefined,
     path: [:0]const u8 = undefined,
     size: usize = 0,
 
     offset: usize = 0,
     metric_short_send: usize = 0,
 
-    pub fn prep(self: *Self, dir: fs.Dir, path: [:0]const u8, size: usize) !void {
+    pub fn prep(self: *Self, dir: std.Io.Dir, path: [:0]const u8, size: usize) !void {
         self.dir = dir;
         self.path = path;
         self.size = size;
@@ -839,7 +838,7 @@ const Sendfile = struct {
     }
 
     fn open(self: *Self) !void {
-        try self.io.openRead(&self.op, Self.onOpen, self.dir.fd, self.path, null);
+        try self.io.openRead(&self.op, Self.onOpen, self.dir.handle, self.path, null);
     }
 
     fn onPipe(res: Io.Result) !void {

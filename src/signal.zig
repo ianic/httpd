@@ -2,13 +2,15 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.signal);
 
-var signal = std.atomic.Value(c_int).init(posix.SIG.UNUSED);
+const empty = posix.SIG.SYS;
 
-pub fn get() ?c_int {
+var signal = std.atomic.Value(posix.SIG).init(empty);
+
+pub fn get() ?posix.SIG {
     const sig = signal.load(.monotonic);
-    if (sig == posix.SIG.UNUSED)
+    if (sig == empty)
         return null;
-    signal.store(posix.SIG.UNUSED, .release);
+    signal.store(empty, .release);
     return sig;
 }
 
@@ -16,7 +18,7 @@ pub fn watch() void {
     var act = posix.Sigaction{
         .handler = .{
             .handler = struct {
-                fn wrapper(sig: c_int) callconv(.c) void {
+                fn wrapper(sig: posix.SIG) callconv(.c) void {
                     signal.store(sig, .release);
                     //log.debug("signal received {}", .{sig});
                 }

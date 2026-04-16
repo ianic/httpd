@@ -13,7 +13,7 @@ const signal = @import("signal.zig");
 const compress = @import("compress.zig").compress;
 const log = std.log.scoped(.main);
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     signal.watch();
 
     var dbga = std.heap.DebugAllocator(.{}){};
@@ -26,15 +26,15 @@ pub fn main() !void {
         else => {},
     };
 
-    const args = try Args.parse();
+    const args = try Args.parse(init);
     const root = args.root.?;
 
     if (args.command == .compress) {
-        try compress(gpa, root, args.cache.?);
+        try compress(init, gpa, root, args.cache.?);
         return;
     }
 
-    var io: Io = .{};
+    var io: Io = .{ .timer = .{ .io = init.io } };
     try io.init(gpa, .{
         .entries = args.sqes,
         .fd_nr = args.fds,
@@ -42,15 +42,25 @@ pub fn main() !void {
     });
     defer io.deinit(gpa);
 
+    const rng_impl: std.Random.IoSource = .{ .io = init.io };
+    var tls_auth: ?tls.config.CertKeyPair = if (args.cert) |dir| try tls.config.CertKeyPair.fromFilePath(gpa, init.io, dir, "cert.pem", "key.pem") else null;
     var server: Server = .{
         .gpa = gpa,
         .io = &io,
         .root = root,
         .cache = args.cache orelse root,
-        .tls_auth = if (args.cert) |dir| try tls.config.CertKeyPair.fromFilePath(gpa, dir, "cert.pem", "key.pem") else null,
+        .tls_config = .{
+            .auth = if (tls_auth) |*a| a else null,
+            .cipher_suites = Server.cipher_suites,
+            .now = .zero,
+            .rng = rng_impl.interface(),
+        },
+        .std_io = init.io,
+        .timer = .{ .io = init.io },
     };
     try server.init(args.http_port, args.https_port);
     defer server.deinit();
+    defer if (tls_auth) |*a| a.deinit(gpa);
 
     while (true) {
         try io.tick();
@@ -76,9 +86,9 @@ pub fn main() !void {
 }
 
 const Args = struct {
-    root: ?fs.Dir = null,
-    cache: ?fs.Dir = null,
-    cert: ?fs.Dir = null,
+    root: ?std.Io.Dir = null,
+    cache: ?std.Io.Dir = null,
+    cert: ?std.Io.Dir = null,
     http_port: u16 = 8080,
     https_port: u16 = 8443,
     buf_count: u16 = 2,
@@ -92,8 +102,9 @@ const Args = struct {
         compress,
     };
 
-    pub fn parse() !Args {
-        var iter = std.process.args();
+    pub fn parse(init: std.process.Init) !Args {
+        const io = init.io;
+        var iter = init.minimal.args.iterate();
         _ = iter.next();
         var args: Args = .{};
 
@@ -122,11 +133,11 @@ const Args = struct {
                         args.buf_count = v;
                     } else if (parseInt(u32, "buf-size", arg, &iter)) |v| {
                         args.buf_size = v;
-                    } else if (parseDir("root", arg, &iter, false)) |v| {
+                    } else if (parseDir(io, "root", arg, &iter, false)) |v| {
                         args.root = v;
-                    } else if (parseDir("cache", arg, &iter, true)) |v| {
+                    } else if (parseDir(io, "cache", arg, &iter, true)) |v| {
                         args.cache = v;
-                    } else if (parseDir("cert", arg, &iter, false)) |v| {
+                    } else if (parseDir(io, "cert", arg, &iter, false)) |v| {
                         args.cert = v;
                     } else if (mem.eql(u8, "-h", arg) or mem.eql(u8, "--help", arg)) {
                         help(0);
@@ -136,9 +147,9 @@ const Args = struct {
                     }
                 },
                 .compress => {
-                    if (parseDir("root", arg, &iter, false)) |v| {
+                    if (parseDir(io, "root", arg, &iter, false)) |v| {
                         args.root = v;
-                    } else if (parseDir("cache", arg, &iter, true)) |v| {
+                    } else if (parseDir(io, "cache", arg, &iter, true)) |v| {
                         args.cache = v;
                     } else if (mem.eql(u8, "-h", arg) or mem.eql(u8, "--help", arg)) {
                         help(0);
@@ -162,11 +173,11 @@ const Args = struct {
         return args;
     }
 
-    fn parseDir(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator, mk_if_not_found: bool) ?fs.Dir {
+    fn parseDir(io: std.Io, comptime name: []const u8, arg: [:0]const u8, iter: *std.process.Args.Iterator, mk_if_not_found: bool) ?std.Io.Dir {
         if (parseString(name, arg, iter)) |v| {
-            return fs.cwd().openDir(v, .{}) catch |err| {
+            return std.Io.Dir.cwd().openDir(io, v, .{}) catch |err| {
                 if (mk_if_not_found and err == error.FileNotFound) {
-                    if (mkDir(v)) |d| return d;
+                    if (mkDir(io, v)) |d| return d;
                 }
                 fatal("cant't open dir '{s}' {}", .{ v, err });
             };
@@ -174,12 +185,12 @@ const Args = struct {
         return null;
     }
 
-    fn mkDir(path: []const u8) ?fs.Dir {
-        fs.cwd().makePath(path) catch return null;
-        return fs.cwd().openDir(path, .{}) catch return null;
+    fn mkDir(io: std.Io, path: []const u8) ?std.Io.Dir {
+        std.Io.Dir.cwd().createDirPath(io, path) catch return null;
+        return std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
     }
 
-    fn parseInt(T: type, comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?T {
+    fn parseInt(T: type, comptime name: []const u8, arg: [:0]const u8, iter: *std.process.Args.Iterator) ?T {
         const arg_name1 = "--" ++ name ++ "=";
         const arg_name2 = "--" ++ name;
 
@@ -203,7 +214,7 @@ const Args = struct {
         return null;
     }
 
-    fn parseString(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.ArgIterator) ?[]const u8 {
+    fn parseString(comptime name: []const u8, arg: [:0]const u8, iter: *std.process.Args.Iterator) ?[]const u8 {
         const arg_name1 = "--" ++ name ++ "=";
         const arg_name2 = "--" ++ name;
 
