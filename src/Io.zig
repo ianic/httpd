@@ -292,8 +292,7 @@ pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pi
 pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {
     try io.ensureSqCapacity(1);
 
-    const ring = &io.ring;
-    const sqe = try ring.get_sqe();
+    const sqe = try io.ring.get_sqe();
     const OP_PIPE = 62;
     sqe.prep_rw(@enumFromInt(OP_PIPE), 0, @intFromPtr(fds), 0, 0);
     const file_index: u32 = linux.IORING_FILE_INDEX_ALLOC;
@@ -422,7 +421,7 @@ const Metric = struct {
         // count number of errors
         _ = result(cqe) catch |err| switch (err) {
             error.NoBufferSpaceAvailable => self.err.no_recv_buffer +%= 1,
-            error.NoSuchFileOrDirectory => self.err.file_not_found +%= 1,
+            error.NoSuchFileOrDirectory, error.NotADirectory => self.err.file_not_found +%= 1,
             error.SignalInterrupt => self.err.interrupt +%= 1,
             error.FileTableOverflow => self.err.file_table_overflow +%= 1,
             error.OperationCanceled => self.err.canceled +%= 1,
@@ -483,7 +482,9 @@ test "pipe" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
-    var io: Io = .{};
+    var io: Io = .{
+        .timer = .{ .io = testing.io },
+    };
     try io.init(gpa, .{
         .entries = 128,
         .fd_nr = 128,
