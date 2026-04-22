@@ -43,7 +43,7 @@ sudo modprobe tls
 
 # enable permanently
 # cat /etc/modules-load.d/gnutls.conf
-echo tls | sudo tee /etc/modules-load.d/gnutls.conf
+echo tls | sudo tee /etc/modules-load.d/tls.conf
 ```
 
 

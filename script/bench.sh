@@ -45,6 +45,9 @@ if [ ! -L site/root ]; then
     ln -s site/ziglang.org site/root
 fi
 
+# enable kernel tls
+lsmod | grep -q tls || sudo modprobe tls
+
 # start httpd listening on 8080 http and 8443 https
 zig build -Doptimize=ReleaseFast
 ulimit -n 65535

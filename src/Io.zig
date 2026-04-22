@@ -159,9 +159,9 @@ pub fn ktlsUgrade(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, tx_opt: []const u
     const RX = @as(c_int, 2);
 
     var sqe = try io.ring.setsockopt(0, fd, linux.IPPROTO.TCP, linux.TCP.ULP, "tls");
-    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(0, fd, linux.SOL.TLS, TX, tx_opt);
-    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
     sqe = try io.ring.setsockopt(op.prep(cb, io), fd, linux.SOL.TLS, RX, rx_opt);
     sqe.flags |= linux.IOSQE_FIXED_FILE;
 }
@@ -426,6 +426,8 @@ const Metric = struct {
             error.FileTableOverflow => self.err.file_table_overflow +%= 1,
             error.OperationCanceled => self.err.canceled +%= 1,
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer, error.IOError => self.err.eof +%= 1,
+            error.ProtocolNotAvailable, // when kernel tls is not enabled
+            => self.err.other += 1,
             else => {
                 log.info("error metric unhandled {}", .{err});
                 self.err.other +%= 1;

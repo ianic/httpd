@@ -117,6 +117,9 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
         error.ConnectionResetByPeer,
         error.IOError,
         => {},
+        error.ProtocolNotAvailable => {
+            log.err("{} fail to upgrade to kernel tls {} ", .{ self.fd, err });
+        },
         else => {
             // unexpected error
             log.warn("{} failed {}", .{ self.fd, err });
