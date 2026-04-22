@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         .gpa = gpa,
         .io = &io,
         .root = root,
-        .cache = args.cache orelse root,
+        .cache = args.cache,
         .tls_config = .{
             .auth = if (tls_auth) |*a| a else null,
             .cipher_suites = Server.cipher_suites,
@@ -69,6 +69,10 @@ pub fn main(init: std.process.Init) !void {
             posix.SIG.USR1 => {
                 log.info("metric: {}", .{server.metric});
                 log.info("io metric: {}", .{server.io.metric});
+                log.info(
+                    "sendfile chunk: {}",
+                    .{server.metric.files.short_send_bytes / server.metric.files.short_send_count},
+                );
             },
             else => {
                 log.info("ignoring signal {}", .{sig});

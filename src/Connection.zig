@@ -77,6 +77,7 @@ pub fn init(self: *Connection) !void {
             .fail = onError,
         },
         .conn_fd = self.fd,
+        .metric = &self.server.metric.files,
     };
 
     try self.recv();
@@ -100,10 +101,11 @@ fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
         try self.recv();
         return 0;
     };
+    const just_plain = &[_]ContentEncoding{.plain};
     try self.file_stat_op.prep(
         self.arena,
         self.req.path,
-        self.req.accept_encoding orelse &[_]ContentEncoding{.plain},
+        if (self.server.cache == null) just_plain else self.req.accept_encoding orelse just_plain,
     );
     return self.req.size;
 }
@@ -135,12 +137,8 @@ fn onHeader(ptr: *anyopaque) !void {
 }
 
 /// Body is sent
-fn onSendfile(ptr: *anyopaque, metric: Sendfile.Metric) !void {
+fn onSendfile(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
-    const files = &self.server.metric.files;
-    files.count +%= 1;
-    files.bytes +%= metric.bytes;
-    files.short_send +%= metric.short_send;
     try self.done();
 }
 
@@ -537,7 +535,7 @@ const FileStat = struct {
 
     io: *Io,
     root: std.Io.Dir,
-    cache: std.Io.Dir,
+    cache: ?std.Io.Dir,
     vtable: struct {
         ptr: *anyopaque,
         success: *const fn (*anyopaque, ?Result) anyerror!void,
@@ -553,7 +551,7 @@ const FileStat = struct {
         for (encodings, 0..) |encoding, i| {
             self.ops[i] = .{
                 .parent = self,
-                .dir = if (encoding == .plain) self.root else self.cache,
+                .dir = if (encoding == .plain) self.root else self.cache.?,
                 .encoding = encoding,
                 .path = try mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
             };
@@ -797,16 +795,14 @@ pub const SendBytes = struct {
 
 const Sendfile = struct {
     const Self = @This();
-    const Metric = struct {
-        bytes: usize,
-        short_send: usize,
-    };
 
     io: *Io,
     op: Io.Op = .{},
+    metric: *Server.Metric.Files,
+
     vtable: struct {
         ptr: *anyopaque,
-        success: *const fn (*anyopaque, Metric) anyerror!void,
+        success: *const fn (*anyopaque) anyerror!void,
         fail: *const fn (*anyopaque, anyerror) anyerror!void,
     },
 
@@ -816,9 +812,7 @@ const Sendfile = struct {
     dir: std.Io.Dir = undefined,
     path: [:0]const u8 = undefined,
     size: usize = 0,
-
     offset: usize = 0,
-    metric_short_send: usize = 0,
 
     pub fn prep(self: *Self, dir: std.Io.Dir, path: [:0]const u8, size: usize) !void {
         self.dir = dir;
@@ -880,12 +874,14 @@ const Sendfile = struct {
     }
 
     fn onCompleteFallible(self: *Self, res: Io.Result) !void {
-        self.offset += res.bytes() catch |err| brk: switch (err) {
+        const bytes = res.bytes() catch |err| brk: switch (err) {
             error.SignalInterrupt => break :brk 0,
             else => return err,
         };
+        self.offset += bytes;
         if (self.offset < self.size) { // short send, send the rest of the file
-            self.metric_short_send += 1;
+            self.metric.short_send_count +%= 1;
+            self.metric.short_send_bytes +%= bytes;
             try self.sendfile();
             return;
         }
@@ -893,7 +889,9 @@ const Sendfile = struct {
             try self.io.close(self.file_fd);
             self.file_fd = -1;
         }
-        try self.vtable.success(self.vtable.ptr, .{ .bytes = self.size, .short_send = self.metric_short_send });
+        self.metric.count +%= 1;
+        self.metric.bytes +%= self.size;
+        try self.vtable.success(self.vtable.ptr);
     }
 
     pub fn close(self: *Self) !void {

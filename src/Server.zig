@@ -19,7 +19,7 @@ const Server = @This();
 /// Static site root.
 root: std.Io.Dir,
 /// Where to find precompressed files.
-cache: std.Io.Dir,
+cache: ?std.Io.Dir,
 /// Basic metric counters.
 metric: Metric = .{},
 
@@ -175,11 +175,14 @@ pub const Metric = struct {
         count: usize = 0,
         duration: usize = 0,
     } = .{},
-    files: struct {
+    files: Files = .{},
+
+    pub const Files = struct {
         count: usize = 0,
         bytes: usize = 0,
-        short_send: usize = 0,
-    } = .{},
+        short_send_count: usize = 0,
+        short_send_bytes: usize = 0,
+    };
 
     const Gauge = struct {
         current: usize = 0,
