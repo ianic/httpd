@@ -73,6 +73,15 @@ pub fn main(init: std.process.Init) !void {
                     "sendfile chunk: {}",
                     .{server.metric.files.short_send_bytes / server.metric.files.short_send_count},
                 );
+                const sm = &server.io.metric;
+                log.info(
+                    "operations: {}, enters: {}, operations per enter: {d:.2}, enters from ensure sq capacity: {}",
+                    .{ sm.total, sm.enters, @as(f64, @floatFromInt(sm.total)) / @as(f64, @floatFromInt(sm.enters)), sm.err.ensure_sq_capacity },
+                );
+                log.info(
+                    "operations callbacks total duration: {}ms, {}ns per operation",
+                    .{ sm.tick_duration / std.time.ns_per_ms, sm.tick_duration / sm.total },
+                );
             },
             else => {
                 log.info("ignoring signal {}", .{sig});

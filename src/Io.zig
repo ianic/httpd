@@ -86,10 +86,10 @@ fn getCqes(io: *Io) !void {
         @branchHint(.unlikely);
         return;
     }
-    _ = try io.ring.submit();
-    const n = try io.ring.copy_cqes(io.cqes_buf, 1);
+    _ = try io.ring.submit_and_wait(1);
+    io.metric.enters +%= 1;
+    const n = try io.ring.copy_cqes(io.cqes_buf, 0);
     io.cqes = io.cqes_buf[0..n];
-    try io.ensureSqCapacity(n);
 }
 
 /// Number of unused submission queue entries
@@ -393,6 +393,7 @@ const Metric = struct {
     tick_duration: usize = 0,
     total: usize = 0,
     active: usize = 0, // number of in_kernel completions
+    enters: usize = 0, // number of io_uring_enter calls
 
     err: struct {
         no_recv_buffer: usize = 0,
