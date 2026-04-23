@@ -295,8 +295,7 @@ pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {
     const sqe = try io.ring.get_sqe();
     const OP_PIPE = 62;
     sqe.prep_rw(@enumFromInt(OP_PIPE), 0, @intFromPtr(fds), 0, 0);
-    const file_index: u32 = linux.IORING_FILE_INDEX_ALLOC;
-    sqe.splice_fd_in = @bitCast(file_index); //  sqe_file_index: u32
+    sqe.splice_fd_in = @bitCast(@as(u32, linux.IORING_FILE_INDEX_ALLOC));
     sqe.flags |= linux.IOSQE_FIXED_FILE;
     sqe.user_data = op.prep(cb, io);
 }

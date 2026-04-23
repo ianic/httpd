@@ -27,6 +27,21 @@ oha-tests() {
     rs+=($r)
     echo 1 connection $r
 
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 2 -w --cacert site/ca/cert.pem > tmp/oha-out
+    r=$(grep Requests tmp/oha-out | awk '{print $NF}')
+    rs+=($r)
+    echo 2 connections $r
+
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 5 -w --cacert site/ca/cert.pem > tmp/oha-out
+    r=$(grep Requests tmp/oha-out | awk '{print $NF}')
+    rs+=($r)
+    echo 5 connections $r
+
+    oha -z 1s --no-tui --urls-from-file site/targets-oha -c 10 -w --cacert site/ca/cert.pem > tmp/oha-out
+    r=$(grep Requests tmp/oha-out | awk '{print $NF}')
+    rs+=($r)
+    echo 10 connections $r
+
     oha -z 1s --no-tui --urls-from-file site/targets-oha -c 100 -w --cacert site/ca/cert.pem > tmp/oha-out
     r=$(grep Requests tmp/oha-out | awk '{print $NF}')
     rs+=($r)
@@ -60,14 +75,14 @@ nginx -p "$(pwd)" -c script/nginx.conf -g 'daemon off;' &
 nginx_pid=$!
 sleep 0.2
 
-results+=( "" "http" "" )
+results+=( "" "http" "1c" "1" "2" "5" "10" "100" "500" "" )
 echo -e "http"
 oha-tests http 8080 "$host" httpd
 
 echo -e "\nhttp nginx"
 oha-tests http 8081 "$host" Nginx
 
-results+=( "https" "" )
+results+=( "https" "1c" "1" "2" "5" "10" "100" "500" "" )
 echo -e "\nhttps"
 oha-tests https 8443 "$host" httpd
 
