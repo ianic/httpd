@@ -275,7 +275,19 @@ pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8
     return io.openAt(op, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
-pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
+/// Prepare sendfile for the chunk of the file defined by offset and len. If the
+/// op is null this sendfile will be linked with the next. Set op to null for
+/// all chunks except for the last one.
+pub fn sendfile(
+    io: *Io,
+    op: ?*Op,
+    cb: Op.Callback,
+    fd_out: fd_t,
+    fd_in: fd_t,
+    pipe_fds: [2]fd_t,
+    offset: u64,
+    len: u32,
+) !void {
     // from musl/include/fcnt.h
     const splice_f_nonblock = 0x02;
     const splice_no_offset = math.maxInt(u64);
@@ -284,9 +296,13 @@ pub fn sendfile(io: *Io, op: *Op, cb: Op.Callback, fd_out: fd_t, fd_in: fd_t, pi
     var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_FIXED_FILE;
-    sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    const user_data = if (op) |o| o.prep(cb, io) else 0;
+    sqe = try io.ring.splice(user_data, pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
+    if (op == null) {
+        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
+    }
 }
 
 pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {

@@ -82,6 +82,11 @@ pub fn main(init: std.process.Init) !void {
                     "operations callbacks total duration: {}ms, {}ns per operation",
                     .{ sm.tick_duration / std.time.ns_per_ms, sm.tick_duration / sm.total },
                 );
+                log.info("operations per file: {}/{} = {d:.2} ", .{
+                    sm.total,
+                    server.metric.files.count,
+                    @as(f64, @floatFromInt(sm.total)) / @as(f64, @floatFromInt(server.metric.files.count)),
+                });
             },
             else => {
                 log.info("ignoring signal {}", .{sig});

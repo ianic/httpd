@@ -851,10 +851,10 @@ const Sendfile = struct {
             error.SignalInterrupt => try self.open(),
             else => try self.vtable.fail(self.vtable.ptr, err),
         };
-        try self.sendfile();
-    }
 
-    fn sendfile(self: *Self) !void {
+        // Send first chunk, offset = 0, len = size. Here we still don't know
+        // pipe capacity so we can't determine how many chunk is needed. In
+        // onComplete we will know that capacity.
         try self.io.sendfile(
             &self.op,
             onComplete,
@@ -874,17 +874,36 @@ const Sendfile = struct {
     }
 
     fn onCompleteFallible(self: *Self, res: Io.Result) !void {
-        const bytes = res.bytes() catch |err| brk: switch (err) {
-            error.SignalInterrupt => break :brk 0,
-            else => return err,
-        };
-        self.offset += bytes;
-        if (self.offset < self.size) { // short send, send the rest of the file
+        const chunk = try res.bytes();
+        self.offset += chunk;
+
+        // Short send. Pipe capacity is `chunk`. Send all other chunks, only
+        // last one will call onComplete callback (if op is null no callback is
+        // called). All sendfile operations are linked in the ring.
+        if (self.offset < self.size) {
             self.metric.short_send_count +%= 1;
-            self.metric.short_send_bytes +%= bytes;
-            try self.sendfile();
+            self.metric.short_send_bytes +%= chunk;
+
+            while (true) {
+                const len = @min(chunk, self.size - self.offset);
+                const last = self.offset + len == self.size;
+                try self.io.sendfile(
+                    if (last) &self.op else null,
+                    onComplete,
+                    self.conn_fd,
+                    self.file_fd,
+                    self.pipe_fds,
+                    @intCast(self.offset),
+                    @intCast(len),
+                );
+                if (last) break;
+                self.offset += len;
+            }
+
             return;
         }
+
+        // Success, do cleanup.
         {
             try self.io.close(self.file_fd);
             self.file_fd = -1;
