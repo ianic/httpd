@@ -521,3 +521,148 @@ test "pipe" {
     try testing.expect(handler.fds[1] > 0);
     //std.debug.print("fds: {any}\n", .{handler.fds});
 }
+
+const IoUring = linux.IoUring;
+const testing = std.testing;
+
+fn resize_rings(ring: *IoUring, entries: u32) !void {
+    if (entries == 0) return error.EntriesZero;
+    if (!std.math.isPowerOfTwo(entries)) return error.EntriesNotPowerOfTwo;
+
+    var p = std.mem.zeroInit(linux.io_uring_params, .{
+        .sq_entries = entries,
+        .cq_entries = 0, // leave to default 2 * entries
+        .flags = linux.IORING_SETUP_CLAMP, // clamp to max if entries exceed that
+        .features = linux.IORING_FEAT_SINGLE_MMAP, // asserted in SubmissionQueue.init
+    });
+    try resize_rings_params(ring, &p);
+}
+
+fn resize_rings_params(ring: *IoUring, p: *linux.io_uring_params) !void {
+    // Need to sync internal state before resize
+    _ = ring.flush_sq();
+    // Resize
+    const res = linux.io_uring_register(ring.fd, .REGISTER_RESIZE_RINGS, p, 1);
+    switch (linux.errno(res)) {
+        .SUCCESS => {},
+        // Attempting to resize a ring setup with IORING_SETUP_SINGLE_ISSUER and
+        // the resizing task is different from the one that created/enabled the
+        // ring.
+        .EXIST => return error.InvalidThread,
+        // Copying of p was unsuccessful.
+        .FAULT => return error.Fault,
+        // Invalid flags were specified for the operation or attempt to resize a
+        // ring not setup with IORING_SETUP_DEFER_TASKRUN.
+        .INVAL => return error.ArgumentsInvalid,
+        // The values specified for SQ or CQ entries would cause an overflow.
+        .OVERFLOW => return error.Overflow,
+        .NOSYS => return error.SystemOutdated,
+        else => |ern| return posix.unexpectedErrno(ern),
+    }
+
+    // Create new submission and completion queues
+    var sq = try linux.IoUring.SubmissionQueue.init(ring.fd, p.*);
+    errdefer sq.deinit();
+    var cq = try linux.IoUring.CompletionQueue.init(ring.fd, p.*, sq);
+    errdefer cq.deinit();
+    // Copy pointers from previous submission queue
+    sq.sqe_head = ring.sq.sqe_head;
+    sq.sqe_tail = ring.sq.sqe_tail;
+    for (0..@min(sq.array.len, ring.sq.array.len)) |i| {
+        sq.array[i] = ring.sq.array[i];
+    }
+
+    // Replace queues in the ring
+    ring.sq.deinit();
+    ring.sq = sq;
+    ring.cq.deinit();
+    ring.cq = cq;
+}
+
+test "ring resize" {
+    var ring = try linux.IoUring.init(4, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
+    defer ring.deinit();
+
+    // original sizes
+    try testing.expectEqual(4, ring.sq.sqes.len);
+    try testing.expectEqual(8, ring.cq.cqes.len);
+
+    // create 1 entry in cqe and 2 entries in sqe
+    _ = try ring.nop(42);
+    try testing.expectEqual(1, try ring.submit_and_wait(1));
+    _ = try ring.nop(43);
+    _ = try ring.nop(44);
+    try testing.expectEqual(1, ring.cq_ready());
+    try testing.expectEqual(2, ring.sq_ready());
+
+    // check pointers
+    try testing.expectEqual(1, ring.sq.sqe_head);
+    try testing.expectEqual(3, ring.sq.sqe_tail);
+    try testing.expectEqual(1, ring.sq.head.*);
+    try testing.expectEqual(1, ring.sq.tail.*);
+
+    try resize_rings(&ring, 8);
+
+    // new sizes
+    try testing.expectEqual(8, ring.sq.sqes.len);
+    try testing.expectEqual(16, ring.cq.cqes.len);
+
+    // entries are copied to the new queues
+    try testing.expectEqual(1, ring.cq_ready());
+    try testing.expectEqual(2, ring.sq_ready());
+
+    // check pointers (flush is called in resize)
+    try testing.expectEqual(1, ring.sq.head.*);
+    try testing.expectEqual(3, ring.sq.tail.*);
+    try testing.expectEqual(3, ring.sq.sqe_head);
+    try testing.expectEqual(3, ring.sq.sqe_tail);
+
+    // submit 2 copied seqs
+    try testing.expectEqual(2, try ring.submit_and_wait(2));
+    try testing.expectEqual(3, ring.cq_ready());
+    try testing.expectEqual(0, ring.sq_ready());
+
+    // check all 3 cqes
+    var cqe = try ring.copy_cqe();
+    try testing.expectEqual(42, cqe.user_data);
+    cqe = try ring.copy_cqe();
+    try testing.expectEqual(43, cqe.user_data);
+    cqe = try ring.copy_cqe();
+    try testing.expectEqual(44, cqe.user_data);
+
+    // normal use of the ring
+    _ = try ring.nop(45);
+    _ = try ring.nop(46);
+    try testing.expectEqual(2, try ring.submit());
+    cqe = try ring.copy_cqe();
+    try testing.expectEqual(45, cqe.user_data);
+    cqe = try ring.copy_cqe();
+    try testing.expectEqual(46, cqe.user_data);
+}
+
+test "ring resize with wrong flags" {
+    var ring = try linux.IoUring.init(4, linux.IORING_SETUP_SINGLE_ISSUER);
+    defer ring.deinit();
+    try testing.expectError(error.ArgumentsInvalid, resize_rings(&ring, 8));
+}
+
+test "ring resize overflow" {
+    var ring = try linux.IoUring.init(4, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
+    defer ring.deinit();
+    for (0..3) |i| {
+        _ = try ring.nop(i);
+    }
+    // can't resize sqe to 2 with 3 sqe's
+    try testing.expectError(error.Overflow, resize_rings(&ring, 2));
+}
+
+test "ring resize with clamp" {
+    var ring = try linux.IoUring.init(4, linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN);
+    defer ring.deinit();
+    const entries = 1 << 31;
+    try resize_rings(&ring, entries);
+
+    // sq and q ring entries are clamped to the maximum allowable size
+    try testing.expect(ring.sq.sqes.len < entries); // 32k
+    try testing.expect(ring.cq.cqes.len < entries); // 64k
+}
