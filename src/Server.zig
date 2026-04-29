@@ -176,12 +176,17 @@ pub const Metric = struct {
         duration: usize = 0,
     } = .{},
     files: Files = .{},
+    recv: struct {
+        bytes: usize = 0,
+        count: usize = 0,
+        short: usize = 0,
+    } = .{},
 
     pub const Files = struct {
         count: usize = 0,
         bytes: usize = 0,
-        short_send_count: usize = 0,
-        short_send_bytes: usize = 0,
+        pipes: usize = 0,
+        pipes_cap: usize = 0,
     };
 
     const Gauge = struct {

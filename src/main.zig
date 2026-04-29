@@ -70,8 +70,8 @@ pub fn main(init: std.process.Init) !void {
                 log.info("metric: {}", .{server.metric});
                 log.info("io metric: {}", .{server.io.metric});
                 log.info(
-                    "sendfile chunk: {}",
-                    .{server.metric.files.short_send_bytes / server.metric.files.short_send_count},
+                    "sendfile pipe capacity: {}",
+                    .{server.metric.files.pipes_cap / server.metric.files.pipes},
                 );
                 const sm = &server.io.metric;
                 log.info(
@@ -87,6 +87,10 @@ pub fn main(init: std.process.Init) !void {
                     server.metric.files.count,
                     @as(f64, @floatFromInt(sm.total)) / @as(f64, @floatFromInt(server.metric.files.count)),
                 });
+                log.info(
+                    "requests {} short {} size {}",
+                    .{ server.metric.recv.count, server.metric.recv.short, server.metric.recv.bytes / server.metric.recv.count },
+                );
             },
             else => {
                 log.info("ignoring signal {}", .{sig});

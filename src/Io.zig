@@ -275,34 +275,22 @@ pub fn openRead(io: *Io, op: *Op, cb: Op.Callback, dir: fd_t, path: [:0]const u8
     return io.openAt(op, cb, dir, path, .{ .ACCMODE = .RDONLY, .CREAT = false }, 0o666);
 }
 
-/// Prepare sendfile for the chunk of the file defined by offset and len. If the
-/// op is null this sendfile will be linked with the next. Set op to null for
-/// all chunks except for the last one.
-pub fn sendfile(
-    io: *Io,
-    op: ?*Op,
-    cb: Op.Callback,
-    fd_out: fd_t,
-    fd_in: fd_t,
-    pipe_fds: [2]fd_t,
-    offset: u64,
-    len: u32,
-) !void {
-    // from musl/include/fcnt.h
-    const splice_f_nonblock = 0x02;
-    const splice_no_offset = math.maxInt(u64);
+// from musl/include/fcnt.h
+const splice_f_nonblock = 0x02;
+const splice_no_offset = math.maxInt(u64);
 
+pub fn fileToPipe(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, pipe_fds: [2]fd_t, offset: u64, len: u32) !void {
     try io.ensureSqCapacity(2);
-    var sqe = try io.ring.splice(0, fd_in, offset, pipe_fds[1], splice_no_offset, len);
+    var sqe = try io.ring.splice(op.prep(cb, io), fd, offset, pipe_fds[1], splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
-    sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS | linux.IOSQE_FIXED_FILE;
-    const user_data = if (op) |o| o.prep(cb, io) else 0;
-    sqe = try io.ring.splice(user_data, pipe_fds[0], splice_no_offset, fd_out, splice_no_offset, len);
+    sqe.flags |= linux.IOSQE_IO_LINK | linux.IOSQE_FIXED_FILE;
+}
+
+pub fn pipeToSocket(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, pipe_fds: [2]fd_t, len: u32) !void {
+    try io.ensureSqCapacity(1);
+    var sqe = try io.ring.splice(op.prep(cb, io), pipe_fds[0], splice_no_offset, fd, splice_no_offset, len);
     sqe.rw_flags = linux.IORING_SPLICE_F_FD_IN_FIXED + splice_f_nonblock;
     sqe.flags |= linux.IOSQE_FIXED_FILE;
-    if (op == null) {
-        sqe.flags |= linux.IOSQE_IO_HARDLINK | linux.IOSQE_CQE_SKIP_SUCCESS;
-    }
 }
 
 pub fn pipe(io: *Io, op: *Op, cb: Op.Callback, fds: *[2]fd_t) !void {
@@ -391,11 +379,15 @@ pub const Op = struct {
     }
 };
 
+test "size" {
+    try testing.expectEqual(8, @sizeOf(Op));
+}
+
 pub const Options = struct {
     /// Number of submission queue entries
     entries: u16,
     /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_TASKRUN_FLAG,
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_TASKRUN_FLAG | linux.IORING_SETUP_COOP_TASKRUN,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
 
@@ -443,6 +435,7 @@ const Metric = struct {
             error.OperationCanceled => self.err.canceled +%= 1,
             error.EndOfFile, error.BrokenPipe, error.ConnectionResetByPeer, error.IOError => self.err.eof +%= 1,
             error.ProtocolNotAvailable, // when kernel tls is not enabled
+            error.TryAgain,
             => self.err.other += 1,
             else => {
                 log.info("error metric unhandled {}", .{err});
@@ -497,7 +490,6 @@ const CloseNotify = struct {
 };
 
 test "pipe" {
-    const testing = std.testing;
     const gpa = testing.allocator;
 
     var io: Io = .{

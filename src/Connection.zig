@@ -94,13 +94,16 @@ fn recv(self: *Connection) !void {
 /// Some bytes are recieved parse it into request
 fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
     const self: *Connection = @ptrCast(@alignCast(ptr));
+    self.server.metric.recv.count +%= 1;
     self.req = try Request.parse(self.arena, bytes) orelse {
         if (bytes.len >= max_header_size) {
             return error.RequestBufferOverflow;
         }
         try self.recv();
+        self.server.metric.recv.short +%= 1;
         return 0;
     };
+    self.server.metric.recv.bytes +%= bytes.len;
     const just_plain = &[_]ContentEncoding{.plain};
     try self.file_stat_op.prep(
         self.arena,
@@ -199,7 +202,7 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
         else => {
             // unexpected error
             log.warn("{} failed {}", .{ self.fd, err });
-            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            // if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         },
     };
     self.reset();
@@ -564,6 +567,7 @@ const FileStat = struct {
         if (self.join_count > 0) return;
 
         self.joinFallible() catch |err| {
+            // log.warn("file stat {}", .{err});
             try self.vtable.fail(self.vtable.ptr, err);
         };
     }
@@ -686,6 +690,7 @@ const RequestRecv = struct {
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         self.onCompleteFallible(res) catch |err| {
+            // log.warn("{} request recv {}", .{ self.fd, err });
             try self.vtable.fail(self.vtable.ptr, err);
         };
     }
@@ -770,6 +775,7 @@ pub const SendBytes = struct {
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         self.onCompleteFallible(res) catch |err| {
+            // log.warn("{} send bytes {}", .{ self.fd, err });
             try self.vtable.fail(self.vtable.ptr, err);
         };
     }
@@ -797,7 +803,8 @@ const Sendfile = struct {
     const Self = @This();
 
     io: *Io,
-    op: Io.Op = .{},
+    op1: Io.Op = .{},
+    op2: Io.Op = .{},
     metric: *Server.Metric.Files,
 
     vtable: struct {
@@ -808,112 +815,145 @@ const Sendfile = struct {
 
     conn_fd: fd_t,
     file_fd: fd_t = -1,
-    pipe_fds: [2]fd_t = .{ -1, -1 },
-    pipe_cap: usize = 0,
-    dir: std.Io.Dir = undefined,
     path: [:0]const u8 = undefined,
-    size: usize = 0,
-    offset: usize = 0,
+    dir: std.Io.Dir = undefined,
+    pipe_fds: [2]fd_t = .{ -1, -1 },
+    pipe_cap: usize = 0, // capacity of the pipe, unknown
+    size: usize = 0, // size of the file to send
+    sent: usize = 0, // number of bytes sent to the socket
+    buffered: usize = 0, // number of bytes buffered in the pipe
 
     pub fn prep(self: *Self, dir: std.Io.Dir, path: [:0]const u8, size: usize) !void {
         self.dir = dir;
         self.path = path;
         self.size = size;
-        self.offset = 0;
+        self.sent = 0;
+        self.buffered = 0;
 
         if (self.pipe_fds[0] == -1) {
             try self.pipe();
-            return;
         }
         try self.open();
     }
 
     fn pipe(self: *Self) !void {
-        try self.io.pipe(&self.op, Self.onPipe, &self.pipe_fds);
+        try self.io.pipe(&self.op1, Self.onPipe, &self.pipe_fds);
     }
 
     fn open(self: *Self) !void {
-        try self.io.openRead(&self.op, Self.onOpen, self.dir.handle, self.path, null);
+        try self.io.openRead(&self.op2, Self.onOpen, self.dir.handle, self.path, null);
     }
 
     fn onPipe(res: Io.Result) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        const self: *Self = @alignCast(@fieldParentPtr("op1", res.ptr));
         res.ok() catch |err| return switch (err) {
             error.SignalInterrupt => try self.pipe(),
-            else => try self.vtable.fail(self.vtable.ptr, err),
+            else => {
+                // log.warn("{} onPipe {}", .{ self.conn_fd, err });
+                try self.vtable.fail(self.vtable.ptr, err);
+            },
         };
-        try self.open();
+
+        if (!self.op2.active())
+            try self.send();
     }
 
     fn onOpen(res: Io.Result) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        const self: *Self = @alignCast(@fieldParentPtr("op2", res.ptr));
         assert(self.file_fd == -1);
         self.file_fd = res.fd() catch |err| return switch (err) {
             error.SignalInterrupt => try self.open(),
-            else => try self.vtable.fail(self.vtable.ptr, err),
+            else => {
+                // log.warn("{} onOpen {}", .{ self.conn_fd, err });
+                try self.vtable.fail(self.vtable.ptr, err);
+            },
         };
 
-        try self.send();
+        if (!self.op1.active())
+            try self.send();
     }
 
     fn send(self: *Self) !void {
-        // While we don't know pipe capacity send first chunk (offset = 0, len =
-        // size).
-        if (self.pipe_cap == 0) {
-            try self.io.sendfile(
-                &self.op,
-                onComplete,
+        if (self.buffered > 0) {
+            try self.io.pipeToSocket(
+                &self.op2,
+                onPipeToSocket,
                 self.conn_fd,
-                self.file_fd,
                 self.pipe_fds,
-                @intCast(self.offset),
-                @intCast(self.size - self.offset),
+                @intCast(self.buffered),
             );
             return;
         }
 
-        // Send all other chunks, only last one will call onComplete callback
-        // (if op is null no callback is called). All sendfile operations are
-        // linked in the ring.
-        while (true) {
-            const len = @min(self.pipe_cap, self.size - self.offset);
-            const last = self.offset + len == self.size;
-            try self.io.sendfile(
-                if (last) &self.op else null,
-                onComplete,
-                self.conn_fd,
-                self.file_fd,
-                self.pipe_fds,
-                @intCast(self.offset),
-                @intCast(len),
-            );
-            if (last) break;
-            self.offset += len;
-        }
+        const len = @min(if (self.pipe_cap == 0) 1024 * 1024 else self.pipe_cap, self.size - self.sent);
+
+        try self.io.fileToPipe(
+            &self.op1,
+            onFileToPipe,
+            self.file_fd,
+            self.pipe_fds,
+            @intCast(self.sent),
+            @intCast(len),
+        );
+        try self.io.pipeToSocket(
+            &self.op2,
+            onPipeToSocket,
+            self.conn_fd,
+            self.pipe_fds,
+            @intCast(len),
+        );
     }
 
-    fn onComplete(res: Io.Result) !void {
-        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
-        self.onCompleteFallible(res) catch |err| {
+    fn onFileToPipe(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op1", res.ptr));
+        self.onFileToPipeFallible(res) catch |err| {
             try self.vtable.fail(self.vtable.ptr, err);
         };
     }
 
-    fn onCompleteFallible(self: *Self, res: Io.Result) !void {
-        const chunk = try res.bytes();
-        self.offset += chunk;
-
-        // Short send.
-        if (self.offset < self.size) {
-            // Send chunk is the capacity of the pipe when file size iz larger
-            // than pipe capacity.
-            if (self.pipe_cap == 0) self.pipe_cap = chunk;
-            self.metric.short_send_count +%= 1;
-            self.metric.short_send_bytes +%= chunk;
-            // Send all other chunks
-            try self.send();
-            return;
+    fn onFileToPipeFallible(self: *Self, res: Io.Result) !void {
+        const bytes = res.bytes() catch |err| brk: {
+            log.warn(
+                "{} onFileToPipe {} {s} {} {} {}",
+                .{ self.conn_fd, err, self.path, self.size, self.sent, self.pipe_cap },
+            );
+            break :brk 0;
+        };
+        self.buffered += bytes;
+        // Discover pipe capacity on the first short send, when pipe buffers
+        // less than we asked for.
+        if (self.pipe_cap == 0 and bytes > 0 and bytes < self.size and self.sent == 0) {
+            self.metric.pipes +%= 1;
+            self.metric.pipes_cap +%= bytes;
+            self.pipe_cap = bytes;
         }
+    }
+
+    fn onPipeToSocket(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op2", res.ptr));
+        self.onPipeToSocketFallible(res) catch |err| {
+            log.warn(
+                "{} onPipeToSocket {} {s} {} {} {}",
+                .{ self.conn_fd, err, self.path, self.size, self.sent, self.pipe_cap },
+            );
+            try self.vtable.fail(self.vtable.ptr, err);
+        };
+    }
+
+    fn onPipeToSocketFallible(self: *Self, res: Io.Result) !void {
+        const bytes = res.bytes() catch |err| switch (err) {
+            error.SignalInterrupt,
+            error.TryAgain,
+            error.OperationCanceled,
+            => 0,
+            else => return err,
+        };
+        self.buffered -= bytes;
+        self.sent += bytes;
+
+        // Short send, send other parts
+        if (self.sent < self.size)
+            return try self.send();
 
         // Success, do cleanup.
         {
@@ -938,6 +978,6 @@ const Sendfile = struct {
     }
 
     pub fn active(self: *Self) bool {
-        return self.op.active();
+        return self.op1.active() or self.op2.active();
     }
 };
