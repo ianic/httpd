@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const testing = std.testing;
 const fs = std.fs;
 const linux = std.os.linux;
 const fd_t = linux.fd_t;
@@ -11,7 +12,6 @@ const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const Head = @import("Head.zig");
 const log = std.log.scoped(.connection);
-const toLastModified = @import("time.zig").toLastModified;
 
 const Connection = @This();
 const keepalive_timeout = 30;
@@ -39,9 +39,8 @@ sendfile_op: Sendfile = undefined, // send file as http body
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
     self.arena = self.arena_instance.allocator();
-
     self.recv_op = .{
-        .allocator = self.gpa,
+        .gpa = self.gpa,
         .io = self.io,
         .vtable = .{
             .ptr = self,
@@ -95,7 +94,7 @@ fn recv(self: *Connection) !void {
 fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
     const self: *Connection = @ptrCast(@alignCast(ptr));
     self.server.metric.recv.count +%= 1;
-    self.req = try Request.parse(self.arena, bytes) orelse {
+    const n = try self.req.parse(self.arena, bytes) orelse {
         if (bytes.len >= max_header_size) {
             return error.RequestBufferOverflow;
         }
@@ -104,13 +103,15 @@ fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
         return 0;
     };
     self.server.metric.recv.bytes +%= bytes.len;
-    const just_plain = &[_]ContentEncoding{.plain};
     try self.file_stat_op.prep(
         self.arena,
         self.req.path,
-        if (self.server.cache == null) just_plain else self.req.accept_encoding orelse just_plain,
+        if (self.server.cache == null)
+            self.req.accept_encoding[0..1] // just .plain
+        else
+            self.req.accept_encoding,
     );
-    return self.req.size;
+    return n;
 }
 
 /// File system file is found, or null if no such file, prepare repsonse header
@@ -233,12 +234,13 @@ const Request = struct {
         mtime: i96 = 0,
     } = .{},
     keep_alive: bool = false,
-    accept_encoding: ?[]ContentEncoding = null,
+    accept_encoding_buf: [4]ContentEncoding = @splat(.plain),
+    accept_encoding: []ContentEncoding = &.{},
     size: usize = 0,
     method: http.Method = .GET,
 
     /// Returns null if recv_buf doesn't hold full http request
-    fn parse(allocator: Allocator, buf: []const u8) !?Request {
+    fn parse(req: *Request, arena: Allocator, buf: []const u8) !?usize {
         var hp: http.HeadParser = .{};
         const n = hp.feed(buf);
         if (hp.state != .finished) {
@@ -253,9 +255,8 @@ const Request = struct {
             return error.BadRequest;
         };
 
-        var req: Request = .{
+        req.* = .{
             .keep_alive = head.keep_alive,
-            .size = n,
             .method = head.method,
         };
         if (head.etag) |et| { // parse etag
@@ -264,55 +265,37 @@ const Request = struct {
             req.etag.size = std.fmt.parseInt(u64, it.rest(), 16) catch 0;
         }
         req.path = if (head.target.len <= 1)
-            try allocator.dupeZ(u8, "index.html")
+            try arena.dupeZ(u8, "index.html")
         else if (head.target[head.target.len - 1] == '/')
-            try std.fmt.allocPrintSentinel(allocator, "{s}index.html", .{head.target[1..]}, 0)
+            try mem.joinZ(arena, "", &.{ head.target[1..], "index.html" })
         else
-            try allocator.dupeZ(u8, head.target[1..]);
+            try arena.dupeZ(u8, head.target[1..]);
 
+        req.accept_encoding_buf[0] = .plain;
+        req.accept_encoding = req.accept_encoding_buf[0..1];
         if (compressible(req.path)) {
-            if (head.accept_encoding) |accept_encoding| {
-                if (try ContentEncoding.parse(allocator, accept_encoding)) |encodings| {
-                    req.accept_encoding = encodings;
-                }
+            if (head.accept_encoding) |accept_encoding_str| {
+                req.accept_encoding = try ContentEncoding.parse(&req.accept_encoding_buf, accept_encoding_str);
             }
         }
 
-        return req;
+        return n;
     }
 
     fn onlyHeader(req: Request) bool {
         return req.method == .HEAD;
     }
-
-    fn deinit(req: *Request, allocator: Allocator) void {
-        if (req.path.len > 0) {
-            allocator.free(req.path);
-        }
-        if (req.accept_encoding) |ae| {
-            allocator.free(ae);
-        }
-        req.* = .{};
-    }
 };
 
 const Response = struct {
-    fd: fd_t = -1,
     fsr: ?FileStat.Result = null,
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
-    fn deinit(rsp: *Response, allocator: Allocator) void {
-        if (rsp.header.len > 0) {
-            allocator.free(rsp.header);
-        }
-        rsp.* = .{};
-    }
-
-    fn init(rsp: *Response, allocator: Allocator, req: Request) !void {
+    fn init(rsp: *Response, arena: Allocator, req: Request) !void {
         if (rsp.fsr == null) {
             rsp.status = .not_found;
-            rsp.header = try notFound(allocator, req.keep_alive);
+            rsp.header = try notFound(arena, req.keep_alive);
             return;
         }
         const stat = rsp.fsr.?.stat;
@@ -320,20 +303,20 @@ const Response = struct {
             .file, .sym_link => {
                 if (etagMatch(stat, req)) {
                     rsp.status = .not_modified;
-                    rsp.header = try notModified(allocator, stat, req.keep_alive);
+                    rsp.header = try notModified(arena, stat, req.keep_alive);
                 } else {
                     rsp.status = .ok;
-                    rsp.header = try ok(allocator, stat, req.path, rsp.fsr.?.encoding, req.keep_alive);
+                    rsp.header = try ok(arena, stat, req.path, rsp.fsr.?.encoding, req.keep_alive);
                 }
             },
             .directory => {
                 // Target path was without trailing '/' and points to directory; redirect
                 rsp.status = .moved_permanently;
-                rsp.header = try dirRedirect(allocator, req.path, req.keep_alive);
+                rsp.header = try dirRedirect(arena, req.path, req.keep_alive);
             },
             else => {
                 rsp.status = .not_found;
-                rsp.header = try notFound(allocator, req.keep_alive);
+                rsp.header = try notFound(arena, req.keep_alive);
             },
         }
     }
@@ -360,59 +343,59 @@ const Response = struct {
     const connection_close = "Connection: close";
 
     fn ok(
-        allocator: Allocator,
+        arena: Allocator,
         stat: std.Io.File.Stat,
         file: [:0]const u8,
         encoding: ContentEncoding,
         keep_alive: bool,
     ) ![]const u8 {
-        var buf: [32]u8 = undefined;
+        const last_modified: LastModified = .{ .sec = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s)) };
         const fmt = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
-            "Last-Modified: {s}\r\n" ++
+            "Last-Modified: {f}\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(allocator, fmt, .{
+        return try std.fmt.allocPrint(arena, fmt, .{
             contentType(file),
             encoding.header(),
             stat.size,
             stat.mtime,
             stat.size,
-            toLastModified(&buf, @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s))),
+            last_modified,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn notModified(allocator: Allocator, stat: std.Io.File.Stat, keep_alive: bool) ![]const u8 {
-        var buf: [32]u8 = undefined;
+    fn notModified(arena: Allocator, stat: std.Io.File.Stat, keep_alive: bool) ![]const u8 {
+        const last_modified: LastModified = .{ .sec = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s)) };
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
-            "Last-Modified: {s}\r\n" ++
+            "Last-Modified: {f}\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(allocator, fmt, .{
+        return try std.fmt.allocPrint(arena, fmt, .{
             stat.mtime,
             stat.size,
-            toLastModified(&buf, @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s))),
+            last_modified,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn notFound(allocator: Allocator, keep_alive: bool) ![]const u8 {
+    fn notFound(arena: Allocator, keep_alive: bool) ![]const u8 {
         const fmt = "HTTP/1.1 404 Not Found\r\n" ++
             "Content-Length: 0\r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(allocator, fmt, .{
+        return try std.fmt.allocPrint(arena, fmt, .{
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn dirRedirect(allocator: Allocator, path: []const u8, keep_alive: bool) ![]const u8 {
+    fn dirRedirect(arena: Allocator, path: []const u8, keep_alive: bool) ![]const u8 {
         const fmt = "HTTP/1.1 301 Moved Permanently\r\n" ++
             "Content-Length: 0\r\n" ++
             "Location: \\{s}\\ \r\n" ++
             "{s}\r\n\r\n";
-        return try std.fmt.allocPrint(allocator, fmt, .{
+        return try std.fmt.allocPrint(arena, fmt, .{
             path,
             if (keep_alive) connection_keep_alive else connection_close,
         });
@@ -452,6 +435,43 @@ const Response = struct {
         }
         return "application/octet-stream"; // Default MIME type
     }
+
+    test "header_buf size is big enough" {
+        var req: Request = .{
+            .path = "index.html",
+            .keep_alive = true,
+        };
+        var rsp: Response = .{};
+        { // not found
+            try rsp.init(req);
+            try testing.expectEqual(.not_found, rsp.status);
+            try testing.expectEqual(69, rsp.header.len);
+            //std.debug.print("{s}\n", .{rsp.header});
+        }
+        { // ok
+            rsp.fsr = .{
+                .dir = undefined,
+                .encoding = .plain,
+                .stat = mem.zeroInit(std.Io.File.Stat, .{
+                    .kind = .file,
+                    .size = 1024 * 1024 * 1024,
+                    .mtime = .{ .nanoseconds = std.time.ns_per_week * 1024 },
+                }),
+            };
+            try rsp.init(req);
+            try testing.expectEqual(.ok, rsp.status);
+            try testing.expectEqual(176, rsp.header.len);
+            //std.debug.print("{s}\n", .{rsp.header});
+        }
+        { // not modified
+            req.etag.mtime = rsp.fsr.?.stat.mtime.nanoseconds;
+            req.etag.size = rsp.fsr.?.stat.size;
+            try rsp.init(req);
+            try testing.expectEqual(.not_modified, rsp.status);
+            try testing.expectEqual(133, rsp.header.len);
+            //std.debug.print("{s}\n", .{rsp.header});
+        }
+    }
 };
 
 const ContentEncoding = enum {
@@ -472,28 +492,25 @@ const ContentEncoding = enum {
     /// Parse Accept-Encoding http header into list of ContentEncoding values.
     /// Plain is always included at index 0.
     /// Returns null if no supported encodings are found in accept_encoding string.
-    fn parse(allocator: Allocator, accept_encoding: []const u8) !?[]ContentEncoding {
-        var list: std.ArrayList(ContentEncoding) = .empty;
-        try list.append(allocator, .plain);
-
-        var iter = mem.splitAny(u8, accept_encoding, ", ");
+    fn parse(list: []ContentEncoding, accept_encoding_str: []const u8) ![]ContentEncoding {
+        list[0] = .plain;
+        var i: usize = 1;
+        var iter = mem.splitAny(u8, accept_encoding_str, ", ");
         while (iter.next()) |v| {
             if (v.len == 0) continue;
-            const v1 = if (mem.indexOfScalar(u8, v, ';')) |i| v[0..i] else v;
+            const v1 = if (mem.indexOfScalar(u8, v, ';')) |j| v[0..j] else v;
             if (mem.eql(u8, v1, "gzip")) {
-                try list.append(allocator, .gzip);
+                list[i] = .gzip;
+                i += 1;
             } else if (mem.eql(u8, v1, "br")) {
-                try list.append(allocator, .brotli);
+                list[i] = .brotli;
+                i += 1;
             } else if (mem.eql(u8, v1, "zstd")) {
-                try list.append(allocator, .zstd);
+                list[i] = .zstd;
+                i += 1;
             }
         }
-
-        if (list.items.len == 1) {
-            list.deinit(allocator);
-            return null;
-        }
-        return try list.toOwnedSlice(allocator);
+        return list[0..i];
     }
 
     pub fn header(self: ContentEncoding) []const u8 {
@@ -506,23 +523,22 @@ const ContentEncoding = enum {
     }
 
     test parse {
-        const testing = std.testing;
+        var buf: [4]ContentEncoding = undefined;
 
-        var ar = (try parse(testing.allocator, "gzip, deflate, zstd")).?;
+        var ar = try parse(&buf, "gzip, deflate, zstd");
         try testing.expectEqual(3, ar.len);
         try testing.expectEqual(.plain, ar[0]);
         try testing.expectEqual(.gzip, ar[1]);
         try testing.expectEqual(.zstd, ar[2]);
-        testing.allocator.free(ar);
 
-        ar = (try parse(testing.allocator, "br;q=1.0, gzip;q=0.8, *;q=0.1")).?;
+        ar = try parse(&buf, "br;q=1.0, gzip;q=0.8, *;q=0.1");
         try testing.expectEqual(3, ar.len);
         try testing.expectEqual(.plain, ar[0]);
         try testing.expectEqual(.brotli, ar[1]);
         try testing.expectEqual(.gzip, ar[2]);
-        testing.allocator.free(ar);
 
-        try testing.expectEqual(null, try parse(testing.allocator, "one two"));
+        ar = try parse(&buf, "one two");
+        try testing.expectEqual(1, ar.len);
     }
 };
 
@@ -544,22 +560,16 @@ const FileStat = struct {
         success: *const fn (*anyopaque, ?Result) anyerror!void,
         fail: *const fn (*anyopaque, anyerror) anyerror!void,
     },
+    ops_buf: [4]StatOp = undefined,
     ops: []StatOp = &.{},
     join_count: usize = 0,
 
-    fn prep(self: *Self, allocator: Allocator, path: []const u8, encodings: []const ContentEncoding) !void {
-        self.ops = try allocator.alloc(StatOp, encodings.len);
-        self.join_count = encodings.len;
-
+    fn prep(self: *Self, arena: Allocator, path: []const u8, encodings: []const ContentEncoding) !void {
         for (encodings, 0..) |encoding, i| {
-            self.ops[i] = .{
-                .parent = self,
-                .dir = if (encoding == .plain) self.root else self.cache.?,
-                .encoding = encoding,
-                .path = try mem.joinZ(allocator, "", &.{ path, encoding.extension() }),
-            };
-            try (&self.ops[i]).prep();
+            try self.ops_buf[i].init(arena, self, path, encoding);
         }
+        self.join_count = encodings.len;
+        self.ops = self.ops_buf[0..encodings.len];
     }
 
     fn join(self: *Self) !void {
@@ -606,15 +616,6 @@ const FileStat = struct {
         });
     }
 
-    fn deinit(self: *Self, allocator: Allocator) void {
-        if (self.ops.len == 0) return;
-        for (self.ops) |f| {
-            allocator.free(f.path);
-        }
-        allocator.free(self.ops);
-        self.ops = &.{};
-    }
-
     const StatOp = struct {
         parent: *FileStat,
         op: Io.Op = .{},
@@ -623,6 +624,19 @@ const FileStat = struct {
         encoding: ContentEncoding,
         statx: linux.Statx = mem.zeroes(linux.Statx),
         err: ?anyerror = null,
+
+        fn init(op: *StatOp, arena: Allocator, parent: *Self, path: []const u8, encoding: ContentEncoding) !void {
+            op.* = .{
+                .parent = parent,
+                .dir = if (encoding == .plain) parent.root else parent.cache.?,
+                .encoding = encoding,
+            };
+            op.path = if (encoding == .plain)
+                try arena.dupeZ(u8, path)
+            else
+                try mem.joinZ(arena, "", &.{ path, encoding.extension() });
+            try op.prep();
+        }
 
         fn prep(op: *StatOp) !void {
             try op.parent.io.statx(&op.op, onComplete, op.dir.handle, op.path, &op.statx);
@@ -642,6 +656,11 @@ const FileStat = struct {
             try op.parent.join();
         }
     };
+
+    test "size of" {
+        try testing.expectEqual(256, @sizeOf(linux.Statx));
+        try testing.expectEqual(296, @sizeOf(StatOp));
+    }
 };
 
 pub fn compressible(file_name: []const u8) bool {
@@ -670,7 +689,7 @@ pub fn compressible(file_name: []const u8) bool {
 const RequestRecv = struct {
     const Self = @This();
 
-    allocator: Allocator,
+    gpa: Allocator,
     io: *Io,
     op: Io.Op = .{},
     fd: fd_t,
@@ -709,7 +728,7 @@ const RequestRecv = struct {
             if (self.buffer.len == 0) break :brk provided_buf;
             // there is saved part in the buffer append to it
             const prev_len = self.buffer.len;
-            self.buffer = try self.allocator.realloc(self.buffer, prev_len + provided_buf.len);
+            self.buffer = try self.gpa.realloc(self.buffer, prev_len + provided_buf.len);
             @memcpy(self.buffer[prev_len..], provided_buf);
             break :brk self.buffer;
         };
@@ -719,7 +738,7 @@ const RequestRecv = struct {
         if (m == 0) {
             if (self.buffer.len == 0) {
                 // partial msg in provided recv_buf save that part
-                self.buffer = try self.allocator.dupe(u8, recv_buf);
+                self.buffer = try self.gpa.dupe(u8, recv_buf);
             }
             return;
         }
@@ -727,10 +746,10 @@ const RequestRecv = struct {
             const unused = recv_buf[m..];
             const prev = self.buffer;
             if (unused.len > 0) {
-                self.buffer = try self.allocator.dupe(u8, unused);
+                self.buffer = try self.gpa.dupe(u8, unused);
             }
             if (prev.len > 0) {
-                self.allocator.free(prev);
+                self.gpa.free(prev);
                 self.buffer = &.{};
             }
         }
@@ -741,7 +760,7 @@ const RequestRecv = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.buffer);
+        self.gpa.free(self.buffer);
     }
 };
 
@@ -981,3 +1000,53 @@ const Sendfile = struct {
         return self.op1.active() or self.op2.active();
     }
 };
+
+const LastModified = struct {
+    sec: i64,
+
+    pub fn format(self: LastModified, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(self.sec) };
+        const day_secs = epoch_secs.getDaySeconds();
+        const epoch_day = epoch_secs.getEpochDay();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const weekday = (epoch_day.day + 4) % 7;
+
+        const day_names = [_][]const u8{
+            "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+        };
+        const month_names = [_][]const u8{
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        };
+
+        try writer.print(
+            "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+            .{
+                day_names[weekday],
+                month_day.day_index + 1, // 0-indexed → 1-indexed
+                month_names[@intFromEnum(month_day.month) - 1],
+                year_day.year,
+                day_secs.getHoursIntoDay(),
+                day_secs.getMinutesIntoHour(),
+                day_secs.getSecondsIntoMinute(),
+            },
+        );
+    }
+
+    test LastModified {
+        var buf: [30]u8 = undefined;
+        const sec = 1777557784;
+
+        const lm: LastModified = .{ .sec = sec };
+        const res = try std.fmt.bufPrint(&buf, "{f}", .{lm});
+        try std.testing.expectEqualStrings("Thu, 30 Apr 2026 14:03:04 GMT", res);
+    }
+};
+
+test {
+    _ = ContentEncoding;
+    _ = Response;
+    _ = LastModified;
+    _ = FileStat;
+}

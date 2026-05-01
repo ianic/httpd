@@ -30,5 +30,7 @@ fi
 
 cd ..
 zig build
+mkdir -p tmp/cache
+zig-out/bin/httpd compress --root=./site/root --cache=./tmp/cache
 echo -e "\nBrowse http://localhost:8080 or https://localhost:8443"
-zig-out/bin/httpd --root=./site/root --cert=./site/cert_ec/
+zig-out/bin/httpd --root=./site/root --cert=./site/cert_ec/ --cache=./tmp/cache

@@ -176,3 +176,10 @@ Status code distribution:
 
 
 
+
+
+parse: GET /news/goodbye-cpp/oom.png HTTP/1.1
+accept: */*
+accept-encoding: gzip, compress, deflate, br
+user-agent: oha/1.14.0
+host: localhost:8080

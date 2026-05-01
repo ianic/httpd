@@ -4,7 +4,7 @@ set -e
 ulimit -n 65535
 
 conns=100
-secs=2
+secs=10
 
 nginx_strace=0
 httpd_strace=1
@@ -21,7 +21,11 @@ fi
 
 if [ $httpd_valgrind -eq 1 ]; then
     zig build -Doptimize=ReleaseSafe
-    valgrind --tool=callgrind --dump-instr=yes --collect-jumps=yes zig-out/bin/httpd --root site/root --cert site/cert_ec --fds 65535 &
+    valgrind --tool=callgrind \
+        --dump-instr=yes \
+        --collect-jumps=yes \
+        --separate-callers=2 \
+        zig-out/bin/httpd --root site/root --cert site/cert_ec --fds 65535 &
     script/targets.sh http 8080 localhost testing
     oha -z "$secs"s --no-tui --urls-from-file site/targets-oha -c $conns -w --cacert site/ca/cert.pem
     #pkill -USR1 httpd && pkill httpd

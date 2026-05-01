@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
                 // importing modules from different packages).
                 .{ .name = "tls", .module = tls_module },
             },
-            .link_libc = true,
+            //.link_libc = true,
         }),
     });
 
