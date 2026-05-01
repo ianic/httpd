@@ -453,16 +453,20 @@ const Response = struct {
     }
 
     test "header_buf size is big enough" {
+        var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_instance.deinit();
+        const arena = arena_instance.allocator();
+
         var req: Request = .{
             .path = "index.html",
             .keep_alive = true,
         };
         var rsp: Response = .{};
         { // not found
-            try rsp.init(req);
+            try rsp.init(arena, req);
             try testing.expectEqual(.not_found, rsp.status);
             try testing.expectEqual(69, rsp.header.len);
-            //std.debug.print("{s}\n", .{rsp.header});
+            // std.debug.print("{s}\n", .{rsp.header});
         }
         { // ok
             rsp.fsr = .{
@@ -474,18 +478,18 @@ const Response = struct {
                     .mtime = .{ .nanoseconds = std.time.ns_per_week * 1024 },
                 }),
             };
-            try rsp.init(req);
+            try rsp.init(arena, req);
             try testing.expectEqual(.ok, rsp.status);
             try testing.expectEqual(176, rsp.header.len);
-            //std.debug.print("{s}\n", .{rsp.header});
+            // std.debug.print("{s}\n", .{rsp.header});
         }
         { // not modified
             req.etag.mtime = rsp.fsr.?.stat.mtime.nanoseconds;
             req.etag.size = rsp.fsr.?.stat.size;
-            try rsp.init(req);
+            try rsp.init(arena, req);
             try testing.expectEqual(.not_modified, rsp.status);
             try testing.expectEqual(133, rsp.header.len);
-            //std.debug.print("{s}\n", .{rsp.header});
+            // std.debug.print("{s}\n", .{rsp.header});
         }
     }
 };
