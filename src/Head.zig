@@ -11,11 +11,8 @@ const Head = @This();
 method: http.Method,
 target: []const u8,
 version: http.Version,
-expect: ?[]const u8,
-content_type: ?[]const u8,
+
 content_length: ?u64,
-transfer_encoding: http.TransferEncoding,
-transfer_compression: http.ContentEncoding,
 etag: ?[]const u8,
 keep_alive: bool,
 accept_encoding: ?[]const u8,
@@ -32,8 +29,7 @@ pub const ParseError = error{
 };
 
 pub fn parse(bytes: []const u8) ParseError!Head {
-    var it = mem.splitSequence(u8, bytes, "\r\n");
-
+    var it = mem.splitScalar(u8, bytes, '\r');
     const first_line = it.next().?;
     if (first_line.len < 10)
         return error.HttpHeadersInvalid;
@@ -62,11 +58,7 @@ pub fn parse(bytes: []const u8) ParseError!Head {
         .method = method,
         .target = target,
         .version = version,
-        .expect = null,
-        .content_type = null,
         .content_length = null,
-        .transfer_encoding = .none,
-        .transfer_compression = .identity,
         .etag = null,
         .keep_alive = switch (version) {
             .@"HTTP/1.0" => false,
@@ -75,8 +67,10 @@ pub fn parse(bytes: []const u8) ParseError!Head {
         .accept_encoding = null,
     };
 
-    while (it.next()) |line| {
-        if (line.len == 0) return head;
+    while (it.next()) |line_n| {
+        if (line_n.len <= 1) return head;
+        const line = line_n[1..]; // \n at line[0]
+
         switch (line[0]) {
             ' ', '\t' => return error.HttpHeaderContinuationsUnsupported,
             else => {},
@@ -87,61 +81,17 @@ pub fn parse(bytes: []const u8) ParseError!Head {
         const header_value = mem.trim(u8, line_it.rest(), " \t");
         if (header_name.len == 0) return error.HttpHeadersInvalid;
 
-        if (std.ascii.eqlIgnoreCase(header_name, "connection")) {
-            head.keep_alive = !std.ascii.eqlIgnoreCase(header_value, "close");
-        } else if (std.ascii.eqlIgnoreCase(header_name, "expect")) {
-            head.expect = header_value;
-        } else if (std.ascii.eqlIgnoreCase(header_name, "content-type")) {
-            head.content_type = header_value;
+        if (std.ascii.eqlIgnoreCase(header_name, "accept-encoding")) {
+            head.accept_encoding = header_value;
         } else if (std.ascii.eqlIgnoreCase(header_name, "content-length")) {
             if (head.content_length != null) return error.HttpHeadersInvalid;
             head.content_length = std.fmt.parseInt(u64, header_value, 10) catch
                 return error.InvalidContentLength;
-        } else if (std.ascii.eqlIgnoreCase(header_name, "content-encoding")) {
-            if (head.transfer_compression != .identity) return error.HttpHeadersInvalid;
-
-            const trimmed = mem.trim(u8, header_value, " ");
-
-            if (http.ContentEncoding.fromString(trimmed)) |ce| {
-                head.transfer_compression = ce;
-            } else {
-                return error.HttpTransferEncodingUnsupported;
-            }
-        } else if (std.ascii.eqlIgnoreCase(header_name, "transfer-encoding")) {
-            // Transfer-Encoding: second, first
-            // Transfer-Encoding: deflate, chunked
-            var iter = mem.splitBackwardsScalar(u8, header_value, ',');
-
-            const first = iter.first();
-            const trimmed_first = mem.trim(u8, first, " ");
-
-            var next: ?[]const u8 = first;
-            if (std.meta.stringToEnum(http.TransferEncoding, trimmed_first)) |transfer| {
-                if (head.transfer_encoding != .none)
-                    return error.HttpHeadersInvalid; // we already have a transfer encoding
-                head.transfer_encoding = transfer;
-
-                next = iter.next();
-            }
-
-            if (next) |second| {
-                const trimmed_second = mem.trim(u8, second, " ");
-
-                if (http.ContentEncoding.fromString(trimmed_second)) |transfer| {
-                    if (head.transfer_compression != .identity)
-                        return error.HttpHeadersInvalid; // double compression is not supported
-                    head.transfer_compression = transfer;
-                } else {
-                    return error.HttpTransferEncodingUnsupported;
-                }
-            }
-
-            if (iter.next()) |_| return error.HttpTransferEncodingUnsupported;
         } else if (std.ascii.eqlIgnoreCase(header_name, "if-none-match")) {
             const trimmed = mem.trim(u8, header_value, "\"");
             head.etag = trimmed;
-        } else if (std.ascii.eqlIgnoreCase(header_name, "accept-encoding")) {
-            head.accept_encoding = header_value;
+        } else if (std.ascii.eqlIgnoreCase(header_name, "connection")) {
+            head.keep_alive = !std.ascii.eqlIgnoreCase(header_value, "close");
         }
     }
     return error.MissingFinalNewline;
@@ -162,13 +112,13 @@ test parse {
     try testing.expectEqual(.@"HTTP/1.0", req.version);
     try testing.expectEqualStrings("/hi", req.target);
 
-    try testing.expectEqualStrings("text/plain", req.content_type.?);
-    try testing.expectEqualStrings("100-continue", req.expect.?);
+    //try testing.expectEqualStrings("text/plain", req.content_type.?);
+    //try testing.expectEqualStrings("100-continue", req.expect.?);
 
     try testing.expectEqual(true, req.keep_alive);
     try testing.expectEqual(10, req.content_length.?);
-    try testing.expectEqual(.chunked, req.transfer_encoding);
-    try testing.expectEqual(.deflate, req.transfer_compression);
+    //try testing.expectEqual(.chunked, req.transfer_encoding);
+    //try testing.expectEqual(.deflate, req.transfer_compression);
 }
 
 inline fn int64(array: *const [8]u8) u64 {
