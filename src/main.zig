@@ -15,17 +15,7 @@ const log = std.log.scoped(.main);
 
 pub fn main(init: std.process.Init) !void {
     signal.watch();
-
-    var dbga = std.heap.DebugAllocator(.{}){};
-    const gpa = switch (builtin.mode) {
-        .Debug => dbga.allocator(),
-        else => std.heap.c_allocator,
-    };
-    defer switch (builtin.mode) {
-        .Debug => _ = dbga.deinit(),
-        else => {},
-    };
-
+    const gpa = init.gpa;
     const args = try Args.parse(init);
     const root = args.root.?;
 
@@ -113,8 +103,8 @@ const Args = struct {
     cert: ?std.Io.Dir = null,
     http_port: u16 = 8080,
     https_port: u16 = 8443,
-    buf_count: u16 = 2,
-    buf_size: u32 = 4096 * 16,
+    buf_count: u16 = 512,
+    buf_size: u32 = 4096,
     fds: u16 = 1024,
     sqes: u16 = 1024,
     command: Command = .start,
