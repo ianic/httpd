@@ -42,26 +42,24 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
         .fd = self.fd,
         .buffer = &self.buffer,
         .vtable = .{
-            .ptr = self,
             .success = onRecv,
-            .fail = onError,
+            .fail = onRecvError,
         },
     };
     self.send_op = .{
         .io = self.io,
         .fd = self.fd,
         .vtable = .{
-            .ptr = self,
             .success = onSend,
-            .fail = onError,
+            .fail = onSendError,
         },
     };
     self.timer.start();
     try self.recv();
 }
 
-fn onRecv(ptr: *anyopaque, buf: []const u8) anyerror!void {
-    const self: *Handshake = @ptrCast(@alignCast(ptr));
+fn onRecv(op: *Recv, buf: []const u8) anyerror!void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("recv_op", op));
     if (self.hs.done()) {
         try self.upgrade();
         return;
@@ -87,6 +85,11 @@ fn onRecv(ptr: *anyopaque, buf: []const u8) anyerror!void {
     }
     // short read, get more
     try self.recv();
+}
+
+fn onRecvError(op: *Recv, err: anyerror) !void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("recv_op", op));
+    try self.shutdown(err);
 }
 
 fn recv(self: *Handshake) !void {
@@ -131,13 +134,13 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
     self.deinit();
 }
 
-fn onSend(ptr: *anyopaque) !void {
-    const self: *Handshake = @ptrCast(@alignCast(ptr));
+fn onSend(op: *SendBytes) !void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", op));
     try self.recv();
 }
 
-fn onError(ptr: *anyopaque, err: anyerror) !void {
-    const self: *Handshake = @ptrCast(@alignCast(ptr));
+fn onSendError(op: *SendBytes, err: anyerror) !void {
+    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", op));
     try self.shutdown(err);
 }
 
@@ -167,9 +170,8 @@ const Recv = struct {
     op: Io.Op = .{},
     fd: fd_t,
     vtable: struct {
-        ptr: *anyopaque,
-        success: *const fn (*anyopaque, []const u8) anyerror!void,
-        fail: *const fn (*anyopaque, anyerror) anyerror!void,
+        success: *const fn (*Self, []const u8) anyerror!void,
+        fail: *const fn (*Self, anyerror) anyerror!void,
     },
 
     buffer: []u8,
@@ -210,7 +212,7 @@ const Recv = struct {
     fn onComplete(res: Io.Result) !void {
         const self = res.parentPtr(Self, "op");
         self.onCompleteFallible(res) catch |err| {
-            try self.vtable.fail(self.vtable.ptr, err);
+            try self.vtable.fail(self, err);
         };
     }
 
@@ -223,7 +225,7 @@ const Recv = struct {
             return error.EndOfStream;
         }
         if (self.kind == .peek) {
-            _ = try self.vtable.success(self.vtable.ptr, self.buffer[0 .. self.end + n]);
+            _ = try self.vtable.success(self, self.buffer[0 .. self.end + n]);
             return;
         }
         self.end += n;
@@ -231,7 +233,7 @@ const Recv = struct {
             self.count -= n;
             if (self.count > 0) return try self.prep();
         }
-        try self.vtable.success(self.vtable.ptr, self.buffer[0..self.end]);
+        try self.vtable.success(self, self.buffer[0..self.end]);
     }
 
     // n bytes is consumed from the buffer
