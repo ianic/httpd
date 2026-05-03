@@ -32,9 +32,10 @@ rsp: Response = .{},
 
 // io operations
 recv_op: RequestRecv = undefined, // read http reqeust
-file_stat_op: FileStat = undefined, // find file on the disk
 send_op: SendBytes = undefined, // send http header
 sendfile_op: Sendfile = undefined, // send file as http body
+stat_ops: [4]FileStat = undefined, // file stat operation for each supported encoding
+stat_join_count: usize = 0,
 
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
@@ -48,29 +49,15 @@ pub fn init(self: *Connection) !void {
         },
         .fd = self.fd,
     };
-    self.file_stat_op = .{
-        .io = self.io,
-        .vtable = .{
-            .success = onFileStat,
-            .fail = onFileStatError,
-        },
-        .root = self.server.root,
-        .cache = self.server.cache,
-    };
     self.send_op = .{
         .io = self.io,
-        .vtable = .{
-            .success = onSend,
-            .fail = onSendError,
-        },
+        .callback = onSend,
         .fd = self.fd,
     };
     self.sendfile_op = .{
         .io = self.io,
-        .vtable = .{
-            .success = onSendfile,
-            .fail = onSendfileError,
-        },
+        .open_callback = onSendfileOpen,
+        .send_callback = onSendfile,
         .conn_fd = self.fd,
         .metric = &self.server.metric.files,
     };
@@ -99,15 +86,85 @@ fn onRecv(op: *RequestRecv, bytes: []const u8) !usize {
         return 0;
     };
     self.server.metric.recv.bytes +%= bytes.len;
-    try self.file_stat_op.prep(
-        self.arena,
-        self.req.path,
-        if (self.server.cache == null)
-            self.req.accept_encoding[0..1] // just .plain
-        else
-            self.req.accept_encoding,
-    );
+    if (self.server.cache == null)
+        self.req.accept_encoding = self.req.accept_encoding[0..1]; // just .plain
+    try self.fileStat();
+
     return n;
+}
+
+// Start FileStat operation for each encoding
+fn fileStat(self: *Connection) !void {
+    for (self.req.accept_encoding, 0..) |encoding, i| {
+        var fs_op = &self.stat_ops[i];
+        fs_op.* = .{
+            .io = self.io,
+            .cb = .{ .ptr = self, .fnc = onFileStatJoin },
+            .dir = if (encoding == .plain) self.server.root else self.server.cache.?,
+            .path = if (encoding == .plain)
+                try self.arena.dupeZ(u8, self.req.path)
+            else
+                try mem.joinZ(self.arena, "", &.{ self.req.path, encoding.extension() }),
+        };
+        try fs_op.prep();
+    }
+    self.stat_join_count = self.req.accept_encoding.len;
+}
+
+fn onFileStatJoin(ptr: *anyopaque) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    // Wait for all operations to finish
+    self.stat_join_count -= 1;
+    if (self.stat_join_count != 0) return;
+
+    const ops = self.stat_ops[0..self.req.accept_encoding.len];
+
+    const plain = ops[0];
+    if (plain.err) |err| return switch (err) {
+        // Respond with not found
+        error.NoSuchFileOrDirectory => try self.send(null),
+        else => self.shutdown(err),
+    };
+    const plain_mtime = plain.statx.mtime;
+
+    // Find best match, shortest one
+    var idx: usize = 0;
+    for (ops[1..], 1..) |stat, i| {
+        if (stat.err != null) continue;
+        // Plain and compressed mtime must match
+        const mtime = stat.statx.mtime;
+        if (!(mtime.sec == plain_mtime.sec and mtime.nsec == plain_mtime.nsec)) {
+            continue;
+        }
+        if (stat.statx.size < ops[idx].statx.size) {
+            idx = i;
+        }
+    }
+    const match = &ops[idx];
+
+    try self.send(.{
+        .dir = match.dir,
+        .path = match.path,
+        .encoding = self.req.accept_encoding[idx],
+        // TODO zasto convert use linux version
+        .stat = try std.Io.Threaded.statFromLinux(&match.statx),
+    });
+}
+
+/// File system file is found, or null if no such file, prepare repsonse header,
+/// send header and body.
+fn send(self: *Connection, fsr: ?FileStatResult) !void {
+    // Prepare header
+    self.rsp.fsr = fsr;
+    try self.rsp.init(self.arena, self.req);
+
+    // Start header send and sendfile prep operations in parallel. Sync is in
+    // headerOpenJoin. If there is no body to send start only send header
+    // operation, no sync is called from onSend then.
+    try self.send_op.prep(self.rsp.header, self.hasBody());
+    if (self.hasBody()) {
+        try self.sendfile_op.prep(fsr.?.dir, fsr.?.path, fsr.?.stat.size);
+    }
 }
 
 fn onRecvError(op: *RequestRecv, err: anyerror) !void {
@@ -115,51 +172,38 @@ fn onRecvError(op: *RequestRecv, err: anyerror) !void {
     try self.shutdown(err);
 }
 
-/// File system file is found, or null if no such file, prepare repsonse header
-fn onFileStat(op: *FileStat, fsr: ?FileStat.Result) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("file_stat_op", op));
-    const rsp = &self.rsp;
-    rsp.fsr = fsr;
-    try rsp.init(self.arena, self.req);
-    try self.send_op.prep(rsp.header, self.hasBody());
-}
-
-fn onFileStatError(op: *FileStat, err: anyerror) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("file_stat_op", op));
-    try self.shutdown(err);
-}
-
+/// Is there file to send as response body (by sendfile).
 fn hasBody(self: Connection) bool {
     return !self.req.onlyHeader() and self.rsp.hasBody();
+}
+
+fn headerOpenJoin(self: *Connection) !void {
+    if (self.sendfile_op.active() or self.send_op.active()) return;
+    if (self.send_op.err) |err| return try self.shutdown(err);
+    if (self.sendfile_op.err) |err| return try self.shutdown(err);
+    try self.sendfile_op.send();
 }
 
 /// Header is sent, prepare sending body
 fn onSend(op: *SendBytes) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("send_op", op));
-    if (!self.hasBody()) {
-        // no body and header sent
-        try self.done();
-        return;
+    if (self.hasBody()) {
+        return try self.headerOpenJoin();
     }
-    // there is file to send as body
-    const fsr = self.rsp.fsr.?;
-    try self.sendfile_op.prep(fsr.dir, fsr.path, fsr.stat.size);
+    if (op.err) |err| return try self.shutdown(err);
+    try self.done();
 }
 
-fn onSendError(op: *SendBytes, err: anyerror) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("send_op", op));
-    try self.shutdown(err);
+fn onSendfileOpen(op: *Sendfile) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
+    try self.headerOpenJoin();
 }
 
 /// Body is sent
 fn onSendfile(op: *Sendfile) !void {
     const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
+    if (op.err) |err| return try self.shutdown(err);
     try self.done();
-}
-
-fn onSendfileError(op: *Sendfile, err: anyerror) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
-    try self.shutdown(err);
 }
 
 /// Io operation failed
@@ -201,6 +245,8 @@ fn reset(self: *Connection) void {
     _ = self.arena_instance.reset(.free_all);
     self.req = .{};
     self.rsp = .{};
+    self.sendfile_op.err = null;
+    self.send_op.err = null;
 }
 
 /// Shutdown connection
@@ -222,7 +268,6 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
             // if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
         },
     };
-    self.reset();
 
     try self.sendfile_op.close();
     if (self.protocol == .https) {
@@ -304,7 +349,7 @@ const Request = struct {
 };
 
 const Response = struct {
-    fsr: ?FileStat.Result = null,
+    fsr: ?FileStatResult = null,
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
@@ -562,125 +607,6 @@ const ContentEncoding = enum {
     }
 };
 
-const FileStat = struct {
-    const Self = @This();
-
-    const Result = struct {
-        dir: std.Io.Dir,
-        path: [:0]const u8 = &.{},
-        stat: std.Io.File.Stat,
-        encoding: ContentEncoding,
-    };
-
-    io: *Io,
-    root: std.Io.Dir,
-    cache: ?std.Io.Dir,
-    vtable: struct {
-        success: *const fn (*Self, ?Result) anyerror!void,
-        fail: *const fn (*Self, anyerror) anyerror!void,
-    },
-    ops_buf: [4]StatOp = undefined,
-    ops: []StatOp = &.{},
-    join_count: usize = 0,
-
-    fn prep(self: *Self, arena: Allocator, path: []const u8, encodings: []const ContentEncoding) !void {
-        for (encodings, 0..) |encoding, i| {
-            try self.ops_buf[i].init(arena, self, path, encoding);
-        }
-        self.join_count = encodings.len;
-        self.ops = self.ops_buf[0..encodings.len];
-    }
-
-    fn join(self: *Self) !void {
-        self.join_count -= 1;
-        if (self.join_count > 0) return;
-
-        self.joinFallible() catch |err| {
-            try self.vtable.fail(self, err);
-        };
-    }
-
-    fn joinFallible(self: *Self) !void {
-        const plain = self.ops[0];
-        assert(plain.encoding == .plain);
-        if (plain.err) |err| switch (err) {
-            error.NoSuchFileOrDirectory => return try self.vtable.success(self, null),
-            else => return err,
-        };
-        const plain_mtime = plain.statx.mtime;
-
-        // find best match, shortest one
-        var idx: usize = 0;
-        for (self.ops, 0..) |stat, i| {
-            if (stat.err != null) {
-                continue;
-            }
-            // plain and compressed mtime must match
-            const mtime = stat.statx.mtime;
-            if (!(mtime.sec == plain_mtime.sec and mtime.nsec == mtime.nsec)) {
-                continue;
-            }
-            if (stat.statx.size < self.ops[idx].statx.size) {
-                idx = i;
-            }
-        }
-        const match = &self.ops[idx];
-
-        try self.vtable.success(self, .{
-            .dir = match.dir,
-            .path = match.path,
-            .encoding = match.encoding,
-            .stat = try std.Io.Threaded.statFromLinux(&match.statx),
-        });
-    }
-
-    const StatOp = struct {
-        parent: *FileStat,
-        op: Io.Op = .{},
-        dir: std.Io.Dir,
-        path: [:0]const u8 = &.{},
-        encoding: ContentEncoding,
-        statx: linux.Statx = mem.zeroes(linux.Statx),
-        err: ?anyerror = null,
-
-        fn init(op: *StatOp, arena: Allocator, parent: *Self, path: []const u8, encoding: ContentEncoding) !void {
-            op.* = .{
-                .parent = parent,
-                .dir = if (encoding == .plain) parent.root else parent.cache.?,
-                .encoding = encoding,
-            };
-            op.path = if (encoding == .plain)
-                try arena.dupeZ(u8, path)
-            else
-                try mem.joinZ(arena, "", &.{ path, encoding.extension() });
-            try op.prep();
-        }
-
-        fn prep(op: *StatOp) !void {
-            try op.parent.io.statx(&op.op, onComplete, op.dir.handle, op.path, &op.statx);
-        }
-
-        fn onComplete(res: Io.Result) !void {
-            const op: *StatOp = @alignCast(@fieldParentPtr("op", res.ptr));
-            res.ok() catch |err| switch (err) {
-                error.SignalInterrupt => {
-                    try op.prep();
-                    return;
-                },
-                else => {
-                    op.err = err;
-                },
-            };
-            try op.parent.join();
-        }
-    };
-
-    test "size of" {
-        try testing.expectEqual(256, @sizeOf(linux.Statx));
-        try testing.expectEqual(296, @sizeOf(StatOp));
-    }
-};
-
 pub fn compressible(file_name: []const u8) bool {
     const extensions = [_][]const u8{
         ".html",
@@ -787,10 +713,8 @@ pub const SendBytes = struct {
     io: *Io,
     op: Io.Op = .{},
     fd: fd_t,
-    vtable: struct {
-        success: *const fn (*Self) anyerror!void,
-        fail: *const fn (*Self, anyerror) anyerror!void,
-    },
+    err: ?anyerror = null,
+    callback: *const fn (*Self) anyerror!void,
 
     buffer: []const u8 = undefined,
     more: bool = false,
@@ -800,6 +724,7 @@ pub const SendBytes = struct {
         self.buffer = buffer;
         self.more = more;
         self.offset = 0;
+        self.err = null;
         try self.send();
     }
 
@@ -810,7 +735,8 @@ pub const SendBytes = struct {
     fn onComplete(res: Io.Result) !void {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         self.onCompleteFallible(res) catch |err| {
-            try self.vtable.fail(self, err);
+            self.err = err;
+            try self.callback(self);
         };
     }
 
@@ -825,7 +751,7 @@ pub const SendBytes = struct {
             // short send
             return try self.send();
         }
-        try self.vtable.success(self);
+        try self.callback(self);
     }
 
     pub fn active(self: *Self) bool {
@@ -840,11 +766,8 @@ const Sendfile = struct {
     op1: Io.Op = .{},
     op2: Io.Op = .{},
     metric: *Server.Metric.Files,
-
-    vtable: struct {
-        success: *const fn (*Self) anyerror!void,
-        fail: *const fn (*Self, anyerror) anyerror!void,
-    },
+    open_callback: *const fn (*Self) anyerror!void,
+    send_callback: *const fn (*Self) anyerror!void,
 
     conn_fd: fd_t,
     file_fd: fd_t = -1,
@@ -907,13 +830,13 @@ const Sendfile = struct {
         if (self.op1.active() or self.op2.active()) {
             return;
         }
-        if (self.err) |err| {
-            return try self.vtable.fail(self, err);
-        }
-        try self.send();
+        try self.open_callback(self);
     }
 
-    fn send(self: *Self) !void {
+    pub fn send(self: *Self) !void {
+        assert(self.file_fd >= 0);
+        assert(self.pipe_fds[0] >= 0);
+
         if (self.buffered > 0) {
             try self.io.pipeToSocket(
                 &self.op2,
@@ -964,7 +887,7 @@ const Sendfile = struct {
         const self: *Self = @alignCast(@fieldParentPtr("op2", res.ptr));
         self.onPipeToSocketFallible(res) catch |err| {
             if (self.err == null) self.err = err;
-            try self.vtable.fail(self, self.err.?);
+            try self.send_callback(self);
         };
     }
 
@@ -990,7 +913,7 @@ const Sendfile = struct {
         }
         self.metric.count +%= 1;
         self.metric.bytes +%= self.size;
-        try self.vtable.success(self);
+        try self.send_callback(self);
     }
 
     pub fn close(self: *Self) !void {
@@ -1058,4 +981,95 @@ test {
     _ = Response;
     _ = LastModified;
     _ = FileStat;
+
+    std.debug.print("sizes {} {} {} {}\n", .{
+        @sizeOf(RequestRecv),
+        @sizeOf(FileStat),
+        @sizeOf(SendBytes),
+        @sizeOf(Sendfile),
+    });
+
+    _ = Op;
+    _ = FileStat;
 }
+
+const Op = union {
+    recv: *RequestRecv,
+    file_stat: *FileStat,
+    send: *SendBytes,
+    sendfile: *Sendfile,
+};
+
+const Callback = struct {
+    ptr: *anyopaque,
+    fnc: *const fn (*anyopaque) anyerror!void,
+
+    fn call(self: *Callback) !void {
+        try self.fnc(self.ptr);
+    }
+};
+
+const FileStatResult = struct {
+    dir: std.Io.Dir,
+    path: [:0]const u8 = &.{},
+    stat: std.Io.File.Stat,
+    encoding: ContentEncoding,
+};
+
+const FileStat = struct {
+    const Self = @This();
+
+    io: *Io,
+    op: Io.Op = .{},
+    cb: Callback,
+    err: ?anyerror = null,
+
+    dir: std.Io.Dir,
+    path: [:0]const u8,
+    statx: linux.Statx = mem.zeroes(linux.Statx),
+
+    fn prep(self: *Self) !void {
+        try self.io.statx(&self.op, onComplete, self.dir.handle, self.path, &self.statx);
+    }
+
+    fn onComplete(res: Io.Result) !void {
+        const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
+        res.ok() catch |err| switch (err) {
+            error.SignalInterrupt => return try self.prep(),
+            else => self.err = err,
+        };
+        try self.cb.call();
+    }
+
+    fn status(self: *Self) OpStatus {
+        if (self.op.active()) return .active;
+        if (self.err != null) return .fail;
+        if (@as(u2048, @bitCast(self.statx)) == 0) return .inactive;
+        return .success;
+    }
+
+    test "status" {
+        var op: FileStat = .{
+            .io = undefined,
+            .cb = undefined,
+            .dir = undefined,
+            .path = undefined,
+        };
+        try testing.expectEqual(.inactive, op.status());
+        op.err = error.Fail;
+        try testing.expectEqual(.fail, op.status());
+    }
+
+    test "size of" {
+        try testing.expectEqual(256, @sizeOf(linux.Statx));
+        try testing.expectEqual(312, @sizeOf(FileStat));
+        try testing.expectEqual(96, @sizeOf(std.Io.File.Stat));
+    }
+};
+
+const OpStatus = enum {
+    inactive,
+    active,
+    success,
+    fail,
+};

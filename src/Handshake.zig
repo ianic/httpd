@@ -49,10 +49,7 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
     self.send_op = .{
         .io = self.io,
         .fd = self.fd,
-        .vtable = .{
-            .success = onSend,
-            .fail = onSendError,
-        },
+        .callback = onSend,
     };
     self.timer.start();
     try self.recv();
@@ -136,12 +133,8 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
 
 fn onSend(op: *SendBytes) !void {
     const self: *Handshake = @alignCast(@fieldParentPtr("send_op", op));
+    if (op.err) |err| return try self.shutdown(err);
     try self.recv();
-}
-
-fn onSendError(op: *SendBytes, err: anyerror) !void {
-    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", op));
-    try self.shutdown(err);
 }
 
 fn upgrade(self: *Handshake) !void {
