@@ -35,7 +35,7 @@ recv_op: RequestRecv = undefined, // read http reqeust
 send_op: SendBytes = undefined, // send http header
 sendfile_op: Sendfile = undefined, // send file as http body
 stat_ops: [4]FileStat = undefined, // file stat operation for each supported encoding
-wg: WaitGroup = undefined,
+wg: WaitGroup = .{},
 
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
@@ -44,6 +44,7 @@ pub fn init(self: *Connection) !void {
         .gpa = self.gpa,
         .io = self.io,
         .vtable = .{
+            .ptr = self,
             .success = onRecv,
             .fail = onRecvError,
         },
@@ -73,8 +74,8 @@ fn recv(self: *Connection) !void {
 }
 
 /// Some bytes are recieved parse it into request
-fn onRecv(op: *RequestRecv, bytes: []const u8) !usize {
-    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", op));
+fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
     self.server.metric.recv.count +%= 1;
     const n = try self.req.parse(self.arena, bytes) orelse {
         if (bytes.len >= max_header_size) {
@@ -92,8 +93,8 @@ fn onRecv(op: *RequestRecv, bytes: []const u8) !usize {
     return n;
 }
 
-fn onRecvError(op: *RequestRecv, err: anyerror) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", op));
+fn onRecvError(ptr: *anyopaque, err: anyerror) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
     try self.shutdown(err);
 }
 
@@ -258,6 +259,11 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
         },
     };
 
+    assert(!self.recv_op.active());
+    assert(!self.send_op.active());
+    assert(!self.sendfile_op.active());
+    assert(self.wg.tasks == 0);
+
     try self.sendfile_op.close();
     if (self.protocol == .https) {
         try self.io.tlsCloseNotify(self.fd);
@@ -267,6 +273,7 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
     self.arena_instance.deinit();
     self.recv_op.deinit();
     self.server.destroy(self);
+    log.debug("{} closed", .{self.fd});
 }
 
 /// External close request
@@ -634,9 +641,10 @@ const RequestRecv = struct {
     op: Io.Op = .{},
     fd: fd_t,
     vtable: struct {
+        ptr: *anyopaque,
         // success callback returns number of bytes consumed
-        success: *const fn (*Self, []const u8) anyerror!usize,
-        fail: *const fn (*Self, anyerror) anyerror!void,
+        success: *const fn (*anyopaque, []const u8) anyerror!usize,
+        fail: *const fn (*anyopaque, anyerror) anyerror!void,
     },
     buffer: []u8 = &.{},
     recv_timeout: linux.kernel_timespec = .{ .sec = keepalive_timeout, .nsec = 0 },
@@ -649,7 +657,7 @@ const RequestRecv = struct {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         self.onCompleteFallible(res) catch |err| {
             // log.warn("{} request recv {}", .{ self.fd, err });
-            try self.vtable.fail(self, err);
+            try self.vtable.fail(self.vtable.ptr, err);
         };
     }
 
@@ -673,7 +681,7 @@ const RequestRecv = struct {
         };
         defer self.io.putProvidedBuffer(res);
 
-        const m = try self.vtable.success(self, recv_buf);
+        const m = try self.vtable.success(self.vtable.ptr, recv_buf);
         if (m == 0) {
             if (self.buffer.len == 0) {
                 // partial msg in provided recv_buf save that part
@@ -1069,8 +1077,8 @@ const OpStatus = enum {
 
 const WaitGroup = struct {
     const Self = @This();
-    tasks: usize,
-    cb: Callback,
+    tasks: usize = 0,
+    cb: Callback = undefined,
 
     fn onComplete(ptr: *anyopaque) !void {
         const self: *Self = @ptrCast(@alignCast(ptr));
