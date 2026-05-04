@@ -77,6 +77,7 @@ fn recv(self: *Connection) !void {
 fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
     const self: *Connection = @ptrCast(@alignCast(ptr));
     self.server.metric.recv.count +%= 1;
+    // Parse http request
     const n = try self.req.parse(self.arena, bytes) orelse {
         if (bytes.len >= max_header_size) {
             return error.RequestBufferOverflow;
@@ -86,6 +87,8 @@ fn onRecv(ptr: *anyopaque, bytes: []const u8) !usize {
         return 0;
     };
     self.server.metric.recv.bytes +%= bytes.len;
+
+    // Find requested file
     if (self.server.cache == null)
         self.req.accept_encoding = self.req.accept_encoding[0..1]; // just .plain
     try self.fileStat();
@@ -98,13 +101,14 @@ fn onRecvError(ptr: *anyopaque, err: anyerror) !void {
     try self.shutdown(err);
 }
 
-// Start FileStat operation for each encoding
+/// Start FileStat operation for each encoding
 fn fileStat(self: *Connection) !void {
     const encodings = self.req.accept_encoding;
     self.wg = .{
         .tasks = encodings.len,
         .cb = .{ .ptr = self, .fnc = onFileStat },
     };
+    // Prepare file stat operation for each encoding
     for (encodings, 0..) |encoding, i| {
         var fs_op = &self.stat_ops[i];
         fs_op.* = .{
@@ -152,8 +156,7 @@ fn onFileStat(ptr: *anyopaque) !void {
         .dir = match.dir,
         .path = match.path,
         .encoding = encodings[idx],
-        // TODO zasto convert use linux version
-        .stat = try std.Io.Threaded.statFromLinux(&match.statx),
+        .stat = &match.statx,
     });
 }
 
@@ -348,7 +351,7 @@ const Response = struct {
     const File = struct {
         dir: std.Io.Dir,
         path: [:0]const u8 = &.{},
-        stat: std.Io.File.Stat,
+        stat: *linux.Statx,
         encoding: ContentEncoding,
     };
 
@@ -363,7 +366,7 @@ const Response = struct {
             return;
         }
         const stat = rsp.file.?.stat;
-        switch (stat.kind) {
+        switch (std.Io.Threaded.statxKind(stat.mode)) {
             .file, .sym_link => {
                 if (etagMatch(stat, req)) {
                     rsp.status = .not_modified;
@@ -385,8 +388,8 @@ const Response = struct {
         }
     }
 
-    fn etagMatch(stat: std.Io.File.Stat, req: Request) bool {
-        return stat.size == req.etag.size and stat.mtime.nanoseconds == req.etag.mtime;
+    fn etagMatch(stat: *linux.Statx, req: Request) bool {
+        return stat.size == req.etag.size and stat.mtime.sec == req.etag.mtime;
     }
 
     fn hasBody(rsp: Response) bool {
@@ -408,12 +411,12 @@ const Response = struct {
 
     fn ok(
         arena: Allocator,
-        stat: std.Io.File.Stat,
+        stat: *linux.Statx,
         file: [:0]const u8,
         encoding: ContentEncoding,
         keep_alive: bool,
     ) ![]const u8 {
-        const last_modified: LastModified = .{ .sec = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s)) };
+        const last_modified: LastModified = .{ .sec = stat.mtime.sec };
         const fmt = "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: {s}\r\n{s}" ++
             "Content-Length: {d}\r\n" ++
@@ -424,21 +427,21 @@ const Response = struct {
             contentType(file),
             encoding.header(),
             stat.size,
-            stat.mtime,
+            stat.mtime.sec,
             stat.size,
             last_modified,
             if (keep_alive) connection_keep_alive else connection_close,
         });
     }
 
-    fn notModified(arena: Allocator, stat: std.Io.File.Stat, keep_alive: bool) ![]const u8 {
-        const last_modified: LastModified = .{ .sec = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s)) };
+    fn notModified(arena: Allocator, stat: *linux.Statx, keep_alive: bool) ![]const u8 {
+        const last_modified: LastModified = .{ .sec = stat.mtime.sec };
         const fmt = "HTTP/1.1 304 Not Modified\r\n" ++
             "ETag: \"{x}-{x}\"\r\n" ++
             "Last-Modified: {f}\r\n" ++
             "{s}\r\n\r\n";
         return try std.fmt.allocPrint(arena, fmt, .{
-            stat.mtime,
+            stat.mtime.sec,
             stat.size,
             last_modified,
             if (keep_alive) connection_keep_alive else connection_close,
@@ -516,27 +519,29 @@ const Response = struct {
             try testing.expectEqual(69, rsp.header.len);
             // std.debug.print("{s}\n", .{rsp.header});
         }
+        var stx = mem.zeroInit(linux.Statx, .{
+            .mode = std.os.linux.S.IFREG, // file
+            .size = 1024 * 1024 * 1024,
+            .mtime = .{ .sec = 1777896219 },
+        });
+
         { // ok
             rsp.file = .{
                 .dir = undefined,
                 .encoding = .plain,
-                .stat = mem.zeroInit(std.Io.File.Stat, .{
-                    .kind = .file,
-                    .size = 1024 * 1024 * 1024,
-                    .mtime = .{ .nanoseconds = std.time.ns_per_week * 1024 },
-                }),
+                .stat = &stx,
             };
             try rsp.init(arena, req);
             try testing.expectEqual(.ok, rsp.status);
-            try testing.expectEqual(176, rsp.header.len);
             // std.debug.print("{s}\n", .{rsp.header});
+            try testing.expectEqual(169, rsp.header.len);
         }
         { // not modified
-            req.etag.mtime = rsp.file.?.stat.mtime.nanoseconds;
-            req.etag.size = rsp.file.?.stat.size;
+            req.etag.mtime = stx.mtime.sec;
+            req.etag.size = stx.size;
             try rsp.init(arena, req);
             try testing.expectEqual(.not_modified, rsp.status);
-            try testing.expectEqual(133, rsp.header.len);
+            try testing.expectEqual(126, rsp.header.len);
             // std.debug.print("{s}\n", .{rsp.header});
         }
     }
