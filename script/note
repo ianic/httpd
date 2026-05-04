@@ -183,3 +183,17 @@ accept: */*
 accept-encoding: gzip, compress, deflate, br
 user-agent: oha/1.14.0
 host: localhost:8080
+
+
+
+prije:
+  [200] 233412 responses
+info(main): metric: .{ .conn = .{ .http = .{ .current = 0, .total = 100, .max = 100 }, .https = .{ .current = 0, .total = 0, .max = 0 } }, .handshake = .{ .count = 0, .duration = 0 }, .files = .{ .count = 233412, .bytes = 28618646723, .pipes = 100, .pipes_cap = 6553600 }, .recv = .{ .bytes = 35678627, .count = 233412, .short = 0 } }
+info(main): io metric: .{ .tick_duration = 385731334, .total = 2145810, .active = 2, .enters = 20003, .err = .{ .no_recv_buffer = 0, .file_not_found = 0, .interrupt = 0, .file_table_overflow = 0, .canceled = 100, .eof = 0, .other = 0, .ensure_sq_capacity = 0 } }
+info(main): sendfile pipe capacity: 65536
+info(main): operations: 2145810, enters: 20003, operations per enter: 107.27, enters from ensure sq capacity: 0
+info(main): operations callbacks total duration: 385ms, 179ns per operation
+info(main): operations per file: 2145810/233412 = 9.19 
+info(main): requests 233412 short 0 size 152
+% time     seconds  usecs/call     calls    errors syscall                                                                                                              ------ ----------- ----------- --------- --------- ------------------
+ 99.90    2.629500         131     20005         1 io_uring_enter

@@ -4,7 +4,7 @@ set -e
 ulimit -n 65535
 
 conns=100
-secs=10
+secs=2
 
 nginx_strace=0
 httpd_strace=1
