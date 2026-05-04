@@ -9,6 +9,7 @@ const Allocator = mem.Allocator;
 const fd_t = linux.fd_t;
 
 const errno = @import("errno.zig");
+const Timer = @import("Timer.zig");
 const log = std.log.scoped(.io);
 
 const Io = @This();
@@ -18,7 +19,7 @@ recv_buffer_group: linux.IoUring.BufferGroup = undefined,
 cqes_buf: []linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
-timer: @import("Timer.zig"),
+timer: Timer = .{},
 
 pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     assert(opt.recv_buffers.size > 0 and opt.recv_buffers.count > 0);

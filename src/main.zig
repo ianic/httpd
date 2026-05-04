@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var io: Io = .{ .timer = .{ .io = init.io } };
+    var io: Io = .{};
     try io.init(gpa, .{
         .entries = args.sqes,
         .fd_nr = args.fds,
@@ -46,7 +46,6 @@ pub fn main(init: std.process.Init) !void {
             .rng = rng_impl.interface(),
         },
         .std_io = init.io,
-        .timer = .{ .io = init.io },
     };
     try server.init(args.http_port, args.https_port);
     defer server.deinit();

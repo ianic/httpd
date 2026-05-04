@@ -31,7 +31,6 @@ connections: std.AutoArrayHashMapUnmanaged(*Connection, void) = .empty,
 /// Tls config with certificate and private key pair.
 /// If tls_config.auht is null https listener is not started.
 tls_config: tls.config.Server,
-timer: @import("Timer.zig"),
 
 state: State = .active,
 const State = enum {
@@ -97,7 +96,7 @@ pub fn connect(self: *Server, protocol: Protocol, fd: fd_t) !void {
         },
         .tls => {
             const handshake = try self.gpa.create(Handshake);
-            handshake.* = .{ .server = self, .io = self.io, .fd = fd, .timer = self.timer.clone() };
+            handshake.* = .{ .server = self, .io = self.io, .fd = fd };
             try handshake.init(self.tls_config);
             self.metric.handshake.count +%= 1;
         },

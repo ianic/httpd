@@ -10,6 +10,7 @@ const tls = @import("tls");
 const Io = @import("Io.zig");
 const Server = @import("Server.zig");
 const SendBytes = @import("Connection.zig").SendBytes;
+const Timer = @import("Timer.zig");
 const log = std.log.scoped(.handshake);
 
 const Handshake = @This();
@@ -33,7 +34,7 @@ buffer: [tls.output_buffer_len]u8 = undefined,
 recv_op: Recv = undefined,
 send_op: SendBytes = undefined,
 
-timer: @import("Timer.zig"),
+timer: Timer = .{},
 
 pub fn init(self: *Handshake, config: tls.config.Server) !void {
     self.hs = .init(config);
@@ -62,7 +63,7 @@ fn onRecv(op: *Recv, buf: []const u8) anyerror!void {
         return;
     }
 
-    var hs_timer = self.timer.clone();
+    var hs_timer: Timer = .{};
     hs_timer.start();
     const hs_res = self.hs.run(buf, &self.buffer) catch |err| return try self.shutdown(err);
     self.server.metric.handshake.duration +%= hs_timer.read();
