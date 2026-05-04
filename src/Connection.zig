@@ -35,7 +35,7 @@ recv_op: RequestRecv = undefined, // read http reqeust
 send_op: SendBytes = undefined, // send http header
 sendfile_op: Sendfile = undefined, // send file as http body
 stat_ops: [4]FileStat = undefined, // file stat operation for each supported encoding
-stat_join_count: usize = 0,
+wg: WaitGroup = undefined,
 
 pub fn init(self: *Connection) !void {
     self.arena_instance = std.heap.ArenaAllocator.init(self.gpa);
@@ -51,15 +51,14 @@ pub fn init(self: *Connection) !void {
     };
     self.send_op = .{
         .io = self.io,
-        .callback = onSend,
         .fd = self.fd,
+        .cb = undefined,
     };
     self.sendfile_op = .{
         .io = self.io,
-        .open_callback = onSendfileOpen,
-        .send_callback = onSendfile,
         .conn_fd = self.fd,
         .metric = &self.server.metric.files,
+        .cb = undefined,
     };
 
     try self.recv();
@@ -93,13 +92,23 @@ fn onRecv(op: *RequestRecv, bytes: []const u8) !usize {
     return n;
 }
 
+fn onRecvError(op: *RequestRecv, err: anyerror) !void {
+    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", op));
+    try self.shutdown(err);
+}
+
 // Start FileStat operation for each encoding
 fn fileStat(self: *Connection) !void {
-    for (self.req.accept_encoding, 0..) |encoding, i| {
+    const encodings = self.req.accept_encoding;
+    self.wg = .{
+        .tasks = encodings.len,
+        .cb = .{ .ptr = self, .fnc = onFileStat },
+    };
+    for (encodings, 0..) |encoding, i| {
         var fs_op = &self.stat_ops[i];
         fs_op.* = .{
             .io = self.io,
-            .cb = .{ .ptr = self, .fnc = onFileStatJoin },
+            .cb = self.wg.taskCallback(),
             .dir = if (encoding == .plain) self.server.root else self.server.cache.?,
             .path = if (encoding == .plain)
                 try self.arena.dupeZ(u8, self.req.path)
@@ -108,16 +117,12 @@ fn fileStat(self: *Connection) !void {
         };
         try fs_op.prep();
     }
-    self.stat_join_count = self.req.accept_encoding.len;
 }
 
-fn onFileStatJoin(ptr: *anyopaque) !void {
+fn onFileStat(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
-    // Wait for all operations to finish
-    self.stat_join_count -= 1;
-    if (self.stat_join_count != 0) return;
-
-    const ops = self.stat_ops[0..self.req.accept_encoding.len];
+    const encodings = self.req.accept_encoding;
+    const ops = self.stat_ops[0..encodings.len];
 
     const plain = ops[0];
     if (plain.err) |err| return switch (err) {
@@ -145,7 +150,7 @@ fn onFileStatJoin(ptr: *anyopaque) !void {
     try self.send(.{
         .dir = match.dir,
         .path = match.path,
-        .encoding = self.req.accept_encoding[idx],
+        .encoding = encodings[idx],
         // TODO zasto convert use linux version
         .stat = try std.Io.Threaded.statFromLinux(&match.statx),
     });
@@ -161,15 +166,38 @@ fn send(self: *Connection, fsr: ?FileStatResult) !void {
     // Start header send and sendfile prep operations in parallel. Sync is in
     // headerOpenJoin. If there is no body to send start only send header
     // operation, no sync is called from onSend then.
-    try self.send_op.prep(self.rsp.header, self.hasBody());
+    // try self.send_op.prep(self.rsp.header, self.hasBody());
+    // if (self.hasBody()) {
+    //     try self.sendfile_op.prep(fsr.?.dir, fsr.?.path, fsr.?.stat.size);
+    // }
+
     if (self.hasBody()) {
+        self.wg = .{
+            .tasks = 2,
+            .cb = .{ .ptr = self, .fnc = onHeader },
+        };
+        self.send_op.cb = self.wg.taskCallback();
+        self.sendfile_op.cb = self.wg.taskCallback();
+        try self.send_op.prep(self.rsp.header, self.hasBody());
         try self.sendfile_op.prep(fsr.?.dir, fsr.?.path, fsr.?.stat.size);
+    } else {
+        self.send_op.cb = .{ .ptr = self, .fnc = onHeader2 };
+        try self.send_op.prep(self.rsp.header, self.hasBody());
     }
 }
 
-fn onRecvError(op: *RequestRecv, err: anyerror) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("recv_op", op));
-    try self.shutdown(err);
+fn onHeader(ptr: *anyopaque) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    if (self.send_op.err) |err| return try self.shutdown(err);
+    if (self.sendfile_op.err) |err| return try self.shutdown(err);
+    self.sendfile_op.cb = .{ .ptr = self, .fnc = onSendfile };
+    try self.sendfile_op.send();
+}
+
+fn onHeader2(ptr: *anyopaque) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    if (self.send_op.err) |err| return try self.shutdown(err);
+    try self.done();
 }
 
 /// Is there file to send as response body (by sendfile).
@@ -177,40 +205,40 @@ fn hasBody(self: Connection) bool {
     return !self.req.onlyHeader() and self.rsp.hasBody();
 }
 
-fn headerOpenJoin(self: *Connection) !void {
-    if (self.sendfile_op.active() or self.send_op.active()) return;
-    if (self.send_op.err) |err| return try self.shutdown(err);
-    if (self.sendfile_op.err) |err| return try self.shutdown(err);
-    try self.sendfile_op.send();
-}
+// fn headerOpenJoin(self: *Connection) !void {
+//     if (self.sendfile_op.active() or self.send_op.active()) return;
+//     if (self.send_op.err) |err| return try self.shutdown(err);
+//     if (self.sendfile_op.err) |err| return try self.shutdown(err);
+//     try self.sendfile_op.send();
+// }
 
-/// Header is sent, prepare sending body
-fn onSend(op: *SendBytes) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("send_op", op));
-    if (self.hasBody()) {
-        return try self.headerOpenJoin();
-    }
-    if (op.err) |err| return try self.shutdown(err);
-    try self.done();
-}
+// /// Header is sent, prepare sending body
+// fn onSend(op: *SendBytes) !void {
+//     const self: *Connection = @alignCast(@fieldParentPtr("send_op", op));
+//     if (self.hasBody()) {
+//         return try self.headerOpenJoin();
+//     }
+//     if (op.err) |err| return try self.shutdown(err);
+//     try self.done();
+// }
 
-fn onSendfileOpen(op: *Sendfile) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
-    try self.headerOpenJoin();
-}
+// fn onSendfileOpen(op: *Sendfile) !void {
+//     const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
+//     try self.headerOpenJoin();
+// }
 
 /// Body is sent
-fn onSendfile(op: *Sendfile) !void {
-    const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
-    if (op.err) |err| return try self.shutdown(err);
+fn onSendfile(ptr: *anyopaque) !void {
+    const self: *Connection = @ptrCast(@alignCast(ptr));
+    if (self.sendfile_op.err) |err| return try self.shutdown(err);
     try self.done();
 }
 
-/// Io operation failed
-fn onError(ptr: *anyopaque, err: anyerror) !void {
-    const self: *Connection = @ptrCast(@alignCast(ptr));
-    try self.shutdown(err);
-}
+// /// Io operation failed
+// fn onError(ptr: *anyopaque, err: anyerror) !void {
+//     const self: *Connection = @ptrCast(@alignCast(ptr));
+//     try self.shutdown(err);
+// }
 
 /// Done sending response
 fn done(self: *Connection) !void {
@@ -714,7 +742,7 @@ pub const SendBytes = struct {
     op: Io.Op = .{},
     fd: fd_t,
     err: ?anyerror = null,
-    callback: *const fn (*Self) anyerror!void,
+    cb: Callback,
 
     buffer: []const u8 = undefined,
     more: bool = false,
@@ -736,7 +764,7 @@ pub const SendBytes = struct {
         const self: *Self = @alignCast(@fieldParentPtr("op", res.ptr));
         self.onCompleteFallible(res) catch |err| {
             self.err = err;
-            try self.callback(self);
+            try self.cb.call();
         };
     }
 
@@ -751,7 +779,7 @@ pub const SendBytes = struct {
             // short send
             return try self.send();
         }
-        try self.callback(self);
+        try self.cb.call();
     }
 
     pub fn active(self: *Self) bool {
@@ -766,8 +794,7 @@ const Sendfile = struct {
     op1: Io.Op = .{},
     op2: Io.Op = .{},
     metric: *Server.Metric.Files,
-    open_callback: *const fn (*Self) anyerror!void,
-    send_callback: *const fn (*Self) anyerror!void,
+    cb: Callback,
 
     conn_fd: fd_t,
     file_fd: fd_t = -1,
@@ -830,7 +857,7 @@ const Sendfile = struct {
         if (self.op1.active() or self.op2.active()) {
             return;
         }
-        try self.open_callback(self);
+        try self.cb.call();
     }
 
     pub fn send(self: *Self) !void {
@@ -887,7 +914,7 @@ const Sendfile = struct {
         const self: *Self = @alignCast(@fieldParentPtr("op2", res.ptr));
         self.onPipeToSocketFallible(res) catch |err| {
             if (self.err == null) self.err = err;
-            try self.send_callback(self);
+            try self.cb.call();
         };
     }
 
@@ -913,7 +940,7 @@ const Sendfile = struct {
         }
         self.metric.count +%= 1;
         self.metric.bytes +%= self.size;
-        try self.send_callback(self);
+        try self.cb.call();
     }
 
     pub fn close(self: *Self) !void {
@@ -1072,4 +1099,22 @@ const OpStatus = enum {
     active,
     success,
     fail,
+};
+
+const WaitGroup = struct {
+    const Self = @This();
+    tasks: usize,
+    cb: Callback,
+
+    fn onComplete(ptr: *anyopaque) !void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.tasks -= 1;
+        if (self.tasks == 0) {
+            try self.cb.call();
+        }
+    }
+
+    fn taskCallback(self: *Self) Callback {
+        return .{ .ptr = self, .fnc = onComplete };
+    }
 };

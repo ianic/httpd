@@ -49,7 +49,7 @@ pub fn init(self: *Handshake, config: tls.config.Server) !void {
     self.send_op = .{
         .io = self.io,
         .fd = self.fd,
-        .callback = onSend,
+        .cb = .{ .ptr = self, .fnc = onSend },
     };
     self.timer.start();
     try self.recv();
@@ -131,9 +131,9 @@ fn shutdown(self: *Handshake, maybe_err: ?anyerror) !void {
     self.deinit();
 }
 
-fn onSend(op: *SendBytes) !void {
-    const self: *Handshake = @alignCast(@fieldParentPtr("send_op", op));
-    if (op.err) |err| return try self.shutdown(err);
+fn onSend(ptr: *anyopaque) !void {
+    const self: *Handshake = @ptrCast(@alignCast(ptr));
+    if (self.send_op.err) |err| return try self.shutdown(err);
     try self.recv();
 }
 
