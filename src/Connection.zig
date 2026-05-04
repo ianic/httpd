@@ -158,87 +158,48 @@ fn onFileStat(ptr: *anyopaque) !void {
 
 /// File system file is found, or null if no such file, prepare repsonse header,
 /// send header and body.
-fn send(self: *Connection, fsr: ?FileStatResult) !void {
+fn send(self: *Connection, rf: ?Response.File) !void {
     // Prepare header
-    self.rsp.fsr = fsr;
+    self.rsp.file = rf;
     try self.rsp.init(self.arena, self.req);
 
-    // Start header send and sendfile prep operations in parallel. Sync is in
-    // headerOpenJoin. If there is no body to send start only send header
-    // operation, no sync is called from onSend then.
-    // try self.send_op.prep(self.rsp.header, self.hasBody());
-    // if (self.hasBody()) {
-    //     try self.sendfile_op.prep(fsr.?.dir, fsr.?.path, fsr.?.stat.size);
-    // }
+    const has_body = !self.req.onlyHeader() and self.rsp.hasBody();
 
-    if (self.hasBody()) {
+    if (has_body) {
+        // Start header send and sendfile prep operations concurrently.
         self.wg = .{
             .tasks = 2,
             .cb = .{ .ptr = self, .fnc = onHeader },
         };
         self.send_op.cb = self.wg.taskCallback();
-        self.sendfile_op.cb = self.wg.taskCallback();
-        try self.send_op.prep(self.rsp.header, self.hasBody());
-        try self.sendfile_op.prep(fsr.?.dir, fsr.?.path, fsr.?.stat.size);
+        try self.sendfile_op.prepOpen(self.wg.taskCallback(), rf.?.dir, rf.?.path, rf.?.stat.size);
     } else {
-        self.send_op.cb = .{ .ptr = self, .fnc = onHeader2 };
-        try self.send_op.prep(self.rsp.header, self.hasBody());
+        self.send_op.cb = .{ .ptr = self, .fnc = onHeaderNoBody };
     }
+    try self.send_op.prep(self.rsp.header, has_body);
 }
 
+/// Header is sent, send file as response body
 fn onHeader(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
     if (self.send_op.err) |err| return try self.shutdown(err);
     if (self.sendfile_op.err) |err| return try self.shutdown(err);
-    self.sendfile_op.cb = .{ .ptr = self, .fnc = onSendfile };
-    try self.sendfile_op.send();
+    try self.sendfile_op.prepSend(.{ .ptr = self, .fnc = onBody });
 }
 
-fn onHeader2(ptr: *anyopaque) !void {
+/// Header is sent there is no body to, response done.
+fn onHeaderNoBody(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
     if (self.send_op.err) |err| return try self.shutdown(err);
     try self.done();
 }
 
-/// Is there file to send as response body (by sendfile).
-fn hasBody(self: Connection) bool {
-    return !self.req.onlyHeader() and self.rsp.hasBody();
-}
-
-// fn headerOpenJoin(self: *Connection) !void {
-//     if (self.sendfile_op.active() or self.send_op.active()) return;
-//     if (self.send_op.err) |err| return try self.shutdown(err);
-//     if (self.sendfile_op.err) |err| return try self.shutdown(err);
-//     try self.sendfile_op.send();
-// }
-
-// /// Header is sent, prepare sending body
-// fn onSend(op: *SendBytes) !void {
-//     const self: *Connection = @alignCast(@fieldParentPtr("send_op", op));
-//     if (self.hasBody()) {
-//         return try self.headerOpenJoin();
-//     }
-//     if (op.err) |err| return try self.shutdown(err);
-//     try self.done();
-// }
-
-// fn onSendfileOpen(op: *Sendfile) !void {
-//     const self: *Connection = @alignCast(@fieldParentPtr("sendfile_op", op));
-//     try self.headerOpenJoin();
-// }
-
 /// Body is sent
-fn onSendfile(ptr: *anyopaque) !void {
+fn onBody(ptr: *anyopaque) !void {
     const self: *Connection = @ptrCast(@alignCast(ptr));
     if (self.sendfile_op.err) |err| return try self.shutdown(err);
     try self.done();
 }
-
-// /// Io operation failed
-// fn onError(ptr: *anyopaque, err: anyerror) !void {
-//     const self: *Connection = @ptrCast(@alignCast(ptr));
-//     try self.shutdown(err);
-// }
 
 /// Done sending response
 fn done(self: *Connection) !void {
@@ -377,17 +338,24 @@ const Request = struct {
 };
 
 const Response = struct {
-    fsr: ?FileStatResult = null,
+    const File = struct {
+        dir: std.Io.Dir,
+        path: [:0]const u8 = &.{},
+        stat: std.Io.File.Stat,
+        encoding: ContentEncoding,
+    };
+
+    file: ?File = null,
     status: http.Status = @enumFromInt(0),
     header: []const u8 = &.{},
 
     fn init(rsp: *Response, arena: Allocator, req: Request) !void {
-        if (rsp.fsr == null) {
+        if (rsp.file == null) {
             rsp.status = .not_found;
             rsp.header = try notFound(arena, req.keep_alive);
             return;
         }
-        const stat = rsp.fsr.?.stat;
+        const stat = rsp.file.?.stat;
         switch (stat.kind) {
             .file, .sym_link => {
                 if (etagMatch(stat, req)) {
@@ -395,7 +363,7 @@ const Response = struct {
                     rsp.header = try notModified(arena, stat, req.keep_alive);
                 } else {
                     rsp.status = .ok;
-                    rsp.header = try ok(arena, stat, req.path, rsp.fsr.?.encoding, req.keep_alive);
+                    rsp.header = try ok(arena, stat, req.path, rsp.file.?.encoding, req.keep_alive);
                 }
             },
             .directory => {
@@ -419,12 +387,12 @@ const Response = struct {
     }
 
     fn bodySize(rsp: Response) usize {
-        if (rsp.fsr) |f| return f.stat.size;
+        if (rsp.file) |f| return f.stat.size;
         return 0;
     }
 
     fn contentEncoding(rsp: Response) ContentEncoding {
-        if (rsp.fsr) |f| return f.encoding;
+        if (rsp.file) |f| return f.encoding;
         return .plain;
     }
 
@@ -542,7 +510,7 @@ const Response = struct {
             // std.debug.print("{s}\n", .{rsp.header});
         }
         { // ok
-            rsp.fsr = .{
+            rsp.file = .{
                 .dir = undefined,
                 .encoding = .plain,
                 .stat = mem.zeroInit(std.Io.File.Stat, .{
@@ -557,8 +525,8 @@ const Response = struct {
             // std.debug.print("{s}\n", .{rsp.header});
         }
         { // not modified
-            req.etag.mtime = rsp.fsr.?.stat.mtime.nanoseconds;
-            req.etag.size = rsp.fsr.?.stat.size;
+            req.etag.mtime = rsp.file.?.stat.mtime.nanoseconds;
+            req.etag.size = rsp.file.?.stat.size;
             try rsp.init(arena, req);
             try testing.expectEqual(.not_modified, rsp.status);
             try testing.expectEqual(133, rsp.header.len);
@@ -807,7 +775,8 @@ const Sendfile = struct {
     buffered: usize = 0, // number of bytes buffered in the pipe
     err: ?anyerror = null,
 
-    pub fn prep(self: *Self, dir: std.Io.Dir, path: [:0]const u8, size: usize) !void {
+    pub fn prepOpen(self: *Self, cb: Callback, dir: std.Io.Dir, path: [:0]const u8, size: usize) !void {
+        self.cb = cb;
         self.dir = dir;
         self.path = path;
         self.size = size;
@@ -860,10 +829,14 @@ const Sendfile = struct {
         try self.cb.call();
     }
 
-    pub fn send(self: *Self) !void {
+    pub fn prepSend(self: *Self, cb: Callback) !void {
         assert(self.file_fd >= 0);
         assert(self.pipe_fds[0] >= 0);
+        self.cb = cb;
+        try self.send();
+    }
 
+    fn send(self: *Self) !void {
         if (self.buffered > 0) {
             try self.io.pipeToSocket(
                 &self.op2,
@@ -1034,13 +1007,6 @@ const Callback = struct {
     fn call(self: *Callback) !void {
         try self.fnc(self.ptr);
     }
-};
-
-const FileStatResult = struct {
-    dir: std.Io.Dir,
-    path: [:0]const u8 = &.{},
-    stat: std.Io.File.Stat,
-    encoding: ContentEncoding,
 };
 
 const FileStat = struct {
