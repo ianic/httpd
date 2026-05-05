@@ -16,7 +16,7 @@ const Io = @This();
 
 ring: linux.IoUring = undefined,
 recv_buffer_group: linux.IoUring.BufferGroup = undefined,
-cqes_buf: []linux.io_uring_cqe = undefined,
+cqes_buf: [128]linux.io_uring_cqe = undefined,
 cqes: []linux.io_uring_cqe = &.{},
 metric: Metric = .{},
 timer: Timer = .{},
@@ -28,9 +28,6 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
     errdefer io.ring.deinit();
     try io.ring.register_files_sparse(opt.fd_nr);
 
-    io.cqes_buf = try allocator.alloc(linux.io_uring_cqe, @min(128, opt.entries / 2));
-    errdefer allocator.free(io.cqes_buf);
-
     io.recv_buffer_group = try linux.IoUring.BufferGroup.init(
         &io.ring,
         allocator,
@@ -39,16 +36,19 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         opt.recv_buffers.count,
     );
     close_notify.init();
-    // if (io.ring.sq.sqes.len != opt.entries or io.ring.cq.cqes.len != @as(usize, @intCast(opt.entries)) * 2)
-    //     log.debug(
-    //         "sqes: {}, cqes: {}, cqes_buf: {}, fds: {}, recv buffers: {}",
-    //         .{ io.ring.sq.sqes.len, io.ring.cq.cqes.len, io.cqes_buf.len, opt.fd_nr, opt.recv_buffers },
-    //     );
+    log.debug(
+        "sqes: {}, cqes: {}, {} KB",
+        .{
+            io.ring.sq.sqes.len,
+            io.ring.cq.cqes.len,
+            (io.ring.sq.sqes.len * @sizeOf(linux.io_uring_sqe) + io.ring.cq.cqes.len * @sizeOf(linux.io_uring_cqe)) / 1024,
+        },
+    );
+    log.debug("recv buffers: {}, {} KB", .{ opt.recv_buffers, io.recv_buffer_group.buffers.len / 1024 });
 }
 
 pub fn deinit(io: *Io, allocator: Allocator) void {
     io.recv_buffer_group.deinit(allocator);
-    allocator.free(io.cqes_buf);
     io.ring.deinit();
 }
 
@@ -57,40 +57,40 @@ pub fn deinit(io: *Io, allocator: Allocator) void {
 /// pending compeltions io_uring will wait for at least one completion to appear
 /// in the completion queue.
 pub fn tick(io: *Io) !void {
-    io.getCqes() catch |err| switch (err) {
-        error.SignalInterrupt => return,
-        else => return err,
-    };
+    if (io.cqes.len == 0) {
+        _ = io.ring.submit_and_wait(1) catch |err| switch (err) {
+            error.SignalInterrupt => return,
+            else => return err,
+        };
+        io.metric.enters +%= 1;
+        const n = try io.ring.copy_cqes(&io.cqes_buf, 0);
+        io.cqes = io.cqes_buf[0..n];
+    }
 
     io.timer.start();
-    while (io.cqes.len > 0) {
-        const cqe = io.cqes[0];
-        io.cqes = io.cqes[1..];
-        if (cqe.user_data != 0) {
-            const op: *Op = @ptrFromInt(cqe.user_data);
-            const callback = op.reset(); // op can be reused during callback
-            try callback(.{ .ptr = op, .cqe = cqe });
-            io.metric.completed(cqe);
-        } else {
-            _ = result(cqe) catch |err| switch (err) {
-                error.TimerExpired => {}, // timer triggers cancel of linked operation (recv)
-                error.OperationCanceled => {}, // timer is canceled by linked operation
-                else => log.debug("noop completion failed {}", .{err}),
-            };
+    while (true) {
+        while (io.cqes.len > 0) {
+            const cqe = io.cqes[0];
+            io.cqes = io.cqes[1..];
+            if (cqe.user_data != 0) {
+                const op: *Op = @ptrFromInt(cqe.user_data);
+                const callback = op.reset(); // op can be reused during callback
+                try callback(.{ .ptr = op, .cqe = cqe });
+                io.metric.completed(cqe);
+            } else {
+                _ = result(cqe) catch |err| switch (err) {
+                    error.TimerExpired => {}, // timer triggers cancel of linked operation (recv)
+                    error.OperationCanceled => {}, // timer is canceled by linked operation
+                    else => log.debug("noop completion failed {}", .{err}),
+                };
+            }
         }
+        if (io.ring.cq_ready() == 0) break;
+        const n = try io.ring.copy_cqes(&io.cqes_buf, 0);
+        if (n == 0) break;
+        io.cqes = io.cqes_buf[0..n];
     }
     io.metric.tick_duration +%= io.timer.read();
-}
-
-fn getCqes(io: *Io) !void {
-    if (io.cqes.len > 0) {
-        @branchHint(.unlikely);
-        return;
-    }
-    _ = try io.ring.submit_and_wait(1);
-    io.metric.enters +%= 1;
-    const n = try io.ring.copy_cqes(io.cqes_buf, 0);
-    io.cqes = io.cqes_buf[0..n];
 }
 
 /// Number of unused submission queue entries
@@ -103,6 +103,32 @@ fn sqSpaceLeft(io: *Io) u32 {
 /// space in submission queue for count operations.
 fn ensureSqCapacity(io: *Io, count: u32) !void {
     assert(count <= io.ring.sq.sqes.len);
+    if (io.sqSpaceLeft() >= count) {
+        @branchHint(.likely);
+        return;
+    }
+    { // try double ring sizes
+        const prev: u32 = @intCast(io.ring.sq.sqes.len);
+        var next: u32 = 0;
+        while (next < count) {
+            if (next == 0) next = prev;
+            next *= 2;
+        }
+        if (resize_rings(&io.ring, next)) {
+            log.info("ring resize {} -> {}", .{ prev, next });
+            log.info(
+                "sqes: {}, cqes: {}, {} KB",
+                .{
+                    io.ring.sq.sqes.len,
+                    io.ring.cq.cqes.len,
+                    (io.ring.sq.sqes.len * @sizeOf(linux.io_uring_sqe) + io.ring.cq.cqes.len * @sizeOf(linux.io_uring_cqe)) / 1024,
+                },
+            );
+            return;
+        } else |err| {
+            log.err("ring resize {}", .{err});
+        }
+    }
     while (io.sqSpaceLeft() < count) {
         io.metric.err.ensure_sq_capacity +%= 1;
         _ = io.ring.submit() catch |err| switch (err) {
@@ -381,6 +407,8 @@ pub const Op = struct {
 };
 
 test "size" {
+    try testing.expectEqual(64, @sizeOf(linux.io_uring_sqe));
+    try testing.expectEqual(16, @sizeOf(linux.io_uring_cqe));
     try testing.expectEqual(8, @sizeOf(Op));
 }
 
@@ -388,7 +416,7 @@ pub const Options = struct {
     /// Number of submission queue entries
     entries: u16,
     /// io_uring init flags
-    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_TASKRUN_FLAG | linux.IORING_SETUP_COOP_TASKRUN,
+    flags: u32 = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_TASKRUN_FLAG | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_DEFER_TASKRUN,
     /// Number of kernel registered file descriptors
     fd_nr: u16,
 
@@ -493,9 +521,7 @@ const CloseNotify = struct {
 test "pipe" {
     const gpa = testing.allocator;
 
-    var io: Io = .{
-        .timer = .{ .io = testing.io },
-    };
+    var io: Io = .{};
     try io.init(gpa, .{
         .entries = 128,
         .fd_nr = 128,
@@ -560,7 +586,6 @@ fn resize_rings_params(ring: *IoUring, p: *linux.io_uring_params) !void {
         .NOSYS => return error.SystemOutdated,
         else => |ern| return posix.unexpectedErrno(ern),
     }
-
     // Create new submission and completion queues
     var sq = try linux.IoUring.SubmissionQueue.init(ring.fd, p.*);
     errdefer sq.deinit();
@@ -569,8 +594,10 @@ fn resize_rings_params(ring: *IoUring, p: *linux.io_uring_params) !void {
     // Copy pointers from previous submission queue
     sq.sqe_head = ring.sq.sqe_head;
     sq.sqe_tail = ring.sq.sqe_tail;
-    for (0..@min(sq.array.len, ring.sq.array.len)) |i| {
-        sq.array[i] = ring.sq.array[i];
+    // Directly map SQ slots to SQEs
+    // ref: https://github.com/axboe/liburing/blob/5dfc30a27303af1185e65d10890fdb35117bb3eb/src/register.c#L486-L487
+    for (0..sq.array.len) |i| {
+        sq.array[i] = @intCast(i);
     }
 
     // Replace queues in the ring
