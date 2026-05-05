@@ -207,7 +207,7 @@ fn onBody(ptr: *anyopaque) !void {
 
 /// Done sending response
 fn done(self: *Connection) !void {
-    self.logAccess();
+    //self.logAccess();
     if (self.req.keep_alive) {
         self.reset();
         try self.recv();
@@ -276,7 +276,7 @@ fn shutdown(self: *Connection, maybe_err: ?anyerror) !void {
     self.arena_instance.deinit();
     self.recv_op.deinit();
     self.server.destroy(self);
-    log.debug("{} closed", .{self.fd});
+    // log.debug("{} closed", .{self.fd});
 }
 
 /// External close request

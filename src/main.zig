@@ -105,7 +105,7 @@ const Args = struct {
     buf_count: u16 = 512,
     buf_size: u32 = 4096,
     fds: u16 = 1024,
-    sqes: u16 = 1024,
+    sqes: u16 = 256,
     command: Command = .start,
 
     const Command = enum {
@@ -266,7 +266,7 @@ const Args = struct {
             \\  --http-port         Port for HTTP listener  (default 8080)
             \\  --https-port        Port for HTTPS listener (default 8443)
             \\io_uring options:
-            \\  --sqes              Number of submission queue entries (default 1024, max 32768, must be power of 2)
+            \\  --sqes              Number of submission queue entries (default 256, max 32768, must be power of 2)
             \\  --fds               Number of fixed file descriptors   (default 1024)
             \\  --buf-count         Number of receive provided buffers (default 2)
             \\  --buf-size          Size of each provided buffer       (defalut 4096 * 16)
