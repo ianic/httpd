@@ -116,7 +116,7 @@ fn fileStat(self: *Connection) !void {
             .cb = self.wg.taskCallback(),
             .dir = if (encoding == .plain) self.server.root else self.server.cache.?,
             .path = if (encoding == .plain)
-                try self.arena.dupeZ(u8, self.req.path)
+                try self.arena.dupeSentinel(u8, self.req.path, 0)
             else
                 try mem.joinZ(self.arena, "", &.{ self.req.path, encoding.extension() }),
         };
@@ -325,11 +325,11 @@ const Request = struct {
             req.etag.size = std.fmt.parseInt(u64, it.rest(), 16) catch 0;
         }
         req.path = if (head.target.len <= 1)
-            try arena.dupeZ(u8, "index.html")
+            try arena.dupeSentinel(u8, "index.html", 0)
         else if (head.target[head.target.len - 1] == '/')
             try mem.joinZ(arena, "", &.{ head.target[1..], "index.html" })
         else
-            try arena.dupeZ(u8, head.target[1..]);
+            try arena.dupeSentinel(u8, head.target[1..], 0);
 
         req.accept_encoding_buf[0] = .plain;
         req.accept_encoding = req.accept_encoding_buf[0..1];
