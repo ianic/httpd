@@ -64,7 +64,7 @@ fi
 lsmod | grep -q tls || sudo modprobe tls
 
 # start httpd listening on 8080 http and 8443 https
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast --zig-lib-dir ~/Code/zig/lib
 ulimit -n 65535
 zig-out/bin/httpd --root site/root --cert site/cert_ec --fds 65535 &
 pid=$!

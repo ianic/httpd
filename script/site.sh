@@ -29,7 +29,7 @@ fi
 (lsmod | grep tls >>/dev/null) || (echo "enable ktls" && sudo modprobe tls)
 
 cd ..
-zig build
+zig build --zig-lib-dir ~/Code/zig/lib
 mkdir -p tmp/cache
 zig-out/bin/httpd compress --root=./site/root --cache=./tmp/cache
 echo -e "\nBrowse http://localhost:8080 or https://localhost:8443"

@@ -34,6 +34,7 @@ pub fn init(io: *Io, allocator: Allocator, opt: Options) !void {
         0,
         opt.recv_buffers.size,
         opt.recv_buffers.count,
+        .{},
     );
     close_notify.init();
     log.debug(
@@ -99,7 +100,7 @@ fn sqSpaceLeft(io: *Io) u32 {
     return @as(u32, @intCast(io.ring.sq.sqes.len)) - io.ring.sq_ready();
 }
 
-/// Ensure that error.SubmissionQueueFull never happens that There is enough
+/// Ensure that error.SubmissionQueueFull never happens, that there is enough
 /// space in submission queue for count operations.
 fn ensureSqCapacity(io: *Io, count: u32) !void {
     assert(count <= io.ring.sq.sqes.len);
@@ -234,7 +235,8 @@ pub fn recvDirect(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []u8, tim
 }
 
 pub fn getProvidedBuffer(io: *Io, res: Result) ![]const u8 {
-    return try io.recv_buffer_group.get(res.cqe);
+    const buf, _ = try io.recv_buffer_group.get(res.cqe);
+    return buf;
 }
 
 pub fn putProvidedBuffer(io: *Io, res: Result) void {
@@ -267,8 +269,7 @@ pub fn cancel(io: *Io, fd: fd_t) !void {
     try io.ensureSqCapacity(1);
     var sqe = try io.ring.get_sqe();
     sqe.prep_cancel_fd(fd, linux.IORING_ASYNC_CANCEL_FD_FIXED);
-    sqe.flags |= linux.IOSQE_FIXED_FILE;
-    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    sqe.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
 pub fn send(io: *Io, op: *Op, cb: Op.Callback, fd: fd_t, buffer: []const u8, flags: MsgFlags) !void {

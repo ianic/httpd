@@ -207,7 +207,7 @@ fn onBody(ptr: *anyopaque) !void {
 
 /// Done sending response
 fn done(self: *Connection) !void {
-    //self.logAccess();
+    self.logAccess();
     if (self.req.keep_alive) {
         self.reset();
         try self.recv();
